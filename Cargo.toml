@@ -1,0 +1,53 @@
+[package]
+name = "io-email"
+description = "I/O-free email client library"
+version = "0.0.1"
+authors = ["Clément DOUIN <pimalaya.org@posteo.net>"]
+rust-version = "1.87"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+categories = ["api-bindings", "email"]
+keywords = ["io-free", "coroutine", "email", "imap", "jmap"]
+homepage = "https://pimalaya.org"
+documentation = "https://docs.rs/io-email/latest/io_email"
+repository = "https://github.com/pimalaya/io-email"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+default = ["imap", "jmap", "maildir", "smtp", "serde"]
+std = []
+client = [
+    "std",
+    "io-imap?/client",
+    "io-jmap?/client",
+    "io-maildir?/client",
+    "io-smtp?/client",
+]
+imap = ["dep:io-imap", "dep:mail-parser"]
+jmap = ["dep:io-jmap", "dep:mail-parser", "dep:secrecy", "dep:url"]
+maildir = ["dep:io-maildir", "dep:mail-parser"]
+smtp = ["dep:io-smtp"]
+serde = ["dep:serde", "chrono/serde", "mail-parser?/serde"]
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["alloc"] }
+io-imap = { version = "0.0.1", default-features = false, optional = true }
+io-jmap = { version = "0.0.1", default-features = false, optional = true }
+io-maildir = { version = "0.0.1", default-features = false, optional = true }
+io-smtp = { version = "0.0.1", default-features = false, optional = true }
+log = { version = "0.4", default-features = false }
+mail-parser = { version = "0.11", optional = true }
+secrecy = { version = "0.10", optional = true }
+serde = { version = "1", default-features = false, features = ["derive"], optional = true }
+thiserror = { version = "2", default-features = false }
+url = { version = "2.5", default-features = false, optional = true }
+
+[patch.crates-io]
+io-http.path = "../io-http"
+io-imap.path = "../io-imap"
+io-jmap.path = "../io-jmap"
+io-maildir.path = "../io-maildir"
+io-smtp.path = "../io-smtp"

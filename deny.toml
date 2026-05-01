@@ -1,0 +1,10 @@
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = ["https://github.com/pimalaya/io-notify", "https://github.com/pimalaya/io-process"]
+
+[licenses]
+allow = ["Apache-2.0", "MIT", "Unicode-3.0"]
+
+[licenses.private]
+ignore = true

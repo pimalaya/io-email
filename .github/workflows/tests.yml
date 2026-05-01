@@ -1,0 +1,17 @@
+name: Tests
+
+on:
+  push:
+
+jobs:
+  tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos, windows]
+    runs-on: ${{ matrix.os }}-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - run: cargo run --features std --example std_notify
+      - run: cargo run --features tokio --example tokio_notify
