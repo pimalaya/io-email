@@ -392,7 +392,7 @@ dependencies = [
 [[package]]
 name = "io-imap"
 version = "0.0.1"
-source = "git+https://github.com/pimalaya/io-imap#fe6a6594a67bfd9da8f1c6b877994a218cb6a6c7"
+source = "git+https://github.com/pimalaya/io-imap#50db256f6fe0b34ad86cdced3af4432192545e96"
 dependencies = [
  "imap-codec",
  "log",
@@ -403,7 +403,7 @@ dependencies = [
 [[package]]
 name = "io-jmap"
 version = "0.0.1"
-source = "git+https://github.com/pimalaya/io-jmap#0727f58707eb0aa8d592339e16a435a6cb4ff132"
+source = "git+https://github.com/pimalaya/io-jmap#3181b593df2d9e9909d1badb1faa395acd77f8c8"
 dependencies = [
  "io-http",
  "log",
@@ -417,7 +417,7 @@ dependencies = [
 [[package]]
 name = "io-maildir"
 version = "0.0.1"
-source = "git+https://github.com/pimalaya/io-maildir#6dcfbf2bbf7c6731112fd13ba9d56a598644aca1"
+source = "git+https://github.com/pimalaya/io-maildir#d6756d8bb19c8f9dcc61e10ec580200e6ed308a7"
 dependencies = [
  "gethostname",
  "log",
@@ -429,7 +429,7 @@ dependencies = [
 [[package]]
 name = "io-smtp"
 version = "0.0.1"
-source = "git+https://github.com/pimalaya/io-smtp#86fe9f02460101cf9d2871a9106893aa6667eeef"
+source = "git+https://github.com/pimalaya/io-smtp#40cc5917cf1012478de8a17c241cb045696c50e4"
 dependencies = [
  "base64",
  "bounded-static",

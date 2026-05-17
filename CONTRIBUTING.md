@@ -1,6 +1,6 @@
 # Contributing guide
 
-Thank you for investing your time in contributing to the I/O process project.
+Thank you for investing your time in contributing to the I/O Email project.
 
 ## Development
 
@@ -21,15 +21,25 @@ or install manually the following dependencies:
 ## Build
 
 ```
-cargo build --features std
+cargo build
 ```
 
 ## Test
 
 ```
-cargo test --all-features
+cargo test
+```
+
+## Override dependencies
+
+All Pimalaya crates use `[patch.crates-io]` to point to sibling directories.
+If you want to build io-email against a locally modified dependency (e.g. `io-imap`), add the following to `Cargo.toml`:
+
+```toml
+[patch.crates-io]
+io-imap.path = "/path/to/io-imap"
 ```
 
 ## Commit style
 
-I/O process follows the [conventional commits specification](https://www.conventionalcommits.org/en/v1.0.0/#summary).
+I/O Email follows the [conventional commits specification](https://www.conventionalcommits.org/en/v1.0.0/#summary).

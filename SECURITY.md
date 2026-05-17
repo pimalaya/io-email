@@ -8,4 +8,4 @@
 
 ## Reporting a Vulnerability
 
-https://github.com/pimalaya/io-notifyication/issues/new
+https://github.com/pimalaya/io-email/issues

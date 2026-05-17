@@ -1,6 +1,6 @@
 [package]
 name = "io-email"
-description = "I/O-free email client library"
+description = "Email client library"
 version = "0.0.1"
 authors = ["Clément DOUIN <pimalaya.org@posteo.net>"]
 rust-version = "1.87"
