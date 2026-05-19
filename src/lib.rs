@@ -25,5 +25,7 @@ pub mod jmap;
 pub mod mailbox;
 #[cfg(feature = "maildir")]
 pub mod maildir;
+#[cfg(feature = "search")]
+pub mod search;
 #[cfg(feature = "smtp")]
 pub mod smtp;

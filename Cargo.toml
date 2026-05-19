@@ -23,10 +23,12 @@ imap = ["dep:io-imap", "dep:mail-parser"]
 jmap = ["dep:io-jmap", "dep:mail-parser", "dep:secrecy", "dep:url"]
 smtp = ["dep:io-smtp"]
 maildir = ["client", "dep:io-maildir", "io-maildir?/client", "dep:mail-parser"]
+search = ["dep:chumsky"]
 serde = ["dep:serde", "chrono/serde", "mail-parser?/serde"]
 
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["alloc"] }
+chumsky = { version = "=1.0.0-alpha.8", default-features = false, optional = true }
 io-imap = { version = "0.0.1", default-features = false, optional = true }
 io-jmap = { version = "0.0.1", default-features = false, optional = true }
 io-maildir = { version = "0.0.1", default-features = false, optional = true }

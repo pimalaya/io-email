@@ -10,6 +10,8 @@ use log::trace;
 use pimalaya_stream::std::stream::StreamStd;
 use thiserror::Error;
 
+#[cfg(feature = "search")]
+use crate::search::query::SearchEmailsQuery;
 use crate::{
     envelope::Envelope,
     flag::{Flag, FlagOp},
@@ -152,8 +154,7 @@ impl EmailClientStd {
         }
     }
 
-    /// Lists envelopes from the given mailbox, sorted by date
-    /// descending (most recent first).
+    /// Lists envelopes from the given mailbox.
     ///
     /// `mailbox` is the backend-specific mailbox identifier (name or
     /// id). `page` is 1-indexed; pass `None` to default to page 1.
@@ -161,6 +162,10 @@ impl EmailClientStd {
     /// `with_attachment` is set, [`Envelope::has_attachment`] is
     /// populated when the backend reports it (otherwise left as
     /// `None`).
+    ///
+    /// Default ordering is date descending (most recent first). Use
+    /// [`Self::search_envelopes`] to filter and/or sort with the shared
+    /// search DSL.
     pub fn list_envelopes(
         &mut self,
         mailbox: &str,
@@ -183,6 +188,9 @@ impl EmailClientStd {
                 let mbox = parse_mailbox(mailbox)?;
                 let select = client.select(mbox)?;
                 let exists = select.exists.unwrap_or(0);
+                if exists == 0 {
+                    return Ok(Vec::new());
+                }
 
                 let Some(window) = compute_window(exists, page, page_size) else {
                     return Ok(Vec::new());
@@ -234,6 +242,183 @@ impl EmailClientStd {
 
                 let mut envelopes: Vec<_> = messages.into_iter().map(Envelope::from).collect();
                 envelopes.sort_by(|a, b| b.date.cmp(&a.date));
+
+                Ok(paginate(envelopes, page, page_size))
+            }
+            #[cfg(feature = "smtp")]
+            Self::Smtp(_) => Err(EmailClientStdError::UnsupportedOperation),
+        }
+    }
+
+    /// Searches envelopes in the given mailbox using the shared search
+    /// DSL (requires the `search` cargo feature).
+    ///
+    /// `query` carries an optional filter and/or sort. When the filter
+    /// is `None`, every envelope in `mailbox` matches; when the sort is
+    /// `None`, the default is date descending (most recent first).
+    /// Pagination follows the same rules as [`Self::list_envelopes`].
+    ///
+    /// Per-protocol translation lives in the matching backend module:
+    /// [`crate::imap::envelope_search`] (full grammar, `SEARCH` +
+    /// `SORT`), [`crate::jmap::envelope_search`] (conjunctive only;
+    /// `or`/`not` are rejected; dates over-approximate `receivedAt`
+    /// then re-check `sentAt` client-side), and
+    /// [`crate::maildir::envelope_search`] (full grammar except
+    /// `body`, evaluated client-side).
+    #[cfg(feature = "search")]
+    pub fn search_envelopes(
+        &mut self,
+        mailbox: &str,
+        query: Option<&SearchEmailsQuery>,
+        page: Option<u32>,
+        page_size: Option<u32>,
+        with_attachment: bool,
+    ) -> Result<Vec<Envelope>, EmailClientStdError> {
+        trace!("search envelopes with {self:?}");
+
+        match self {
+            #[cfg(feature = "imap")]
+            Self::Imap(client) => {
+                use alloc::{collections::BTreeMap, string::ToString};
+
+                use io_imap::types::{core::Vec1, fetch::MessageDataItem, sequence::SequenceSet};
+
+                use crate::imap::{
+                    convert::parse_mailbox,
+                    envelope_list::{build_item_names, envelope_from},
+                    envelope_search::{paginate_uids, search_keys, sort_criteria},
+                };
+
+                let mbox = parse_mailbox(mailbox)?;
+                let select = client.select(mbox)?;
+                if select.exists.unwrap_or(0) == 0 {
+                    return Ok(Vec::new());
+                }
+
+                let search_criteria = search_keys(query.and_then(|q| q.filter.as_ref()))?;
+                let sort_criteria = sort_criteria(query.and_then(|q| q.sort.as_deref()));
+
+                let uids = client.sort(sort_criteria, search_criteria, true)?;
+                if uids.is_empty() {
+                    return Ok(Vec::new());
+                }
+
+                let page_uids = paginate_uids(&uids, page, page_size);
+                if page_uids.is_empty() {
+                    return Ok(Vec::new());
+                }
+
+                let uid_str = page_uids
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let sequence_set: SequenceSet = uid_str
+                    .as_str()
+                    .try_into()
+                    .map_err(|_| EmailClientStdError::OperationFailed("invalid IMAP UID set"))?;
+
+                let item_names = build_item_names(with_attachment);
+                let data = client.fetch(sequence_set, item_names, true)?;
+
+                let by_uid: BTreeMap<u32, Envelope> = data
+                    .into_iter()
+                    .map(|(_, items): (_, Vec1<MessageDataItem<'static>>)| {
+                        let items = items.into_inner();
+                        let uid = items.iter().find_map(|item| match item {
+                            MessageDataItem::Uid(u) => Some(u.get()),
+                            _ => None,
+                        });
+                        let env = envelope_from(0, items);
+                        (uid.unwrap_or(0), env)
+                    })
+                    .collect();
+
+                let envelopes: Vec<_> = page_uids
+                    .iter()
+                    .filter_map(|u| by_uid.get(u).cloned())
+                    .collect();
+
+                Ok(envelopes)
+            }
+            #[cfg(feature = "jmap")]
+            Self::Jmap(client) => {
+                use crate::jmap::{
+                    convert::{compute_position_limit, mailbox_filter},
+                    envelope_list::envelope_properties,
+                    envelope_search::{build, post_filter},
+                };
+
+                let base = mailbox_filter(mailbox).unwrap_or_default();
+                let converted = build(query, base)?;
+
+                let (position, limit) = if converted.post_filters.is_empty() {
+                    compute_position_limit(page, page_size)
+                } else {
+                    (None, None)
+                };
+
+                let output = client.email_query(
+                    Some(converted.filter),
+                    Some(converted.sort),
+                    position,
+                    limit,
+                    Some(envelope_properties()),
+                )?;
+
+                let mut envelopes: Vec<_> = output.emails.into_iter().map(Envelope::from).collect();
+
+                if !converted.post_filters.is_empty() {
+                    envelopes.retain(|env| post_filter(env, &converted.post_filters));
+
+                    let total = envelopes.len();
+                    let size = page_size.map(|n| n as usize);
+                    let start =
+                        ((page.unwrap_or(1).max(1) - 1) as usize).saturating_mul(size.unwrap_or(0));
+                    let end = match size {
+                        Some(n) => start.saturating_add(n).min(total),
+                        None => total,
+                    };
+                    if start >= total {
+                        envelopes.clear();
+                    } else {
+                        envelopes = envelopes[start..end].to_vec();
+                    }
+                }
+
+                Ok(envelopes)
+            }
+            #[cfg(feature = "maildir")]
+            Self::Maildir(client) => {
+                use crate::maildir::{
+                    convert::{open_maildir, paginate},
+                    envelope_search::{compare, filter_references_body, matches},
+                };
+
+                let maildir = open_maildir(client, mailbox)?;
+                let messages = client.list_messages(maildir)?;
+
+                let mut envelopes: Vec<_> = messages.into_iter().map(Envelope::from).collect();
+
+                if let Some(query) = query {
+                    if let Some(filter) = &query.filter {
+                        if filter_references_body(filter) {
+                            return Err(EmailClientStdError::OperationFailed(
+                                "envelopes search `body` filter is not yet supported on Maildir",
+                            ));
+                        }
+                        envelopes.retain(|env| matches(env, filter));
+                    }
+
+                    match query.sort.as_deref() {
+                        Some(sort) if !sort.is_empty() => {
+                            envelopes.sort_by(|a, b| compare(a, b, sort));
+                        }
+                        _ => envelopes.sort_by(|a, b| b.date.cmp(&a.date)),
+                    }
+                } else {
+                    envelopes.sort_by(|a, b| b.date.cmp(&a.date));
+                }
 
                 Ok(paginate(envelopes, page, page_size))
             }
