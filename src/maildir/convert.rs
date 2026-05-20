@@ -1,6 +1,7 @@
 //! Conversions between Maildir filesystem types and the shared types
-//! used by [`EmailClientStd`], plus the `From` impl that lets an
-//! already-built [`MaildirClient`] feed the unified client.
+//! used by [`EmailClientStd`], plus the `From` impl that wraps an
+//! already-built [`MaildirClient`] into a fresh unified client with
+//! Maildir as the only registered backend.
 
 use alloc::vec::Vec;
 
@@ -14,7 +15,7 @@ use crate::{
 
 impl From<MaildirClient> for EmailClientStd {
     fn from(client: MaildirClient) -> Self {
-        Self::Maildir(client)
+        Self::new().with_maildir(client)
     }
 }
 

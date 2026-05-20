@@ -1,7 +1,7 @@
 //! Conversions between SMTP wire types and the shared types used by
-//! [`EmailClientStd`], plus the `From` impl that lets an
-//! already-connected [`SmtpClientStd<StreamStd>`] feed the unified
-//! client.
+//! [`EmailClientStd`], plus the `From` impl that wraps an
+//! already-connected [`SmtpClientStd<StreamStd>`] into a fresh unified
+//! client with SMTP as the only registered backend.
 
 use alloc::{
     borrow::{Cow, ToOwned},
@@ -21,7 +21,7 @@ use crate::client::{EmailClientStd, EmailClientStdError};
 
 impl From<SmtpClientStd<StreamStd>> for EmailClientStd {
     fn from(client: SmtpClientStd<StreamStd>) -> Self {
-        Self::Smtp(client)
+        Self::new().with_smtp(client)
     }
 }
 

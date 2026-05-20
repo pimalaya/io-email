@@ -1,6 +1,7 @@
 //! Conversions between JMAP wire types and the shared types used by
-//! [`EmailClientStd`], plus the `From` impl that lets an already-built
-//! [`JmapClientStd`] feed the unified client.
+//! [`EmailClientStd`], plus the `From` impl that wraps an
+//! already-built [`JmapClientStd`] into a fresh unified client with
+//! JMAP as the only registered backend.
 
 use alloc::string::{String, ToString};
 
@@ -10,7 +11,7 @@ use crate::{client::EmailClientStd, flag::Flag};
 
 impl From<JmapClientStd> for EmailClientStd {
     fn from(client: JmapClientStd) -> Self {
-        Self::Jmap(client)
+        Self::new().with_jmap(client)
     }
 }
 

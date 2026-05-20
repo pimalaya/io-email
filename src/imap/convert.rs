@@ -1,7 +1,7 @@
 //! Conversions between IMAP wire types and the shared types used by
-//! [`EmailClientStd`], plus the `From` impl that lets an
-//! already-connected [`ImapClientStd<StreamStd>`] feed the unified
-//! client.
+//! [`EmailClientStd`], plus the `From` impl that wraps an
+//! already-connected [`ImapClientStd<StreamStd>`] into a fresh unified
+//! client with IMAP as the only registered backend.
 
 use core::num::NonZeroU32;
 
@@ -23,7 +23,7 @@ use crate::{
 
 impl From<ImapClientStd<StreamStd>> for EmailClientStd {
     fn from(client: ImapClientStd<StreamStd>) -> Self {
-        Self::Imap(client)
+        Self::new().with_imap(client)
     }
 }
 
