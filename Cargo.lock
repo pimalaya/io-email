@@ -492,7 +492,7 @@ dependencies = [
 [[package]]
 name = "io-jmap"
 version = "0.0.1"
-source = "git+https://github.com/pimalaya/io-jmap#d6f55e8147050bec1a2e809e4e108bd57c03c01c"
+source = "git+https://github.com/pimalaya/io-jmap#a53855723683e0c08269ebaabfd530efceeadb5d"
 dependencies = [
  "io-http",
  "log",
@@ -651,6 +651,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 [[package]]
 name = "pimalaya-stream"
 version = "0.0.1"
+source = "git+https://github.com/pimalaya/stream#4a28a3c051bdc31e65a3fbbeb7f33b8aaebaca7b"
 dependencies = [
  "anyhow",
  "log",
