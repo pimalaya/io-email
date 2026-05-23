@@ -15,13 +15,27 @@ impl From<JmapClientStd> for EmailClientStd {
     }
 }
 
-/// Maps a shared [`Flag`] to its JMAP IANA system keyword.
+/// Maps a shared [`Flag`] to its JMAP keyword.
+///
+/// IANA-classified flags render as the lowercase canonical keyword
+/// (`$seen`, `$forwarded`, …) per RFC 8621 §4.1.1; custom user
+/// keywords pass through their raw wire spelling unchanged.
 pub(crate) fn keyword_from(flag: &Flag) -> String {
-    match flag {
-        Flag::Seen => "$seen".into(),
-        Flag::Answered => "$answered".into(),
-        Flag::Flagged => "$flagged".into(),
-        Flag::Draft => "$draft".into(),
+    use crate::flag::IanaFlag;
+
+    match flag.iana() {
+        Some(IanaFlag::Seen) => "$seen".into(),
+        Some(IanaFlag::Answered) => "$answered".into(),
+        Some(IanaFlag::Flagged) => "$flagged".into(),
+        Some(IanaFlag::Draft) => "$draft".into(),
+        Some(IanaFlag::Deleted) => "$deleted".into(),
+        Some(IanaFlag::Forwarded) => "$forwarded".into(),
+        Some(IanaFlag::Junk) => "$junk".into(),
+        Some(IanaFlag::NotJunk) => "$notjunk".into(),
+        Some(IanaFlag::Phishing) => "$phishing".into(),
+        Some(IanaFlag::Important) => "$important".into(),
+        Some(IanaFlag::MdnSent) => "$mdnsent".into(),
+        None => flag.raw().to_string(),
     }
 }
 

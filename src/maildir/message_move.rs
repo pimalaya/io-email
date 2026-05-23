@@ -3,7 +3,7 @@
 
 use alloc::{
     collections::{BTreeMap, BTreeSet},
-    string::{String, ToString},
+    string::ToString,
     vec::Vec,
 };
 
@@ -13,13 +13,15 @@ use io_maildir::{
         MaildirMessageMoveError, MaildirMessageMoveResult as InnerResult,
     },
     maildir::{Maildir, MaildirSubdir},
+    path::MaildirPath,
 };
 use log::trace;
 
 /// Argument fed back to [`MaildirMessageMove::resume`].
 #[derive(Debug)]
 pub enum MaildirMessageMoveArg {
-    DirRead(BTreeMap<String, BTreeSet<String>>),
+    FileExists(BTreeMap<MaildirPath, bool>),
+    DirRead(BTreeMap<MaildirPath, BTreeSet<MaildirPath>>),
     Rename,
 }
 
@@ -27,8 +29,9 @@ pub enum MaildirMessageMoveArg {
 #[derive(Debug)]
 pub enum MaildirMessageMoveResult {
     Ok,
-    WantsDirRead(BTreeSet<String>),
-    WantsRename(Vec<(String, String)>),
+    WantsFileExists(BTreeSet<MaildirPath>),
+    WantsDirRead(BTreeSet<MaildirPath>),
+    WantsRename(Vec<(MaildirPath, MaildirPath)>),
     Err(MaildirMessageMoveError),
 }
 
@@ -54,12 +57,16 @@ impl MaildirMessageMove {
 
     pub fn resume(&mut self, arg: Option<MaildirMessageMoveArg>) -> MaildirMessageMoveResult {
         let inner_arg = arg.map(|arg| match arg {
+            MaildirMessageMoveArg::FileExists(probes) => InnerArg::FileExists(probes),
             MaildirMessageMoveArg::DirRead(entries) => InnerArg::DirRead(entries),
             MaildirMessageMoveArg::Rename => InnerArg::Rename,
         });
 
         match self.inner.resume(inner_arg) {
             InnerResult::Ok => MaildirMessageMoveResult::Ok,
+            InnerResult::WantsFileExists(probes) => {
+                MaildirMessageMoveResult::WantsFileExists(probes)
+            }
             InnerResult::WantsDirRead(paths) => MaildirMessageMoveResult::WantsDirRead(paths),
             InnerResult::WantsRename(pairs) => MaildirMessageMoveResult::WantsRename(pairs),
             InnerResult::Err(err) => MaildirMessageMoveResult::Err(err),

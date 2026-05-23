@@ -3,7 +3,7 @@
 
 use alloc::{
     collections::{BTreeMap, BTreeSet},
-    string::{String, ToString},
+    string::ToString,
     vec::Vec,
 };
 
@@ -13,13 +13,15 @@ use io_maildir::{
         MaildirMessageCopyError, MaildirMessageCopyResult as InnerResult,
     },
     maildir::{Maildir, MaildirSubdir},
+    path::MaildirPath,
 };
 use log::trace;
 
 /// Argument fed back to [`MaildirMessageCopy::resume`].
 #[derive(Debug)]
 pub enum MaildirMessageCopyArg {
-    DirRead(BTreeMap<String, BTreeSet<String>>),
+    FileExists(BTreeMap<MaildirPath, bool>),
+    DirRead(BTreeMap<MaildirPath, BTreeSet<MaildirPath>>),
     Copy,
 }
 
@@ -27,8 +29,9 @@ pub enum MaildirMessageCopyArg {
 #[derive(Debug)]
 pub enum MaildirMessageCopyResult {
     Ok,
-    WantsDirRead(BTreeSet<String>),
-    WantsCopy(Vec<(String, String)>),
+    WantsFileExists(BTreeSet<MaildirPath>),
+    WantsDirRead(BTreeSet<MaildirPath>),
+    WantsCopy(Vec<(MaildirPath, MaildirPath)>),
     Err(MaildirMessageCopyError),
 }
 
@@ -54,12 +57,16 @@ impl MaildirMessageCopy {
 
     pub fn resume(&mut self, arg: Option<MaildirMessageCopyArg>) -> MaildirMessageCopyResult {
         let inner_arg = arg.map(|arg| match arg {
+            MaildirMessageCopyArg::FileExists(probes) => InnerArg::FileExists(probes),
             MaildirMessageCopyArg::DirRead(entries) => InnerArg::DirRead(entries),
             MaildirMessageCopyArg::Copy => InnerArg::Copy,
         });
 
         match self.inner.resume(inner_arg) {
             InnerResult::Ok => MaildirMessageCopyResult::Ok,
+            InnerResult::WantsFileExists(probes) => {
+                MaildirMessageCopyResult::WantsFileExists(probes)
+            }
             InnerResult::WantsDirRead(paths) => MaildirMessageCopyResult::WantsDirRead(paths),
             InnerResult::WantsCopy(pairs) => MaildirMessageCopyResult::WantsCopy(pairs),
             InnerResult::Err(err) => MaildirMessageCopyResult::Err(err),

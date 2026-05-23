@@ -10,12 +10,16 @@ use io_maildir::{
     },
     flag::Flags,
     maildir::{Maildir, MaildirSubdir},
+    path::MaildirPath,
 };
 use log::trace;
 
 /// Argument fed back to [`MaildirMessageAdd::resume`].
 #[derive(Debug)]
 pub enum MaildirMessageAddArg {
+    Time { secs: u64, nanos: u32 },
+    Pid(u32),
+    Hostname(String),
     FileCreate,
     Rename,
 }
@@ -23,9 +27,12 @@ pub enum MaildirMessageAddArg {
 /// Result returned by [`MaildirMessageAdd::resume`].
 #[derive(Debug)]
 pub enum MaildirMessageAddResult {
-    Ok { id: String, path: String },
-    WantsFileCreate(BTreeMap<String, Vec<u8>>),
-    WantsRename(Vec<(String, String)>),
+    Ok { id: String, path: MaildirPath },
+    WantsTime,
+    WantsPid,
+    WantsHostname,
+    WantsFileCreate(BTreeMap<MaildirPath, Vec<u8>>),
+    WantsRename(Vec<(MaildirPath, MaildirPath)>),
     Err(MaildirMessageStoreError),
 }
 
@@ -53,15 +60,18 @@ impl MaildirMessageAdd {
 
     pub fn resume(&mut self, arg: Option<MaildirMessageAddArg>) -> MaildirMessageAddResult {
         let inner_arg = arg.map(|arg| match arg {
+            MaildirMessageAddArg::Time { secs, nanos } => InnerArg::Time { secs, nanos },
+            MaildirMessageAddArg::Pid(pid) => InnerArg::Pid(pid),
+            MaildirMessageAddArg::Hostname(h) => InnerArg::Hostname(h),
             MaildirMessageAddArg::FileCreate => InnerArg::FileCreate,
             MaildirMessageAddArg::Rename => InnerArg::Rename,
         });
 
         match self.inner.resume(inner_arg) {
-            InnerResult::Ok { id, path } => MaildirMessageAddResult::Ok {
-                id,
-                path: path.to_string_lossy().into_owned(),
-            },
+            InnerResult::Ok { id, path } => MaildirMessageAddResult::Ok { id, path },
+            InnerResult::WantsTime => MaildirMessageAddResult::WantsTime,
+            InnerResult::WantsPid => MaildirMessageAddResult::WantsPid,
+            InnerResult::WantsHostname => MaildirMessageAddResult::WantsHostname,
             InnerResult::WantsFileCreate(files) => MaildirMessageAddResult::WantsFileCreate(files),
             InnerResult::WantsRename(pairs) => MaildirMessageAddResult::WantsRename(pairs),
             InnerResult::Err(err) => MaildirMessageAddResult::Err(err),

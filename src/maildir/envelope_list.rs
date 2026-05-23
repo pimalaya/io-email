@@ -6,10 +6,9 @@
 
 use alloc::{
     collections::{BTreeMap, BTreeSet},
-    string::{String, ToString},
+    string::ToString,
     vec::Vec,
 };
-use std::path::Path;
 
 use chrono::DateTime;
 use io_maildir::{
@@ -19,25 +18,32 @@ use io_maildir::{
     },
     maildir::Maildir,
     message::Message as MaildirMessage,
-    parser::Address as MailParserAddress,
+    path::MaildirPath,
 };
 use log::trace;
+use mail_parser::Address as MailParserAddress;
 
-use crate::{address::Address, envelope::Envelope, flag::Flag};
+use crate::{
+    address::Address,
+    envelope::{Envelope, normalize_message_id},
+    flag::Flag,
+};
 
 /// Argument fed back to [`MaildirEnvelopeList::resume`].
 #[derive(Debug)]
 pub enum MaildirEnvelopeListArg {
-    DirRead(BTreeMap<String, BTreeSet<String>>),
-    FileRead(BTreeMap<String, Vec<u8>>),
+    DirRead(BTreeMap<MaildirPath, BTreeSet<MaildirPath>>),
+    FileExists(BTreeMap<MaildirPath, bool>),
+    FileRead(BTreeMap<MaildirPath, Vec<u8>>),
 }
 
 /// Result returned by [`MaildirEnvelopeList::resume`].
 #[derive(Debug)]
 pub enum MaildirEnvelopeListResult {
     Ok(Vec<Envelope>),
-    WantsDirRead(BTreeSet<String>),
-    WantsFileRead(BTreeSet<String>),
+    WantsDirRead(BTreeSet<MaildirPath>),
+    WantsFileExists(BTreeSet<MaildirPath>),
+    WantsFileRead(BTreeSet<MaildirPath>),
     Err(MaildirMessagesListError),
 }
 
@@ -64,6 +70,9 @@ impl MaildirEnvelopeList {
 
         let inner_arg = arg.map(|arg| match arg {
             MaildirEnvelopeListArg::DirRead(entries) => MaildirMessagesListArg::DirRead(entries),
+            MaildirEnvelopeListArg::FileExists(probes) => {
+                MaildirMessagesListArg::FileExists(probes)
+            }
             MaildirEnvelopeListArg::FileRead(contents) => {
                 MaildirMessagesListArg::FileRead(contents)
             }
@@ -72,6 +81,9 @@ impl MaildirEnvelopeList {
         match self.inner.resume(inner_arg) {
             MaildirMessagesListResult::WantsDirRead(paths) => {
                 MaildirEnvelopeListResult::WantsDirRead(paths)
+            }
+            MaildirMessagesListResult::WantsFileExists(paths) => {
+                MaildirEnvelopeListResult::WantsFileExists(paths)
             }
             MaildirMessagesListResult::WantsFileRead(paths) => {
                 MaildirEnvelopeListResult::WantsFileRead(paths)
@@ -120,8 +132,14 @@ impl From<MaildirMessage> for Envelope {
 
         let has_attachment = parsed.as_ref().map(|m| m.attachment_count() > 0);
 
+        let message_id = parsed
+            .as_ref()
+            .and_then(|m| m.message_id())
+            .and_then(normalize_message_id);
+
         Self {
             id,
+            message_id,
             flags,
             subject,
             from,
@@ -156,8 +174,8 @@ fn paginate(envelopes: Vec<Envelope>, page: Option<u32>, page_size: Option<u32>)
         .collect()
 }
 
-fn parse_filename_flags(path: &Path) -> BTreeSet<Flag> {
-    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+fn parse_filename_flags(path: &MaildirPath) -> BTreeSet<Flag> {
+    let Some(name) = path.file_name() else {
         return BTreeSet::new();
     };
 
@@ -167,10 +185,7 @@ fn parse_filename_flags(path: &Path) -> BTreeSet<Flag> {
 
     letters
         .chars()
-        .filter_map(|c| {
-            let mut buf = [0u8; 4];
-            Flag::parse(c.encode_utf8(&mut buf))
-        })
+        .filter_map(crate::maildir::convert::flag_from_char)
         .collect()
 }
 

@@ -83,7 +83,7 @@ impl JmapMessageGet {
             session,
             http_auth,
             vec![email_id.to_string()],
-            Some(vec!["blobId".into()]),
+            Some(vec![io_jmap::rfc8621::email::EmailProperty::BlobId]),
             false,
             false,
             0,

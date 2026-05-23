@@ -24,6 +24,7 @@ use alloc::{
 use io_imap::{
     context::ImapContext,
     rfc3501::{
+        examine::ImapMailboxExamine,
         fetch::{ImapMessageFetch, ImapMessageFetchError, ImapMessageFetchResult},
         select::{ImapMailboxSelect, ImapMailboxSelectError, ImapMailboxSelectResult},
     },
@@ -44,7 +45,6 @@ use thiserror::Error;
 use crate::{
     client::EmailClientStdError,
     envelope::Envelope,
-    flag::Flag,
     imap::envelope_list::{build_item_names, envelope_from},
     search::{
         filter::query::SearchEmailsFilterQuery,
@@ -80,9 +80,27 @@ pub enum ImapEnvelopeSearchResult {
     Err(ImapEnvelopeSearchError),
 }
 
+/// Wraps either [`ImapMailboxSelect`] or [`ImapMailboxExamine`] so the
+/// downstream coroutine state machine can share a single match arm.
+/// Both coroutines surface the same `ImapMailboxSelectResult` shape
+/// (the EXAMINE result/error types are aliases of the SELECT ones).
+enum SelectOrExamine {
+    Select(ImapMailboxSelect),
+    Examine(ImapMailboxExamine),
+}
+
+impl SelectOrExamine {
+    fn resume(&mut self, arg: Option<&[u8]>) -> ImapMailboxSelectResult {
+        match self {
+            Self::Select(s) => s.resume(arg),
+            Self::Examine(e) => e.resume(arg),
+        }
+    }
+}
+
 enum State {
     Selecting {
-        select: ImapMailboxSelect,
+        select: SelectOrExamine,
         page: Option<u32>,
         page_size: Option<u32>,
         item_names: MacroOrMessageDataItemNames<'static>,
@@ -125,7 +143,7 @@ impl ImapEnvelopeSearch {
     ) -> Result<Self, EmailClientStdError> {
         trace!("prepare IMAP envelope search");
         Self::with_select(
-            ImapMailboxSelect::new(context, mailbox),
+            SelectOrExamine::Select(ImapMailboxSelect::new(context, mailbox)),
             query,
             page,
             page_size,
@@ -144,7 +162,7 @@ impl ImapEnvelopeSearch {
     ) -> Result<Self, EmailClientStdError> {
         trace!("prepare IMAP envelope search (read-only)");
         Self::with_select(
-            ImapMailboxSelect::read_only(context, mailbox),
+            SelectOrExamine::Examine(ImapMailboxExamine::new(context, mailbox)),
             query,
             page,
             page_size,
@@ -153,7 +171,7 @@ impl ImapEnvelopeSearch {
     }
 
     fn with_select(
-        select: ImapMailboxSelect,
+        select: SelectOrExamine,
         query: Option<&SearchEmailsQuery>,
         page: Option<u32>,
         page_size: Option<u32>,
@@ -393,12 +411,27 @@ fn convert_filter(
         Q::Subject(pattern) => SearchKey::Subject(astring(pattern)?),
         Q::Body(pattern) => SearchKey::Body(astring(pattern)?),
 
-        Q::Flag(flag) => match flag {
-            Flag::Seen => SearchKey::Seen,
-            Flag::Answered => SearchKey::Answered,
-            Flag::Flagged => SearchKey::Flagged,
-            Flag::Draft => SearchKey::Draft,
-        },
+        Q::Flag(flag) => {
+            use io_imap::types::core::Atom;
+
+            use crate::flag::IanaFlag;
+
+            // IMAP exposes dedicated search keys for the four
+            // classic system flags plus `\Deleted`; every other
+            // IANA keyword and every custom keyword goes through
+            // `SearchKey::Keyword(Atom)`.
+            match flag.iana() {
+                Some(IanaFlag::Seen) => SearchKey::Seen,
+                Some(IanaFlag::Answered) => SearchKey::Answered,
+                Some(IanaFlag::Flagged) => SearchKey::Flagged,
+                Some(IanaFlag::Draft) => SearchKey::Draft,
+                Some(IanaFlag::Deleted) => SearchKey::Deleted,
+                _ => SearchKey::Keyword(
+                    Atom::try_from(String::from(flag.raw()))
+                        .map_err(|_| EmailClientStdError::InvalidId(String::from(flag.raw())))?,
+                ),
+            }
+        }
     })
 }
 
@@ -465,6 +498,7 @@ mod tests {
     use chrono::NaiveDate;
 
     use super::*;
+    use crate::flag::Flag;
 
     fn naive(y: i32, m: u32, d: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, d).unwrap()
@@ -535,15 +569,24 @@ mod tests {
 
     #[test]
     fn flag_lcd_mapping() {
-        for (variant, expected_seen) in [
-            (Flag::Seen, true),
-            (Flag::Answered, false),
-            (Flag::Flagged, false),
-            (Flag::Draft, false),
+        use crate::flag::IanaFlag;
+
+        for (iana, expected_seen) in [
+            (IanaFlag::Seen, true),
+            (IanaFlag::Answered, false),
+            (IanaFlag::Flagged, false),
+            (IanaFlag::Draft, false),
         ] {
-            let key = convert_filter(&SearchEmailsFilterQuery::Flag(variant)).unwrap();
+            let key =
+                convert_filter(&SearchEmailsFilterQuery::Flag(Flag::from_iana(iana))).unwrap();
             assert_eq!(matches!(key, SearchKey::Seen), expected_seen);
         }
+    }
+
+    #[test]
+    fn flag_custom_keyword_becomes_imap_keyword() {
+        let key = convert_filter(&SearchEmailsFilterQuery::Flag(Flag::from_raw("Work"))).unwrap();
+        assert!(matches!(key, SearchKey::Keyword(_)));
     }
 
     #[test]

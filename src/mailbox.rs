@@ -1,6 +1,6 @@
 //! Mailbox shared across all protocols.
 
-use alloc::string::String;
+use alloc::{string::String, vec::Vec};
 
 /// A mailbox (a.k.a. folder).
 ///
@@ -75,4 +75,25 @@ impl MailboxRole {
             _ => Self::Other(raw.into()),
         }
     }
+}
+
+/// Outcome of [`crate::client::EmailClientStd::diff_mailboxes`].
+///
+/// `new_state` is the opaque per-backend mailbox-set checkpoint to
+/// persist for the next call; format is private to the backend impl
+/// (JMAP stores the raw `Mailbox/state` bytes). Backends without an
+/// account-global mailbox state token (IMAP, m2dir, maildir) return
+/// `Err(EmailClientStdError::UnsupportedOperation)`; callers fall back
+/// to a normal `list_mailboxes` in that case.
+#[derive(Clone, Debug)]
+pub enum MailboxDiff {
+    /// Mailbox set is identical to the cached checkpoint. Caller may
+    /// reuse its prior mailbox list and skip the
+    /// [`crate::client::EmailClientStd::list_mailboxes`] round-trip.
+    Unchanged { new_state: Vec<u8> },
+
+    /// Mailbox set may have changed, or no checkpoint was cached.
+    /// Caller must list mailboxes; `new_state` is `None` when the
+    /// backend could not cheaply capture a baseline without listing.
+    Changed { new_state: Option<Vec<u8>> },
 }

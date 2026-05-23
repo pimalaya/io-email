@@ -3,7 +3,7 @@
 
 use alloc::{
     collections::{BTreeMap, BTreeSet},
-    string::{String, ToString},
+    string::ToString,
     vec::Vec,
 };
 
@@ -13,13 +13,15 @@ use io_maildir::{
     },
     flag::Flags,
     maildir::Maildir,
+    path::MaildirPath,
 };
 use log::trace;
 
 /// Argument fed back to [`MaildirFlagSet::resume`].
 #[derive(Debug)]
 pub enum MaildirFlagSetArg {
-    DirRead(BTreeMap<String, BTreeSet<String>>),
+    FileExists(BTreeMap<MaildirPath, bool>),
+    DirRead(BTreeMap<MaildirPath, BTreeSet<MaildirPath>>),
     Rename,
 }
 
@@ -27,8 +29,9 @@ pub enum MaildirFlagSetArg {
 #[derive(Debug)]
 pub enum MaildirFlagSetResult {
     Ok,
-    WantsDirRead(BTreeSet<String>),
-    WantsRename(Vec<(String, String)>),
+    WantsFileExists(BTreeSet<MaildirPath>),
+    WantsDirRead(BTreeSet<MaildirPath>),
+    WantsRename(Vec<(MaildirPath, MaildirPath)>),
     Err(MaildirFlagsSetError),
 }
 
@@ -49,11 +52,15 @@ impl MaildirFlagSet {
         use io_maildir::coroutines::flags_set::MaildirFlagsSetResult;
 
         let inner_arg = arg.map(|arg| match arg {
+            MaildirFlagSetArg::FileExists(probes) => MaildirFlagsSetArg::FileExists(probes),
             MaildirFlagSetArg::DirRead(entries) => MaildirFlagsSetArg::DirRead(entries),
             MaildirFlagSetArg::Rename => MaildirFlagsSetArg::Rename,
         });
 
         match self.inner.resume(inner_arg) {
+            MaildirFlagsSetResult::WantsFileExists(probes) => {
+                MaildirFlagSetResult::WantsFileExists(probes)
+            }
             MaildirFlagsSetResult::WantsDirRead(paths) => MaildirFlagSetResult::WantsDirRead(paths),
             MaildirFlagsSetResult::WantsRename(pairs) => MaildirFlagSetResult::WantsRename(pairs),
             MaildirFlagsSetResult::Ok => MaildirFlagSetResult::Ok,

@@ -3,7 +3,7 @@
 
 use alloc::{
     collections::{BTreeMap, BTreeSet},
-    string::{String, ToString},
+    string::ToString,
     vec::Vec,
 };
 
@@ -14,13 +14,15 @@ use io_maildir::{
     },
     flag::Flags,
     maildir::Maildir,
+    path::MaildirPath,
 };
 use log::trace;
 
 /// Argument fed back to [`MaildirFlagDelete::resume`].
 #[derive(Debug)]
 pub enum MaildirFlagDeleteArg {
-    DirRead(BTreeMap<String, BTreeSet<String>>),
+    FileExists(BTreeMap<MaildirPath, bool>),
+    DirRead(BTreeMap<MaildirPath, BTreeSet<MaildirPath>>),
     Rename,
 }
 
@@ -28,8 +30,9 @@ pub enum MaildirFlagDeleteArg {
 #[derive(Debug)]
 pub enum MaildirFlagDeleteResult {
     Ok,
-    WantsDirRead(BTreeSet<String>),
-    WantsRename(Vec<(String, String)>),
+    WantsFileExists(BTreeSet<MaildirPath>),
+    WantsDirRead(BTreeSet<MaildirPath>),
+    WantsRename(Vec<(MaildirPath, MaildirPath)>),
     Err(MaildirFlagsRemoveError),
 }
 
@@ -50,11 +53,15 @@ impl MaildirFlagDelete {
         use io_maildir::coroutines::flags_remove::MaildirFlagsRemoveResult;
 
         let inner_arg = arg.map(|arg| match arg {
+            MaildirFlagDeleteArg::FileExists(probes) => MaildirFlagsRemoveArg::FileExists(probes),
             MaildirFlagDeleteArg::DirRead(entries) => MaildirFlagsRemoveArg::DirRead(entries),
             MaildirFlagDeleteArg::Rename => MaildirFlagsRemoveArg::Rename,
         });
 
         match self.inner.resume(inner_arg) {
+            MaildirFlagsRemoveResult::WantsFileExists(probes) => {
+                MaildirFlagDeleteResult::WantsFileExists(probes)
+            }
             MaildirFlagsRemoveResult::WantsDirRead(paths) => {
                 MaildirFlagDeleteResult::WantsDirRead(paths)
             }

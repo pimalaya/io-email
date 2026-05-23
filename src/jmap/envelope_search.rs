@@ -20,11 +20,7 @@
 //! fetches without `position`/`limit` and paginates after the
 //! client-side pass.
 
-use alloc::{
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
+use alloc::{string::String, vec, vec::Vec};
 
 use chrono::{Datelike, NaiveDate};
 use io_jmap::{
@@ -277,13 +273,8 @@ fn apply_leaf(
         Q::Subject(pattern) => set_once(&mut filter.subject, pattern.clone(), "subject"),
         Q::Body(pattern) => set_once(&mut filter.body, pattern.clone(), "body"),
         Q::Flag(flag) => {
-            let keyword = match flag {
-                crate::flag::Flag::Seen => "$seen",
-                crate::flag::Flag::Answered => "$answered",
-                crate::flag::Flag::Flagged => "$flagged",
-                crate::flag::Flag::Draft => "$draft",
-            };
-            set_once(&mut filter.has_keyword, keyword.to_string(), "flag")
+            let keyword = crate::jmap::convert::keyword_from(flag);
+            set_once(&mut filter.has_keyword, keyword, "flag")
         }
         // Over-approximate via `after = start-of-day(D)` (the lowest
         // `receivedAt` consistent with "sentAt-day == D"); the exact
@@ -393,6 +384,7 @@ mod tests {
     fn envelope_at(date: &str) -> Envelope {
         Envelope {
             id: "1".into(),
+            message_id: None,
             flags: Default::default(),
             subject: String::new(),
             from: vec![Address {
@@ -518,8 +510,12 @@ mod tests {
 
     #[test]
     fn flag_clause_sets_has_keyword() {
+        use crate::flag::IanaFlag;
+
         let query = SearchEmailsQuery {
-            filter: Some(SearchEmailsFilterQuery::Flag(Flag::Flagged)),
+            filter: Some(SearchEmailsFilterQuery::Flag(Flag::from_iana(
+                IanaFlag::Flagged,
+            ))),
             sort: None,
         };
         let converted = build(Some(&query), EmailFilter::default()).unwrap();

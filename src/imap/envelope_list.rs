@@ -19,6 +19,7 @@ use chrono::{DateTime, FixedOffset};
 use io_imap::{
     context::ImapContext,
     rfc3501::{
+        examine::ImapMailboxExamine,
         fetch::{ImapMessageFetch, ImapMessageFetchError, ImapMessageFetchResult},
         select::{ImapMailboxSelect, ImapMailboxSelectError, ImapMailboxSelectResult},
     },
@@ -34,7 +35,11 @@ use log::trace;
 use rfc2047_decoder::{Decoder, RecoverStrategy};
 use thiserror::Error;
 
-use crate::{address::Address, envelope::Envelope, flag::Flag};
+use crate::{
+    address::Address,
+    envelope::{Envelope, normalize_message_id},
+    flag::Flag,
+};
 
 /// Errors produced while orchestrating SELECT + FETCH for IMAP envelope
 /// listing.
@@ -59,9 +64,27 @@ pub enum ImapEnvelopeListResult {
     Err(ImapEnvelopeListError),
 }
 
+/// Wraps either [`ImapMailboxSelect`] or [`ImapMailboxExamine`] so the
+/// downstream coroutine state machine can share a single match arm.
+/// Both coroutines surface the same `ImapMailboxSelectResult` shape
+/// (the EXAMINE result/error types are aliases of the SELECT ones).
+enum SelectOrExamine {
+    Select(ImapMailboxSelect),
+    Examine(ImapMailboxExamine),
+}
+
+impl SelectOrExamine {
+    fn resume(&mut self, arg: Option<&[u8]>) -> ImapMailboxSelectResult {
+        match self {
+            Self::Select(s) => s.resume(arg),
+            Self::Examine(e) => e.resume(arg),
+        }
+    }
+}
+
 enum State {
     Selecting {
-        select: ImapMailboxSelect,
+        select: SelectOrExamine,
         page: Option<u32>,
         page_size: Option<u32>,
         item_names: MacroOrMessageDataItemNames<'static>,
@@ -92,7 +115,7 @@ impl ImapEnvelopeList {
     ) -> Self {
         trace!("prepare IMAP envelope listing");
         Self::with_select(
-            ImapMailboxSelect::new(context, mailbox),
+            SelectOrExamine::Select(ImapMailboxSelect::new(context, mailbox)),
             page,
             page_size,
             with_attachment,
@@ -109,7 +132,7 @@ impl ImapEnvelopeList {
     ) -> Self {
         trace!("prepare IMAP envelope listing (read-only)");
         Self::with_select(
-            ImapMailboxSelect::read_only(context, mailbox),
+            SelectOrExamine::Examine(ImapMailboxExamine::new(context, mailbox)),
             page,
             page_size,
             with_attachment,
@@ -117,7 +140,7 @@ impl ImapEnvelopeList {
     }
 
     fn with_select(
-        select: ImapMailboxSelect,
+        select: SelectOrExamine,
         page: Option<u32>,
         page_size: Option<u32>,
         with_attachment: bool,
@@ -271,6 +294,7 @@ pub(crate) fn compute_window(
 
 pub(crate) fn envelope_from(seq: u32, items: Vec<MessageDataItem<'static>>) -> Envelope {
     let mut id = String::new();
+    let mut message_id: Option<String> = None;
     let mut flags = BTreeSet::new();
     let mut subject = String::new();
     let mut from = Vec::new();
@@ -295,6 +319,10 @@ pub(crate) fn envelope_from(seq: u32, items: Vec<MessageDataItem<'static>>) -> E
                     let raw = bytes_to_string(d.as_ref());
                     date = parse_rfc2822_date(&raw);
                 }
+                if let Some(m) = env.message_id.into_option() {
+                    let raw = bytes_to_string(m.as_ref());
+                    message_id = normalize_message_id(&raw);
+                }
                 from = env.from.iter().map(address_from).collect();
                 to = env.to.iter().map(address_from).collect();
             }
@@ -314,6 +342,7 @@ pub(crate) fn envelope_from(seq: u32, items: Vec<MessageDataItem<'static>>) -> E
 
     Envelope {
         id,
+        message_id,
         flags,
         subject,
         from,
@@ -328,7 +357,7 @@ fn flag_from(fetch: FlagFetch<'_>) -> Option<Flag> {
     let FlagFetch::Flag(flag) = fetch else {
         return None;
     };
-    Flag::parse(&flag.to_string())
+    Some(Flag::from_raw(flag.to_string()))
 }
 
 fn address_from(addr: &ImapAddress<'_>) -> Address {

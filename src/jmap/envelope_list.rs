@@ -14,7 +14,11 @@ use io_jmap::{
 use log::trace;
 use secrecy::SecretString;
 
-use crate::{address::Address, envelope::Envelope, flag::Flag};
+use crate::{
+    address::Address,
+    envelope::{Envelope, normalize_message_id},
+    flag::Flag,
+};
 
 /// Result returned by [`JmapEnvelopeList::resume`].
 #[derive(Debug)]
@@ -90,6 +94,7 @@ pub fn envelope_properties() -> Vec<EmailProperty> {
         EmailProperty::SentAt,
         EmailProperty::Size,
         EmailProperty::HasAttachment,
+        EmailProperty::MessageId,
     ]
 }
 
@@ -101,7 +106,7 @@ impl From<Email> for Envelope {
             .keywords
             .unwrap_or_default()
             .into_iter()
-            .filter_map(|(k, v)| if v { Flag::parse(&k) } else { None })
+            .filter_map(|(k, v)| if v { Some(Flag::from_raw(k)) } else { None })
             .collect();
 
         let subject = email.subject.unwrap_or_default();
@@ -125,8 +130,16 @@ impl From<Email> for Envelope {
         let size = email.size.unwrap_or(0);
         let has_attachment = email.has_attachment;
 
+        // JMAP returns `messageId` as a list (RFC 5322 allows multiple
+        // header instances). The first non-empty entry is the
+        // canonical value.
+        let message_id = email
+            .message_id
+            .and_then(|ids| ids.into_iter().find_map(|s| normalize_message_id(&s)));
+
         Self {
             id,
+            message_id,
             flags,
             subject,
             from,

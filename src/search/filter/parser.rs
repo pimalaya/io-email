@@ -222,11 +222,7 @@ fn flag<'a>() -> impl Parser<'a, &'a str, SearchEmailsFilterQuery, ParserError<'
         )
         .ignore_then(
             unquoted_pattern()
-                .try_map(|s, span| {
-                    Flag::parse(&s).ok_or_else(|| {
-                        Rich::custom(span, "expected one of: seen, answered, flagged, draft")
-                    })
-                })
+                .map(Flag::from_raw)
                 .labelled("flag name after `flag`"),
         )
         .map(SearchEmailsFilterQuery::Flag)

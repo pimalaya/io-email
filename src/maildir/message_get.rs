@@ -4,7 +4,7 @@
 
 use alloc::{
     collections::{BTreeMap, BTreeSet},
-    string::{String, ToString},
+    string::ToString,
     vec::Vec,
 };
 
@@ -14,22 +14,25 @@ use io_maildir::{
         MaildirMessageGetError, MaildirMessageGetResult as InnerResult,
     },
     maildir::Maildir,
+    path::MaildirPath,
 };
 use log::trace;
 
 /// Argument fed back to [`MaildirMessageGet::resume`].
 #[derive(Debug)]
 pub enum MaildirMessageGetArg {
-    DirRead(BTreeMap<String, BTreeSet<String>>),
-    FileRead(BTreeMap<String, Vec<u8>>),
+    FileExists(BTreeMap<MaildirPath, bool>),
+    DirRead(BTreeMap<MaildirPath, BTreeSet<MaildirPath>>),
+    FileRead(BTreeMap<MaildirPath, Vec<u8>>),
 }
 
 /// Result returned by [`MaildirMessageGet::resume`].
 #[derive(Debug)]
 pub enum MaildirMessageGetResult {
     Ok(Vec<u8>),
-    WantsDirRead(BTreeSet<String>),
-    WantsFileRead(BTreeSet<String>),
+    WantsFileExists(BTreeSet<MaildirPath>),
+    WantsDirRead(BTreeSet<MaildirPath>),
+    WantsFileRead(BTreeSet<MaildirPath>),
     Err(MaildirMessageGetError),
 }
 
@@ -48,11 +51,15 @@ impl MaildirMessageGet {
 
     pub fn resume(&mut self, arg: Option<MaildirMessageGetArg>) -> MaildirMessageGetResult {
         let inner_arg = arg.map(|arg| match arg {
+            MaildirMessageGetArg::FileExists(probes) => InnerArg::FileExists(probes),
             MaildirMessageGetArg::DirRead(entries) => InnerArg::DirRead(entries),
             MaildirMessageGetArg::FileRead(contents) => InnerArg::FileRead(contents),
         });
 
         match self.inner.resume(inner_arg) {
+            InnerResult::WantsFileExists(probes) => {
+                MaildirMessageGetResult::WantsFileExists(probes)
+            }
             InnerResult::WantsDirRead(paths) => MaildirMessageGetResult::WantsDirRead(paths),
             InnerResult::WantsFileRead(paths) => MaildirMessageGetResult::WantsFileRead(paths),
             InnerResult::Ok(message) => MaildirMessageGetResult::Ok(message.into()),

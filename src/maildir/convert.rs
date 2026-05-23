@@ -19,13 +19,41 @@ impl From<MaildirClient> for EmailClientStd {
     }
 }
 
-/// Maps a shared [`Flag`] to its Maildir flag counterpart.
-pub(crate) fn flag_from(flag: &Flag) -> MdFlag {
-    match flag {
-        Flag::Seen => MdFlag::Seen,
-        Flag::Answered => MdFlag::Replied,
-        Flag::Flagged => MdFlag::Flagged,
-        Flag::Draft => MdFlag::Draft,
+/// Maps a shared [`Flag`] to its Maildir info-section letter.
+///
+/// Returns `None` for IANA keywords that have no Maildir letter
+/// (`Forwarded`, `Junk`, custom) and for user-defined custom
+/// keywords. Callers drop unmapped flags or persist them through a
+/// sidecar.
+pub(crate) fn flag_to_maildir(flag: &Flag) -> Option<MdFlag> {
+    use crate::flag::IanaFlag;
+
+    match flag.iana()? {
+        IanaFlag::Seen => Some(MdFlag::Seen),
+        IanaFlag::Answered => Some(MdFlag::Replied),
+        IanaFlag::Flagged => Some(MdFlag::Flagged),
+        IanaFlag::Draft => Some(MdFlag::Draft),
+        IanaFlag::Deleted => Some(MdFlag::Trashed),
+        _ => None,
+    }
+}
+
+/// Builds a shared [`Flag`] from a Maildir info-section letter.
+///
+/// Maildir letters have no wire casing, so the canonical IANA
+/// spelling is synthesised via [`Flag::iana`]. Returns `None` for
+/// letters outside the standard six.
+pub(crate) fn flag_from_char(c: char) -> Option<Flag> {
+    use crate::flag::IanaFlag;
+
+    match c {
+        'S' => Some(Flag::from_iana(IanaFlag::Seen)),
+        'R' => Some(Flag::from_iana(IanaFlag::Answered)),
+        'F' => Some(Flag::from_iana(IanaFlag::Flagged)),
+        'D' => Some(Flag::from_iana(IanaFlag::Draft)),
+        'T' => Some(Flag::from_iana(IanaFlag::Deleted)),
+        'P' => Some(Flag::from_iana(IanaFlag::Forwarded)),
+        _ => None,
     }
 }
 
@@ -37,8 +65,9 @@ pub(crate) fn open_maildir(
     name: &str,
 ) -> Result<Maildir, EmailClientStdError> {
     let path = client.root().join(name);
-    Maildir::try_from(path.as_path())
-        .map_err(|_| EmailClientStdError::InvalidMailbox(path.to_string_lossy().into_owned()))
+    client
+        .load_maildir(path.clone())
+        .map_err(|_| EmailClientStdError::InvalidMailbox(path.into_string()))
 }
 
 /// 1-indexed pagination on an in-memory list. `page_size = None`

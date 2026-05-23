@@ -1,5 +1,8 @@
 #[cfg(feature = "client")]
+pub mod client;
+#[cfg(feature = "client")]
 pub mod convert;
+pub mod envelope_diff;
 pub mod envelope_list;
 #[cfg(feature = "search")]
 pub mod envelope_search;

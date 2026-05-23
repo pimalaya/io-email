@@ -22,6 +22,7 @@ use io_maildir::{
         MaildirMessagesListError, MaildirMessagesListResult,
     },
     maildir::Maildir,
+    path::MaildirPath,
 };
 use log::trace;
 use thiserror::Error;
@@ -40,8 +41,9 @@ use crate::{
 /// Argument fed back to [`MaildirEnvelopeSearch::resume`].
 #[derive(Debug)]
 pub enum MaildirEnvelopeSearchArg {
-    DirRead(BTreeMap<String, BTreeSet<String>>),
-    FileRead(BTreeMap<String, Vec<u8>>),
+    DirRead(BTreeMap<MaildirPath, BTreeSet<MaildirPath>>),
+    FileExists(BTreeMap<MaildirPath, bool>),
+    FileRead(BTreeMap<MaildirPath, Vec<u8>>),
 }
 
 /// Errors produced while running Maildir envelope search.
@@ -57,8 +59,9 @@ pub enum MaildirEnvelopeSearchError {
 #[derive(Debug)]
 pub enum MaildirEnvelopeSearchResult {
     Ok(Vec<Envelope>),
-    WantsDirRead(BTreeSet<String>),
-    WantsFileRead(BTreeSet<String>),
+    WantsDirRead(BTreeSet<MaildirPath>),
+    WantsFileExists(BTreeSet<MaildirPath>),
+    WantsFileRead(BTreeSet<MaildirPath>),
     Err(MaildirEnvelopeSearchError),
 }
 
@@ -108,6 +111,9 @@ impl MaildirEnvelopeSearch {
 
         let inner_arg = arg.map(|arg| match arg {
             MaildirEnvelopeSearchArg::DirRead(entries) => MaildirMessagesListArg::DirRead(entries),
+            MaildirEnvelopeSearchArg::FileExists(probes) => {
+                MaildirMessagesListArg::FileExists(probes)
+            }
             MaildirEnvelopeSearchArg::FileRead(contents) => {
                 MaildirMessagesListArg::FileRead(contents)
             }
@@ -116,6 +122,9 @@ impl MaildirEnvelopeSearch {
         match inner.resume(inner_arg) {
             MaildirMessagesListResult::WantsDirRead(paths) => {
                 MaildirEnvelopeSearchResult::WantsDirRead(paths)
+            }
+            MaildirMessagesListResult::WantsFileExists(paths) => {
+                MaildirEnvelopeSearchResult::WantsFileExists(paths)
             }
             MaildirMessagesListResult::WantsFileRead(paths) => {
                 MaildirEnvelopeSearchResult::WantsFileRead(paths)
@@ -311,6 +320,7 @@ mod tests {
     fn envelope() -> Envelope {
         Envelope {
             id: String::from("1"),
+            message_id: None,
             flags: Default::default(),
             subject: String::from("Release notes"),
             from: vec![Address {
@@ -408,12 +418,17 @@ mod tests {
 
     #[test]
     fn flag_match() {
+        use crate::flag::IanaFlag;
+
         let mut env = envelope();
-        env.flags.insert(Flag::Seen);
-        assert!(matches(&env, &SearchEmailsFilterQuery::Flag(Flag::Seen)));
+        env.flags.insert(Flag::from_iana(IanaFlag::Seen));
+        assert!(matches(
+            &env,
+            &SearchEmailsFilterQuery::Flag(Flag::from_iana(IanaFlag::Seen))
+        ));
         assert!(!matches(
             &env,
-            &SearchEmailsFilterQuery::Flag(Flag::Flagged)
+            &SearchEmailsFilterQuery::Flag(Flag::from_iana(IanaFlag::Flagged))
         ));
     }
 
