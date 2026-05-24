@@ -8,7 +8,7 @@ use io_maildir::{
         MaildirMessageStore as InnerMaildirMessageStore, MaildirMessageStoreArg as InnerArg,
         MaildirMessageStoreError, MaildirMessageStoreResult as InnerResult,
     },
-    flag::Flags,
+    flag::MaildirFlags,
     maildir::{Maildir, MaildirSubdir},
     path::MaildirPath,
 };
@@ -48,7 +48,7 @@ impl MaildirMessageAdd {
     pub fn new(
         maildir: Maildir,
         subdir: Option<MaildirSubdir>,
-        flags: Flags,
+        flags: MaildirFlags,
         contents: Vec<u8>,
     ) -> Self {
         trace!("prepare Maildir message add");

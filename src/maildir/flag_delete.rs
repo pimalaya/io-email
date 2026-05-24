@@ -12,7 +12,7 @@ use io_maildir::{
         MaildirFlagsRemove as InnerMaildirFlagsRemove, MaildirFlagsRemoveArg,
         MaildirFlagsRemoveError,
     },
-    flag::Flags,
+    flag::MaildirFlags,
     maildir::Maildir,
     path::MaildirPath,
 };
@@ -42,7 +42,7 @@ pub struct MaildirFlagDelete {
 }
 
 impl MaildirFlagDelete {
-    pub fn new(maildir: Maildir, id: impl ToString, flags: Flags) -> Self {
+    pub fn new(maildir: Maildir, id: impl ToString, flags: MaildirFlags) -> Self {
         trace!("prepare Maildir flag delete");
         Self {
             inner: InnerMaildirFlagsRemove::new(maildir, id, flags),

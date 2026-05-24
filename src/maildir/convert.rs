@@ -5,7 +5,7 @@
 
 use alloc::vec::Vec;
 
-use io_maildir::{client::MaildirClient, flag::Flag as MdFlag, maildir::Maildir};
+use io_maildir::{client::MaildirClient, flag::MaildirFlag as MdFlag, maildir::Maildir};
 
 use crate::{
     client::{EmailClientStd, EmailClientStdError},

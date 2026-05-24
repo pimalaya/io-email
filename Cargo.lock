@@ -509,7 +509,7 @@ dependencies = [
 [[package]]
 name = "io-m2dir"
 version = "0.0.1"
-source = "git+https://github.com/pimalaya/io-m2dir#5573017a05ca45cc369a5a83e1fc9e264c60d3c9"
+source = "git+https://github.com/pimalaya/io-m2dir#0f36832cf074eae35d3b9959c7c98076fc0da57b"
 dependencies = [
  "log",
  "thiserror",
@@ -518,7 +518,7 @@ dependencies = [
 [[package]]
 name = "io-maildir"
 version = "0.0.1"
-source = "git+https://github.com/pimalaya/io-maildir#ac75cf8359ce828e5702f1c912e52bb9cfb66c6d"
+source = "git+https://github.com/pimalaya/io-maildir#ca5075379f7ab5879626c1b98df2471cf8c25a19"
 dependencies = [
  "gethostname",
  "log",

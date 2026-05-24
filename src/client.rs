@@ -183,7 +183,7 @@ impl EmailClientStd {
                 }
                 #[cfg(feature = "maildir")]
                 BackendKind::Maildir => {
-                    return self.maildir_list_envelopes(mailbox, page, page_size);
+                    return self.maildir_list_envelopes_par(mailbox, page, page_size);
                 }
                 #[cfg(feature = "m2dir")]
                 BackendKind::M2dir => {

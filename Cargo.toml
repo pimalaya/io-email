@@ -2,7 +2,7 @@
 name = "io-email"
 description = "Email client library"
 version = "0.0.1"
-authors = ["Clément DOUIN <pimalaya.org@posteo.net>"]
+authors = ["soywod <pimalaya.org@posteo.net>"]
 rust-version = "1.87"
 edition = "2024"
 license = "MIT OR Apache-2.0"

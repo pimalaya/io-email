@@ -11,7 +11,7 @@ use io_maildir::{
     coroutines::flags_set::{
         MaildirFlagsSet as InnerMaildirFlagsSet, MaildirFlagsSetArg, MaildirFlagsSetError,
     },
-    flag::Flags,
+    flag::MaildirFlags,
     maildir::Maildir,
     path::MaildirPath,
 };
@@ -41,7 +41,7 @@ pub struct MaildirFlagSet {
 }
 
 impl MaildirFlagSet {
-    pub fn new(maildir: Maildir, id: impl ToString, flags: Flags) -> Self {
+    pub fn new(maildir: Maildir, id: impl ToString, flags: MaildirFlags) -> Self {
         trace!("prepare Maildir flag set");
         Self {
             inner: InnerMaildirFlagsSet::new(maildir, id, flags),

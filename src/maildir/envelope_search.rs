@@ -14,6 +14,7 @@ use alloc::{
     string::String,
     vec::Vec,
 };
+use core::mem;
 
 use chrono::{DateTime, FixedOffset, NaiveDate};
 use io_maildir::{
@@ -21,7 +22,9 @@ use io_maildir::{
         MaildirMessagesList as InnerMaildirMessagesList, MaildirMessagesListArg,
         MaildirMessagesListError, MaildirMessagesListResult,
     },
+    entry::MaildirEntry,
     maildir::Maildir,
+    message::MaildirMessage,
     path::MaildirPath,
 };
 use log::trace;
@@ -65,12 +68,20 @@ pub enum MaildirEnvelopeSearchResult {
     Err(MaildirEnvelopeSearchError),
 }
 
+#[derive(Default)]
+enum State {
+    Listing(InnerMaildirMessagesList),
+    Reading(BTreeSet<MaildirEntry>),
+    #[default]
+    Done,
+}
+
 /// I/O-free coroutine listing every message inside a single Maildir,
 /// then applying the shared query (filter + sort) client-side before
 /// pagination. `page = None` is treated as page 1; `page_size = None`
 /// keeps the full match.
 pub struct MaildirEnvelopeSearch {
-    inner: Option<InnerMaildirMessagesList>,
+    state: State,
     filter: Option<SearchEmailsFilterQuery>,
     sort: Option<Vec<SearchEmailsSorter>>,
     page: Option<u32>,
@@ -96,7 +107,7 @@ impl MaildirEnvelopeSearch {
         }
 
         Ok(Self {
-            inner: Some(InnerMaildirMessagesList::new(maildir)),
+            state: State::Listing(InnerMaildirMessagesList::new(maildir)),
             filter,
             sort,
             page,
@@ -105,36 +116,58 @@ impl MaildirEnvelopeSearch {
     }
 
     pub fn resume(&mut self, arg: Option<MaildirEnvelopeSearchArg>) -> MaildirEnvelopeSearchResult {
-        let Some(inner) = self.inner.as_mut() else {
-            return MaildirEnvelopeSearchResult::Ok(Vec::new());
-        };
+        match (mem::take(&mut self.state), arg) {
+            (State::Listing(mut inner), arg) => {
+                let inner_arg = match arg {
+                    None => None,
+                    Some(MaildirEnvelopeSearchArg::DirRead(entries)) => {
+                        Some(MaildirMessagesListArg::DirRead(entries))
+                    }
+                    Some(MaildirEnvelopeSearchArg::FileExists(probes)) => {
+                        Some(MaildirMessagesListArg::FileExists(probes))
+                    }
+                    Some(MaildirEnvelopeSearchArg::FileRead(_)) => {
+                        return MaildirEnvelopeSearchResult::Err(MaildirEnvelopeSearchError::List(
+                            MaildirMessagesListError::Invalid(
+                                None,
+                                io_maildir::coroutines::message_list::State::Invalid,
+                            ),
+                        ));
+                    }
+                };
 
-        let inner_arg = arg.map(|arg| match arg {
-            MaildirEnvelopeSearchArg::DirRead(entries) => MaildirMessagesListArg::DirRead(entries),
-            MaildirEnvelopeSearchArg::FileExists(probes) => {
-                MaildirMessagesListArg::FileExists(probes)
+                match inner.resume(inner_arg) {
+                    MaildirMessagesListResult::WantsDirRead(paths) => {
+                        self.state = State::Listing(inner);
+                        MaildirEnvelopeSearchResult::WantsDirRead(paths)
+                    }
+                    MaildirMessagesListResult::WantsFileExists(paths) => {
+                        self.state = State::Listing(inner);
+                        MaildirEnvelopeSearchResult::WantsFileExists(paths)
+                    }
+                    MaildirMessagesListResult::Err(err) => {
+                        MaildirEnvelopeSearchResult::Err(err.into())
+                    }
+                    MaildirMessagesListResult::Ok(entries) => {
+                        if entries.is_empty() {
+                            return MaildirEnvelopeSearchResult::Ok(Vec::new());
+                        }
+                        let paths: BTreeSet<MaildirPath> =
+                            entries.iter().map(|e| e.path().clone()).collect();
+                        self.state = State::Reading(entries);
+                        MaildirEnvelopeSearchResult::WantsFileRead(paths)
+                    }
+                }
             }
-            MaildirEnvelopeSearchArg::FileRead(contents) => {
-                MaildirMessagesListArg::FileRead(contents)
-            }
-        });
-
-        match inner.resume(inner_arg) {
-            MaildirMessagesListResult::WantsDirRead(paths) => {
-                MaildirEnvelopeSearchResult::WantsDirRead(paths)
-            }
-            MaildirMessagesListResult::WantsFileExists(paths) => {
-                MaildirEnvelopeSearchResult::WantsFileExists(paths)
-            }
-            MaildirMessagesListResult::WantsFileRead(paths) => {
-                MaildirEnvelopeSearchResult::WantsFileRead(paths)
-            }
-            MaildirMessagesListResult::Err(err) => MaildirEnvelopeSearchResult::Err(err.into()),
-            MaildirMessagesListResult::Ok(messages) => {
-                self.inner = None;
-
-                let mut envelopes: Vec<Envelope> =
-                    messages.into_iter().map(Envelope::from).collect();
+            (State::Reading(entries), Some(MaildirEnvelopeSearchArg::FileRead(mut contents))) => {
+                let mut envelopes: Vec<Envelope> = entries
+                    .into_iter()
+                    .filter_map(|entry| {
+                        let bytes = contents.remove(entry.path())?;
+                        let message = MaildirMessage::from((entry.path().clone(), bytes));
+                        Some(Envelope::from(message))
+                    })
+                    .collect();
 
                 if let Some(ref f) = self.filter {
                     envelopes.retain(|env| matches(env, f));
@@ -148,6 +181,15 @@ impl MaildirEnvelopeSearch {
                 }
 
                 MaildirEnvelopeSearchResult::Ok(paginate(envelopes, self.page, self.page_size))
+            }
+            (state, _) => {
+                self.state = state;
+                MaildirEnvelopeSearchResult::Err(MaildirEnvelopeSearchError::List(
+                    MaildirMessagesListError::Invalid(
+                        None,
+                        io_maildir::coroutines::message_list::State::Invalid,
+                    ),
+                ))
             }
         }
     }

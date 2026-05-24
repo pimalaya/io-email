@@ -3,7 +3,7 @@
 
 use alloc::{string::String, vec::Vec};
 
-use io_maildir::{flag::Flags as MdFlags, maildir::MaildirSubdir};
+use io_maildir::{flag::MaildirFlags as MdFlags, maildir::MaildirSubdir};
 
 #[cfg(feature = "search")]
 use crate::search::query::SearchEmailsQuery;
@@ -48,7 +48,11 @@ impl EmailClientStd {
         Ok(mailboxes)
     }
 
-    pub(crate) fn maildir_list_envelopes(
+    /// Parallel envelope listing backed by the std::thread::scope
+    /// worker pool in [`MaildirClient::read_entries_par`].
+    ///
+    /// [`MaildirClient::read_entries_par`]: io_maildir::client::MaildirClient::read_entries_par
+    pub(crate) fn maildir_list_envelopes_par(
         &mut self,
         mailbox: &str,
         page: Option<u32>,
@@ -57,7 +61,8 @@ impl EmailClientStd {
         let client = self.maildir.as_mut().expect("maildir slot registered");
 
         let maildir = open_maildir(client, mailbox)?;
-        let messages = client.list_messages(maildir)?;
+        let entries: Vec<_> = client.list_entries(maildir)?.into_iter().collect();
+        let messages = client.read_entries_par(&entries)?;
 
         let mut envelopes: Vec<_> = messages.into_iter().map(Envelope::from).collect();
         envelopes.sort_by(|a, b| b.date.cmp(&a.date));
@@ -76,7 +81,8 @@ impl EmailClientStd {
         let client = self.maildir.as_mut().expect("maildir slot registered");
 
         let maildir = open_maildir(client, mailbox)?;
-        let messages = client.list_messages(maildir)?;
+        let entries: Vec<_> = client.list_entries(maildir)?.into_iter().collect();
+        let messages = client.read_entries_par(&entries)?;
 
         let mut envelopes: Vec<_> = messages.into_iter().map(Envelope::from).collect();
 
