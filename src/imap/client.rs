@@ -230,8 +230,10 @@ impl EmailClientStd {
     ) -> Result<(), EmailClientStdError> {
         let client = self.imap.as_mut().expect("imap slot registered");
 
-        let mbox = parse_mailbox(mailbox)?;
-        let _ = client.select(mbox)?;
+        if client.auto_select {
+            let mbox = parse_mailbox(mailbox)?;
+            client.select(mbox)?;
+        }
 
         let sequence_set = parse_uids(ids)?;
         let imap_flags: Vec<_> = flags.iter().map(flag_from).collect();
@@ -241,7 +243,7 @@ impl EmailClientStd {
             FlagOp::Remove => StoreType::Remove,
         };
 
-        let _ = client.store(sequence_set, kind, imap_flags, true)?;
+        client.store(sequence_set, kind, imap_flags, true)?;
 
         Ok(())
     }
@@ -253,8 +255,10 @@ impl EmailClientStd {
     ) -> Result<Vec<u8>, EmailClientStdError> {
         let client = self.imap.as_mut().expect("imap slot registered");
 
-        let mbox = parse_mailbox(mailbox)?;
-        let _ = client.select(mbox)?;
+        if client.auto_select {
+            let mbox = parse_mailbox(mailbox)?;
+            client.select(mbox)?;
+        }
 
         let sequence_set = parse_uids(&[id])?;
         let item_names =
@@ -319,7 +323,7 @@ impl EmailClientStd {
         // `UID SEARCH HEADER Message-ID`. If duplicates exist (rare),
         // take the highest UID (newest append).
         let mbox = parse_mailbox(mailbox)?;
-        let _ = client.select(mbox)?;
+        client.select(mbox)?;
 
         let field = AString::try_from("Message-ID")
             .map_err(|_| EmailClientStdError::OperationFailed("imap header field"))?;
@@ -356,13 +360,16 @@ impl EmailClientStd {
         id: &str,
     ) -> Result<(), EmailClientStdError> {
         let client = self.imap.as_mut().expect("imap slot registered");
-        let mbox = parse_mailbox(mailbox)?;
-        let _ = client.select(mbox)?;
+
+        if client.auto_select {
+            let mbox = parse_mailbox(mailbox)?;
+            client.select(mbox)?;
+        }
 
         let sequence_set = parse_uids(&[id])?;
         let imap_flags = vec![flag_from(&Flag::from_iana(crate::flag::IanaFlag::Deleted))];
-        let _ = client.store(sequence_set, StoreType::Add, imap_flags, true)?;
-        let _ = client.expunge()?;
+        client.store(sequence_set, StoreType::Add, imap_flags, true)?;
+        client.expunge()?;
         Ok(())
     }
 
@@ -374,12 +381,14 @@ impl EmailClientStd {
     ) -> Result<(), EmailClientStdError> {
         let client = self.imap.as_mut().expect("imap slot registered");
 
-        let src = parse_mailbox(from)?;
         let dst = parse_mailbox(to)?;
-        let _ = client.select(src)?;
+        if client.auto_select {
+            let src = parse_mailbox(from)?;
+            client.select(src)?;
+        }
 
         let sequence_set = parse_uids(ids)?;
-        let _ = client.copy(sequence_set, dst, true)?;
+        client.copy(sequence_set, dst, true)?;
 
         Ok(())
     }
@@ -392,12 +401,14 @@ impl EmailClientStd {
     ) -> Result<(), EmailClientStdError> {
         let client = self.imap.as_mut().expect("imap slot registered");
 
-        let src = parse_mailbox(from)?;
         let dst = parse_mailbox(to)?;
-        let _ = client.select(src)?;
+        if client.auto_select {
+            let src = parse_mailbox(from)?;
+            client.select(src)?;
+        }
 
         let sequence_set = parse_uids(ids)?;
-        let _ = client.r#move(sequence_set, dst, true)?;
+        client.r#move(sequence_set, dst, true)?;
 
         Ok(())
     }
