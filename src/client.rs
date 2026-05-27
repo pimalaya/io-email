@@ -128,14 +128,14 @@ impl EmailClientStd {
     /// flag.
     pub fn list_mailboxes(
         &mut self,
-        with_counts: bool,
+        _with_counts: bool,
     ) -> Result<Vec<Mailbox>, EmailClientStdError> {
         trace!("list mailboxes with {self:?}");
 
         for kind in self.order.clone() {
             match kind {
                 #[cfg(feature = "imap")]
-                BackendKind::Imap => return self.imap_list_mailboxes(with_counts),
+                BackendKind::Imap => return self.imap_list_mailboxes(_with_counts),
                 #[cfg(feature = "jmap")]
                 BackendKind::Jmap => return self.jmap_list_mailboxes(),
                 #[cfg(feature = "maildir")]
@@ -164,10 +164,10 @@ impl EmailClientStd {
     /// search DSL.
     pub fn list_envelopes(
         &mut self,
-        mailbox: &str,
-        page: Option<u32>,
-        page_size: Option<u32>,
-        with_attachment: bool,
+        _mailbox: &str,
+        _page: Option<u32>,
+        _page_size: Option<u32>,
+        _with_attachment: bool,
     ) -> Result<Vec<Envelope>, EmailClientStdError> {
         trace!("list envelopes with {self:?}");
 
@@ -175,23 +175,23 @@ impl EmailClientStd {
             match kind {
                 #[cfg(feature = "imap")]
                 BackendKind::Imap => {
-                    return self.imap_list_envelopes(mailbox, page, page_size, with_attachment);
+                    return self.imap_list_envelopes(_mailbox, _page, _page_size, _with_attachment);
                 }
                 #[cfg(feature = "jmap")]
                 BackendKind::Jmap => {
-                    return self.jmap_list_envelopes(mailbox, page, page_size);
+                    return self.jmap_list_envelopes(_mailbox, _page, _page_size);
                 }
                 #[cfg(feature = "maildir")]
                 BackendKind::Maildir => {
-                    return self.maildir_list_envelopes_par(mailbox, page, page_size);
+                    return self.maildir_list_envelopes_par(_mailbox, _page, _page_size);
                 }
                 #[cfg(feature = "m2dir")]
                 BackendKind::M2dir => {
                     return self.m2dir_list_envelopes_par(
-                        mailbox,
-                        page,
-                        page_size,
-                        with_attachment,
+                        _mailbox,
+                        _page,
+                        _page_size,
+                        _with_attachment,
                     );
                 }
                 #[cfg(feature = "smtp")]
@@ -220,11 +220,11 @@ impl EmailClientStd {
     #[cfg(feature = "search")]
     pub fn search_envelopes(
         &mut self,
-        mailbox: &str,
-        query: Option<&SearchEmailsQuery>,
-        page: Option<u32>,
-        page_size: Option<u32>,
-        with_attachment: bool,
+        _mailbox: &str,
+        _query: Option<&SearchEmailsQuery>,
+        _page: Option<u32>,
+        _page_size: Option<u32>,
+        _with_attachment: bool,
     ) -> Result<Vec<Envelope>, EmailClientStdError> {
         trace!("search envelopes with {self:?}");
 
@@ -233,20 +233,20 @@ impl EmailClientStd {
                 #[cfg(feature = "imap")]
                 BackendKind::Imap => {
                     return self.imap_search_envelopes(
-                        mailbox,
-                        query,
-                        page,
-                        page_size,
-                        with_attachment,
+                        _mailbox,
+                        _query,
+                        _page,
+                        _page_size,
+                        _with_attachment,
                     );
                 }
                 #[cfg(feature = "jmap")]
                 BackendKind::Jmap => {
-                    return self.jmap_search_envelopes(mailbox, query, page, page_size);
+                    return self.jmap_search_envelopes(_mailbox, _query, _page, _page_size);
                 }
                 #[cfg(feature = "maildir")]
                 BackendKind::Maildir => {
-                    return self.maildir_search_envelopes(mailbox, query, page, page_size);
+                    return self.maildir_search_envelopes(_mailbox, _query, _page, _page_size);
                 }
                 #[cfg(feature = "m2dir")]
                 BackendKind::M2dir => continue,
@@ -271,17 +271,17 @@ impl EmailClientStd {
     /// (`Email/changes`). Maildir, m2dir and SMTP slots are skipped.
     pub fn diff_envelopes(
         &mut self,
-        mailbox: &str,
-        state: Option<&[u8]>,
+        _mailbox: &str,
+        _state: Option<&[u8]>,
     ) -> Result<EnvelopeDiff, EmailClientStdError> {
         trace!("diff envelopes with {self:?}");
 
         for kind in self.order.clone() {
             match kind {
                 #[cfg(feature = "imap")]
-                BackendKind::Imap => return self.imap_diff_envelopes(mailbox, state),
+                BackendKind::Imap => return self.imap_diff_envelopes(_mailbox, _state),
                 #[cfg(feature = "jmap")]
-                BackendKind::Jmap => return self.jmap_diff_envelopes(mailbox, state),
+                BackendKind::Jmap => return self.jmap_diff_envelopes(_mailbox, _state),
                 #[cfg(feature = "maildir")]
                 BackendKind::Maildir => continue,
                 #[cfg(feature = "m2dir")]
@@ -301,7 +301,7 @@ impl EmailClientStd {
     /// so the caller drops to a normal [`Self::list_mailboxes`].
     pub fn diff_mailboxes(
         &mut self,
-        state: Option<&[u8]>,
+        _state: Option<&[u8]>,
     ) -> Result<MailboxDiff, EmailClientStdError> {
         trace!("diff mailboxes with {self:?}");
 
@@ -310,7 +310,7 @@ impl EmailClientStd {
                 #[cfg(feature = "imap")]
                 BackendKind::Imap => continue,
                 #[cfg(feature = "jmap")]
-                BackendKind::Jmap => return self.jmap_diff_mailboxes(state),
+                BackendKind::Jmap => return self.jmap_diff_mailboxes(_state),
                 #[cfg(feature = "maildir")]
                 BackendKind::Maildir => continue,
                 #[cfg(feature = "m2dir")]
@@ -490,19 +490,19 @@ impl EmailClientStd {
     ///
     /// Backends without a server-side delete primitive (Maildir) are
     /// skipped; expunge-via-flag is the caller's responsibility.
-    pub fn delete_message(&mut self, mailbox: &str, id: &str) -> Result<(), EmailClientStdError> {
+    pub fn delete_message(&mut self, _mailbox: &str, _id: &str) -> Result<(), EmailClientStdError> {
         trace!("delete message with {self:?}");
 
         for kind in self.order.clone() {
             match kind {
                 #[cfg(feature = "imap")]
-                BackendKind::Imap => return self.imap_delete_message(mailbox, id),
+                BackendKind::Imap => return self.imap_delete_message(_mailbox, _id),
                 #[cfg(feature = "jmap")]
-                BackendKind::Jmap => return self.jmap_delete_message(id),
+                BackendKind::Jmap => return self.jmap_delete_message(_id),
                 #[cfg(feature = "maildir")]
                 BackendKind::Maildir => continue,
                 #[cfg(feature = "m2dir")]
-                BackendKind::M2dir => return self.m2dir_delete_message(mailbox, id),
+                BackendKind::M2dir => return self.m2dir_delete_message(_mailbox, _id),
                 #[cfg(feature = "smtp")]
                 BackendKind::Smtp => continue,
             }

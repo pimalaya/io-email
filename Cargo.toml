@@ -48,6 +48,15 @@ uuid = { version = "1.19", features = ["v4"], optional = true }
 [dev-dependencies]
 tempfile = "3"
 
+# [patch.crates-io]
+# io-http.path = "../io-http"
+# io-imap.path = "../io-imap"
+# io-jmap.path = "../io-jmap"
+# io-m2dir.path = "../io-m2dir"
+# io-maildir.path = "../io-maildir"
+# io-smtp.path = "../io-smtp"
+# pimalaya-stream.path = "../stream"
+
 [patch.crates-io]
 io-http.git = "https://github.com/pimalaya/io-http"
 io-imap.git = "https://github.com/pimalaya/io-imap"

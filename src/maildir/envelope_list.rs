@@ -6,7 +6,7 @@
 
 use alloc::{
     collections::{BTreeMap, BTreeSet},
-    string::ToString,
+    string::{String, ToString},
     vec::Vec,
 };
 use core::mem;
@@ -18,6 +18,8 @@ use io_maildir::{
         MaildirMessagesListError, MaildirMessagesListResult,
     },
     entry::MaildirEntry,
+    flag::{KeywordHeader, MaildirFlag, MaildirFlags},
+    headers::extract_keywords_header,
     maildir::Maildir,
     message::MaildirMessage,
     path::MaildirPath,
@@ -29,6 +31,7 @@ use crate::{
     address::Address,
     envelope::{Envelope, normalize_message_id},
     flag::Flag,
+    maildir::convert::flag_from_maildir,
 };
 
 /// Argument fed back to [`MaildirEnvelopeList::resume`].
@@ -144,53 +147,83 @@ impl MaildirEnvelopeList {
 
 impl From<MaildirMessage> for Envelope {
     fn from(message: MaildirMessage) -> Self {
-        let id = message.id().unwrap_or_default().to_string();
-        let flags = parse_filename_flags(message.path());
-        let size = message.contents().len() as u64;
+        envelope_from_message(&message, &BTreeMap::new(), None)
+    }
+}
 
-        let parsed = message.parsed();
+/// Builds an [`Envelope`] from a Maildir message, optionally
+/// enriching its flag set with custom keywords coming from a
+/// dovecot-keywords table (filename `a..z` letters → keywords) and a
+/// configured body header ([`KeywordHeader::XKeywords`] /
+/// [`KeywordHeader::XLabel`]).
+pub(crate) fn envelope_from_message(
+    message: &MaildirMessage,
+    dovecot_table: &BTreeMap<char, String>,
+    header: Option<KeywordHeader>,
+) -> Envelope {
+    let id = message.id().unwrap_or_default().to_string();
+    let mut flags = parse_filename_flags(message.path());
 
-        let subject = parsed
-            .as_ref()
-            .and_then(|m| m.subject())
-            .unwrap_or_default()
-            .to_string();
-
-        let from = parsed
-            .as_ref()
-            .and_then(|m| m.from())
-            .map(addresses_from)
-            .unwrap_or_default();
-
-        let to = parsed
-            .as_ref()
-            .and_then(|m| m.to())
-            .map(addresses_from)
-            .unwrap_or_default();
-
-        let date = parsed
-            .as_ref()
-            .and_then(|m| m.date())
-            .and_then(|d| DateTime::parse_from_rfc3339(&d.to_rfc3339()).ok());
-
-        let has_attachment = parsed.as_ref().map(|m| m.attachment_count() > 0);
-
-        let message_id = parsed
-            .as_ref()
-            .and_then(|m| m.message_id())
-            .and_then(normalize_message_id);
-
-        Self {
-            id,
-            message_id,
-            flags,
-            subject,
-            from,
-            to,
-            date,
-            size,
-            has_attachment,
+    if !dovecot_table.is_empty() {
+        let md_flags = MaildirFlags::with_dovecot(message.path(), dovecot_table);
+        for f in md_flags.iter() {
+            if let MaildirFlag::Keyword(_) = f {
+                if let Some(flag) = flag_from_maildir(f) {
+                    flags.insert(flag);
+                }
+            }
         }
+    }
+
+    if let Some(header) = header {
+        for keyword in extract_keywords_header(message.contents(), header) {
+            flags.insert(Flag::from_raw(keyword));
+        }
+    }
+
+    let size = message.contents().len() as u64;
+    let parsed = message.parsed();
+
+    let subject = parsed
+        .as_ref()
+        .and_then(|m| m.subject())
+        .unwrap_or_default()
+        .to_string();
+
+    let from = parsed
+        .as_ref()
+        .and_then(|m| m.from())
+        .map(addresses_from)
+        .unwrap_or_default();
+
+    let to = parsed
+        .as_ref()
+        .and_then(|m| m.to())
+        .map(addresses_from)
+        .unwrap_or_default();
+
+    let date = parsed
+        .as_ref()
+        .and_then(|m| m.date())
+        .and_then(|d| DateTime::parse_from_rfc3339(&d.to_rfc3339()).ok());
+
+    let has_attachment = parsed.as_ref().map(|m| m.attachment_count() > 0);
+
+    let message_id = parsed
+        .as_ref()
+        .and_then(|m| m.message_id())
+        .and_then(normalize_message_id);
+
+    Envelope {
+        id,
+        message_id,
+        flags,
+        subject,
+        from,
+        to,
+        date,
+        size,
+        has_attachment,
     }
 }
 
