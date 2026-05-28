@@ -47,6 +47,14 @@ pub enum EmailClientStdError {
     #[error(transparent)]
     Smtp(#[from] io_smtp::client::SmtpClientStdError),
 
+    #[cfg(feature = "jmap")]
+    #[error(transparent)]
+    Http(#[from] io_http::client::HttpClientStdError),
+
+    #[cfg(feature = "client")]
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+
     #[error("no registered backend supports this operation")]
     UnsupportedOperation,
 
@@ -194,6 +202,39 @@ impl EmailClientStd {
                         _with_attachment,
                     );
                 }
+                #[cfg(feature = "smtp")]
+                BackendKind::Smtp => continue,
+            }
+        }
+
+        Err(EmailClientStdError::UnsupportedOperation)
+    }
+
+    /// Opens a long-lived [`crate::event::WatchEvent`] stream over
+    /// `mailbox` and returns the consumer-side handle.
+    ///
+    /// Consumes `self` because the protocol thread takes exclusive
+    /// ownership of the chosen backend's connection for the lifetime
+    /// of the stream. Other registered slots are dropped. Backend
+    /// selection follows the registration order (IMAP, then JMAP,
+    /// then Maildir); the first slot that supports watch wins.
+    #[cfg(any(feature = "imap", feature = "jmap", feature = "maildir"))]
+    pub fn watch_envelopes(
+        self,
+        mailbox: String,
+    ) -> Result<crate::watch::WatchStream, EmailClientStdError> {
+        trace!("watch envelopes with {self:?}");
+
+        for kind in self.order.iter().copied() {
+            match kind {
+                #[cfg(feature = "imap")]
+                BackendKind::Imap => return self.imap_watch_envelopes(mailbox),
+                #[cfg(feature = "jmap")]
+                BackendKind::Jmap => return self.jmap_watch_envelopes(mailbox),
+                #[cfg(feature = "maildir")]
+                BackendKind::Maildir => return self.maildir_watch_envelopes(mailbox),
+                #[cfg(feature = "m2dir")]
+                BackendKind::M2dir => continue,
                 #[cfg(feature = "smtp")]
                 BackendKind::Smtp => continue,
             }

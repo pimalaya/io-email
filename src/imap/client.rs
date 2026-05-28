@@ -413,6 +413,16 @@ impl EmailClientStd {
         Ok(())
     }
 
+    pub(crate) fn imap_watch_envelopes(
+        self,
+        mailbox: String,
+    ) -> Result<crate::watch::WatchStream, EmailClientStdError> {
+        let client = self
+            .imap
+            .expect("imap slot registered (checked by dispatcher)");
+        crate::imap::watch::watch_envelopes(client, mailbox)
+    }
+
     pub(crate) fn imap_diff_envelopes(
         &mut self,
         mailbox: &str,

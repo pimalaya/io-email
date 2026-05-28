@@ -20,9 +20,9 @@ rustdoc-args = ["--cfg", "docsrs"]
 default = []
 client = ["pimalaya-stream/std", "io-imap?/client", "io-jmap?/client", "io-maildir?/client", "io-m2dir?/client", "io-smtp?/client"]
 imap = ["dep:io-imap", "dep:mail-parser", "dep:rfc2047-decoder", "dep:uuid"]
-jmap = ["dep:io-jmap", "dep:mail-parser", "dep:secrecy", "dep:url"]
+jmap = ["dep:io-jmap", "dep:io-http", "io-http?/client", "dep:mail-parser", "dep:secrecy", "dep:url"]
 smtp = ["dep:io-smtp"]
-maildir = ["client", "dep:io-maildir", "io-maildir?/client", "io-maildir?/parser", "dep:mail-parser"]
+maildir = ["client", "dep:io-maildir", "io-maildir?/client", "io-maildir?/parser", "dep:mail-parser", "dep:notify"]
 m2dir = ["client", "dep:io-m2dir", "io-m2dir?/client", "dep:mail-parser"]
 search = ["dep:chumsky"]
 serde = ["dep:serde", "chrono/serde", "mail-parser?/serde"]
@@ -30,6 +30,7 @@ serde = ["dep:serde", "chrono/serde", "mail-parser?/serde"]
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["alloc"] }
 chumsky = { version = "0.13", default-features = false, optional = true }
+io-http = { version = "0.0.3", default-features = false, optional = true }
 io-imap = { version = "0.0.1", default-features = false, optional = true }
 io-jmap = { version = "0.0.1", default-features = false, optional = true }
 io-m2dir = { version = "0.0.1", default-features = false, optional = true }
@@ -37,6 +38,7 @@ io-maildir = { version = "0.0.1", default-features = false, optional = true }
 io-smtp = { version = "0.0.1", default-features = false, optional = true }
 log = { version = "0.4", default-features = false }
 mail-parser = { version = "0.11", optional = true }
+notify = { version = "8", optional = true, default-features = false, features = ["macos_kqueue"] }
 pimalaya-stream = { version = "0.0.1", default-features = false, optional = true }
 rfc2047-decoder = { version = "1", optional = true }
 secrecy = { version = "0.10", optional = true }

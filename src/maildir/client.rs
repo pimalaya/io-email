@@ -72,6 +72,16 @@ impl EmailClientStd {
         Ok(mailboxes)
     }
 
+    pub(crate) fn maildir_watch_envelopes(
+        self,
+        mailbox: String,
+    ) -> Result<crate::watch::WatchStream, EmailClientStdError> {
+        let client = self
+            .maildir
+            .expect("maildir slot registered (checked by dispatcher)");
+        crate::maildir::watch::watch_envelopes(client, mailbox)
+    }
+
     /// Parallel envelope listing backed by the std::thread::scope
     /// worker pool in [`MaildirClient::read_entries_par`].
     ///

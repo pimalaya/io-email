@@ -72,6 +72,16 @@ impl EmailClientStd {
         Ok(output.mailboxes.into_iter().map(Mailbox::from).collect())
     }
 
+    pub(crate) fn jmap_watch_envelopes(
+        self,
+        mailbox: String,
+    ) -> Result<crate::watch::WatchStream, EmailClientStdError> {
+        let client = self
+            .jmap
+            .expect("jmap slot registered (checked by dispatcher)");
+        crate::jmap::watch::watch_envelopes(client, mailbox)
+    }
+
     pub(crate) fn jmap_list_envelopes(
         &mut self,
         mailbox: &str,

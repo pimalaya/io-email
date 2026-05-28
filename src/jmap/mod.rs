@@ -15,3 +15,5 @@ pub mod message_copy;
 pub mod message_get;
 pub mod message_move;
 pub mod message_send;
+#[cfg(feature = "client")]
+pub mod watch;

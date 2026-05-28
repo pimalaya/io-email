@@ -18,6 +18,7 @@ pub mod address;
 ))]
 pub mod client;
 pub mod envelope;
+pub mod event;
 pub mod flag;
 #[cfg(feature = "imap")]
 pub mod imap;
@@ -32,3 +33,6 @@ pub mod maildir;
 pub mod search;
 #[cfg(feature = "smtp")]
 pub mod smtp;
+#[cfg(feature = "client")]
+#[cfg(any(feature = "imap", feature = "jmap", feature = "maildir"))]
+pub mod watch;
