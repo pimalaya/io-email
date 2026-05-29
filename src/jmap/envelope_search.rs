@@ -1,42 +1,51 @@
-//! JMAP envelope search (batched `Email/query` + `Email/get`).
+//! JMAP envelope-search coroutine.
 //!
-//! Translates a shared [`SearchEmailsQuery`] into JMAP primitives with
-//! two intentional limitations versus IMAP / Maildir:
+//! Two-stage state machine:
+//! 1. `Mailbox/query + Mailbox/get` resolves the shared mailbox name
+//!    to a JMAP id.
+//! 2. `Email/query + Email/get` (batched in a single HTTP round-trip)
+//!    runs the translated filter + sort scoped to that mailbox.
 //!
-//! 1. JMAP's `FilterCondition` (RFC 8621 §4.4.1) has no recursive
-//!    operator object. Multiple non-`None` fields are an implicit AND,
-//!    but `OR` and `NOT` are not expressible without a wrapping
-//!    `FilterOperator`, which `io-jmap` does not model yet. Queries
-//!    containing those nodes are rejected at conversion time with
-//!    [`EmailClientStdError::OperationFailed`].
+//! The shared filter AST is translated into a JMAP
+//! [`Filter<EmailFilter>`] tree: AND/OR/NOT map to
+//! [`FilterOperator`]s and leaves map to flat `EmailFilter`
+//! conditions. The mailbox scoping is added as a top-level AND.
 //!
-//! 2. JMAP's `before` / `after` filter primitives are anchored to
-//!    `receivedAt`, while our DSL targets `sentAt`. The conversion
-//!    over-approximates by anchoring on `receivedAt`, then re-applies
-//!    the exact `sentAt` predicate client-side via [`PostFilter`].
-//!
-//! When post-filters are present, server-side pagination would slice
-//! the over-approximated result before we trim it; the coroutine
-//! fetches without `position`/`limit` and paginates after the
-//! client-side pass.
+//! Date semantics: the shared DSL targets the `Date:` header
+//! (sent-at) while JMAP's `before` / `after` filter primitives are
+//! anchored to `receivedAt`. The conversion over-approximates by
+//! anchoring on `receivedAt`, then re-applies the exact `sentAt`
+//! predicate client-side via [`PostFilter`]. When post-filters are
+//! present, server-side pagination would slice the over-approximated
+//! result before we trim it, so the coroutine fetches without
+//! `position` / `limit` and paginates after the client-side pass.
 
 use alloc::{string::String, vec, vec::Vec};
+use core::mem;
 
 use chrono::{Datelike, NaiveDate};
 use io_jmap::{
-    rfc8620::session::JmapSession,
+    coroutine::{JmapCoroutine, JmapCoroutineState, JmapYield},
+    rfc8620::{filter::Filter, session::JmapSession},
     rfc8621::{
         email::{EmailComparator, EmailFilter, EmailSortProperty},
-        email_query::{JmapEmailQuery, JmapEmailQueryError, JmapEmailQueryResult},
+        email_query::{JmapEmailQuery as InnerQuery, JmapEmailQueryError as QueryErr},
+        mailbox::{MailboxFilter, MailboxProperty},
+        mailbox_query::{
+            JmapMailboxQuery as InnerMailboxQuery, JmapMailboxQueryError as MailboxQueryErr,
+        },
     },
 };
 use log::trace;
 use secrecy::SecretString;
+use thiserror::Error;
 
 use crate::{
-    client::EmailClientStdError,
+    coroutine::{EmailBackend, EmailCoroutine, EmailCoroutineArg, EmailCoroutineState, JmapStep},
     envelope::Envelope,
-    jmap::{convert::compute_position_limit, envelope_list::envelope_properties},
+    jmap::convert::{
+        compute_position_limit, envelope_from, envelope_properties, find_mailbox_id, keyword_from,
+    },
     search::{
         filter::query::SearchEmailsFilterQuery,
         query::SearchEmailsQuery,
@@ -44,25 +53,22 @@ use crate::{
     },
 };
 
-/// Errors produced while running JMAP envelope search.
-#[derive(Debug, thiserror::Error)]
+/// Errors produced by [`JmapEnvelopeSearch`].
+#[derive(Debug, Error)]
 pub enum JmapEnvelopeSearchError {
     #[error(transparent)]
-    Query(#[from] JmapEmailQueryError),
+    MailboxQuery(#[from] MailboxQueryErr),
     #[error(transparent)]
-    Convert(#[from] EmailClientStdError),
+    EmailQuery(#[from] QueryErr),
+    #[error("no JMAP mailbox named `{0}` found")]
+    NotFound(String),
+    #[error("coroutine was resumed with the wrong EmailCoroutineArg variant")]
+    InvalidArg,
+    #[error("coroutine was resumed after completion")]
+    ResumedAfterDone,
 }
 
-/// Result returned by [`JmapEnvelopeSearch::resume`].
-#[derive(Debug)]
-pub enum JmapEnvelopeSearchResult {
-    Ok(Vec<Envelope>),
-    WantsRead,
-    WantsWrite(Vec<u8>),
-    Err(JmapEnvelopeSearchError),
-}
-
-/// Client-side residual predicate left over after the server filter
+/// Residual client-side predicate left over after the server filter
 /// was applied. Each variant re-checks one AST leaf against the
 /// envelope's `sentAt` (carried in [`Envelope::date`]).
 #[derive(Clone, Debug)]
@@ -71,113 +77,197 @@ pub enum PostFilter {
     AfterDate(NaiveDate),
 }
 
-/// Output of [`build`]: the JMAP-side filter to send to `Email/query`,
-/// the JMAP-side comparator list, and the residual client-side
-/// predicates the caller must re-apply on the returned envelopes.
-#[derive(Debug)]
-pub struct Converted {
-    pub filter: EmailFilter,
-    pub sort: Vec<EmailComparator>,
-    pub post_filters: Vec<PostFilter>,
-}
-
-/// I/O-free coroutine wrapping a batched `Email/query` + `Email/get`
-/// scoped to a single mailbox. Applies any residual `sentAt` predicate
-/// client-side before paginating.
+/// I/O-free coroutine wrapping a mailbox-name lookup + batched
+/// `Email/query` + `Email/get`. Applies any residual `sentAt`
+/// predicate client-side before paginating.
 pub struct JmapEnvelopeSearch {
-    inner: JmapEmailQuery,
-    post_filters: Vec<PostFilter>,
+    state: State,
+    name: String,
+    session: JmapSession,
+    http_auth: SecretString,
+    query: Option<SearchEmailsQuery>,
     page: Option<u32>,
     page_size: Option<u32>,
-    paginate_client_side: bool,
 }
 
 impl JmapEnvelopeSearch {
-    /// `page` is 1-indexed; `page_size = None` lets the server pick.
-    /// `mailbox_filter` is the optional base filter (typically the
-    /// `inMailbox` constraint from
-    /// [`crate::jmap::convert::mailbox_filter`]). `query` carries the
-    /// shared filter+sort AST; `None` defaults to "all envelopes,
-    /// `sentAt` descending".
     pub fn new(
         session: &JmapSession,
         http_auth: &SecretString,
-        mailbox_filter: Option<EmailFilter>,
+        mailbox: &str,
         query: Option<&SearchEmailsQuery>,
         page: Option<u32>,
         page_size: Option<u32>,
     ) -> Result<Self, JmapEnvelopeSearchError> {
         trace!("prepare JMAP envelope search");
-
-        let base = mailbox_filter.unwrap_or_default();
-        let converted = build(query, base)?;
-
-        let paginate_client_side = !converted.post_filters.is_empty();
-        let (position, limit) = if paginate_client_side {
-            (None, None)
-        } else {
-            compute_position_limit(page, page_size)
-        };
-
-        let inner = JmapEmailQuery::new(
+        let resolver = InnerMailboxQuery::new(
             session,
             http_auth,
-            Some(converted.filter),
-            Some(converted.sort),
-            position,
-            limit,
-            Some(envelope_properties()),
+            Some(MailboxFilter {
+                name: Some(mailbox.into()),
+                ..MailboxFilter::default()
+            }),
+            None,
+            None,
+            None,
+            Some(vec![MailboxProperty::Id, MailboxProperty::Name]),
         )?;
-
         Ok(Self {
-            inner,
-            post_filters: converted.post_filters,
+            state: State::Resolving(resolver),
+            name: mailbox.into(),
+            session: session.clone(),
+            http_auth: http_auth.clone(),
+            query: query.cloned(),
             page,
             page_size,
-            paginate_client_side,
         })
     }
+}
 
-    pub fn resume(&mut self, arg: Option<&[u8]>) -> JmapEnvelopeSearchResult {
-        match self.inner.resume(arg) {
-            JmapEmailQueryResult::WantsRead => JmapEnvelopeSearchResult::WantsRead,
-            JmapEmailQueryResult::WantsWrite(bytes) => JmapEnvelopeSearchResult::WantsWrite(bytes),
-            JmapEmailQueryResult::Err(err) => JmapEnvelopeSearchResult::Err(err.into()),
-            JmapEmailQueryResult::Ok { emails, .. } => {
-                let mut envelopes: Vec<Envelope> = emails.into_iter().map(Envelope::from).collect();
+impl EmailCoroutine for JmapEnvelopeSearch {
+    type Yield = JmapStep;
+    type Return = Result<Vec<Envelope>, JmapEnvelopeSearchError>;
 
-                if self.paginate_client_side {
-                    envelopes.retain(|env| post_filter(env, &self.post_filters));
-                    envelopes = paginate(envelopes, self.page, self.page_size);
+    const BACKEND: EmailBackend = EmailBackend::Jmap;
+
+    fn resume(
+        &mut self,
+        arg: EmailCoroutineArg<'_>,
+    ) -> EmailCoroutineState<Self::Yield, Self::Return> {
+        #[allow(irrefutable_let_patterns)]
+        let EmailCoroutineArg::Jmap { bytes } = arg else {
+            return EmailCoroutineState::Complete(Err(JmapEnvelopeSearchError::InvalidArg));
+        };
+
+        match mem::replace(&mut self.state, State::Done) {
+            State::Resolving(mut resolver) => match resolver.resume(bytes) {
+                JmapCoroutineState::Complete(Ok(ok)) => {
+                    let Some(id) = find_mailbox_id(&ok.mailboxes, &self.name) else {
+                        return EmailCoroutineState::Complete(Err(
+                            JmapEnvelopeSearchError::NotFound(self.name.clone()),
+                        ));
+                    };
+
+                    let Converted {
+                        filter,
+                        sort,
+                        post_filters,
+                    } = build(self.query.as_ref(), id);
+
+                    let paginate_client_side = !post_filters.is_empty();
+                    let (position, limit) = if paginate_client_side {
+                        (None, None)
+                    } else {
+                        compute_position_limit(self.page, self.page_size)
+                    };
+
+                    let inner = match InnerQuery::new(
+                        &self.session,
+                        &self.http_auth,
+                        Some(filter),
+                        Some(sort),
+                        position,
+                        limit,
+                        Some(envelope_properties()),
+                    ) {
+                        Ok(q) => q,
+                        Err(err) => return EmailCoroutineState::Complete(Err(err.into())),
+                    };
+                    self.state = State::Searching {
+                        inner,
+                        post_filters,
+                    };
+                    self.resume(EmailCoroutineArg::Jmap { bytes: None })
                 }
+                JmapCoroutineState::Yielded(JmapYield::WantsRead) => {
+                    self.state = State::Resolving(resolver);
+                    EmailCoroutineState::Yielded(JmapStep::WantsRead)
+                }
+                JmapCoroutineState::Yielded(JmapYield::WantsWrite(out)) => {
+                    self.state = State::Resolving(resolver);
+                    EmailCoroutineState::Yielded(JmapStep::WantsWrite(out))
+                }
+                JmapCoroutineState::Complete(Err(err)) => {
+                    EmailCoroutineState::Complete(Err(err.into()))
+                }
+            },
+            State::Searching {
+                mut inner,
+                post_filters,
+            } => match inner.resume(bytes) {
+                JmapCoroutineState::Complete(Ok(ok)) => {
+                    let mut envelopes: Vec<Envelope> =
+                        ok.emails.into_iter().map(envelope_from).collect();
 
-                JmapEnvelopeSearchResult::Ok(envelopes)
+                    if !post_filters.is_empty() {
+                        envelopes.retain(|env| post_match(env, &post_filters));
+                        envelopes = paginate(envelopes, self.page, self.page_size);
+                    }
+
+                    EmailCoroutineState::Complete(Ok(envelopes))
+                }
+                JmapCoroutineState::Yielded(JmapYield::WantsRead) => {
+                    self.state = State::Searching {
+                        inner,
+                        post_filters,
+                    };
+                    EmailCoroutineState::Yielded(JmapStep::WantsRead)
+                }
+                JmapCoroutineState::Yielded(JmapYield::WantsWrite(out)) => {
+                    self.state = State::Searching {
+                        inner,
+                        post_filters,
+                    };
+                    EmailCoroutineState::Yielded(JmapStep::WantsWrite(out))
+                }
+                JmapCoroutineState::Complete(Err(err)) => {
+                    EmailCoroutineState::Complete(Err(err.into()))
+                }
+            },
+            State::Done => {
+                EmailCoroutineState::Complete(Err(JmapEnvelopeSearchError::ResumedAfterDone))
             }
         }
     }
 }
 
-/// Converts the shared query into JMAP primitives plus residual
-/// predicates. The `base` filter is merged with the query's leaves;
-/// callers typically pass [`crate::jmap::convert::mailbox_filter`]'s
-/// result so the result stays scoped to the active mailbox.
-pub fn build(
-    query: Option<&SearchEmailsQuery>,
-    base: EmailFilter,
-) -> Result<Converted, EmailClientStdError> {
-    let mut filter = base;
+enum State {
+    Resolving(InnerMailboxQuery),
+    Searching {
+        inner: InnerQuery,
+        post_filters: Vec<PostFilter>,
+    },
+    Done,
+}
+
+/// Output of [`build`]: the JMAP-side filter (mailbox-scoped, AND/OR/NOT
+/// supported), the JMAP-side comparator list, and the residual
+/// client-side predicates the coroutine must re-apply on the returned
+/// envelopes.
+struct Converted {
+    filter: Filter<EmailFilter>,
+    sort: Vec<EmailComparator>,
+    post_filters: Vec<PostFilter>,
+}
+
+/// Converts `query` into JMAP primitives. The result is always
+/// AND-scoped to `mailbox_id`; an empty user filter yields just the
+/// mailbox scope.
+fn build(query: Option<&SearchEmailsQuery>, mailbox_id: String) -> Converted {
+    let mailbox_scope = Filter::Condition(EmailFilter {
+        in_mailbox: Some(mailbox_id),
+        ..EmailFilter::default()
+    });
+
     let mut post_filters = Vec::new();
+    let user_filter = query
+        .and_then(|q| q.filter.as_ref())
+        .map(|f| convert_filter(f, &mut post_filters));
 
-    if let Some(query) = query
-        && let Some(ref f) = query.filter
-    {
-        let mut leaves = Vec::new();
-        collect_conjunction(f, &mut leaves)?;
-
-        for leaf in leaves {
-            apply_leaf(&mut filter, &mut post_filters, leaf)?;
-        }
-    }
+    let filter = match user_filter {
+        Some(uf) => Filter::and(vec![mailbox_scope, uf]),
+        None => mailbox_scope,
+    };
 
     let sort = query
         .and_then(|q| q.sort.as_deref())
@@ -185,17 +275,82 @@ pub fn build(
         .map(|chain| chain.iter().map(convert_sorter).collect())
         .unwrap_or_else(|| vec![sent_at_desc()]);
 
-    Ok(Converted {
+    Converted {
         filter,
         sort,
         post_filters,
-    })
+    }
+}
+
+/// Recursively translates `node` into a JMAP filter tree. Date-leaf
+/// conversions push a [`PostFilter`] entry so the strict sent-at
+/// semantics can be re-applied client-side.
+fn convert_filter(
+    node: &SearchEmailsFilterQuery,
+    post_filters: &mut Vec<PostFilter>,
+) -> Filter<EmailFilter> {
+    use SearchEmailsFilterQuery as Q;
+
+    match node {
+        Q::And(left, right) => Filter::and(vec![
+            convert_filter(left, post_filters),
+            convert_filter(right, post_filters),
+        ]),
+        Q::Or(left, right) => Filter::or(vec![
+            convert_filter(left, post_filters),
+            convert_filter(right, post_filters),
+        ]),
+        Q::Not(inner) => Filter::not(vec![convert_filter(inner, post_filters)]),
+
+        Q::From(pattern) => Filter::Condition(EmailFilter {
+            from: Some(pattern.clone()),
+            ..EmailFilter::default()
+        }),
+        Q::To(pattern) => Filter::Condition(EmailFilter {
+            to: Some(pattern.clone()),
+            ..EmailFilter::default()
+        }),
+        Q::Subject(pattern) => Filter::Condition(EmailFilter {
+            subject: Some(pattern.clone()),
+            ..EmailFilter::default()
+        }),
+        Q::Body(pattern) => Filter::Condition(EmailFilter {
+            body: Some(pattern.clone()),
+            ..EmailFilter::default()
+        }),
+        Q::Flag(flag) => Filter::Condition(EmailFilter {
+            has_keyword: Some(keyword_from(flag)),
+            ..EmailFilter::default()
+        }),
+
+        // Over-approximate via `after = start-of-day(D)` (the lowest
+        // `receivedAt` consistent with "sentAt-day == D"); the exact
+        // sent-at constraint is re-checked client-side.
+        Q::Date(target) => {
+            post_filters.push(PostFilter::Date(*target));
+            Filter::Condition(EmailFilter {
+                after: Some(utc_midnight(*target)),
+                ..EmailFilter::default()
+            })
+        }
+        // Over-approximate via `after = start-of-day(D+1)` (the
+        // lowest `receivedAt` consistent with "sentAt-day > D"); the
+        // strict sent-at constraint is re-checked client-side.
+        Q::AfterDate(target) => {
+            post_filters.push(PostFilter::AfterDate(*target));
+            let bumped = target.succ_opt().unwrap_or(*target);
+            Filter::Condition(EmailFilter {
+                after: Some(utc_midnight(bumped)),
+                ..EmailFilter::default()
+            })
+        }
+    }
 }
 
 /// Returns `true` when `envelope` matches every residual predicate.
-/// Apply this after the JMAP server returns its (over-approximating)
+/// Apply after the JMAP server returns its (over-approximating)
 /// result set to drop the false positives.
-pub fn post_filter(envelope: &Envelope, post_filters: &[PostFilter]) -> bool {
+fn post_match(envelope: &Envelope, post_filters: &[PostFilter]) -> bool {
     post_filters.iter().all(|pf| match pf {
         PostFilter::Date(target) => envelope
             .date
@@ -208,141 +363,13 @@ pub fn post_filter(envelope: &Envelope, post_filters: &[PostFilter]) -> bool {
     })
 }
 
-/// Default comparator: `sentAt` descending. Matches the sent-at rule
-/// the shared DSL applies on every backend.
-pub fn sent_at_desc() -> EmailComparator {
+fn sent_at_desc() -> EmailComparator {
     EmailComparator {
         property: EmailSortProperty::SentAt,
         is_ascending: Some(false),
         collation: None,
         keyword: None,
     }
-}
-
-fn paginate(envelopes: Vec<Envelope>, page: Option<u32>, page_size: Option<u32>) -> Vec<Envelope> {
-    let total = envelopes.len();
-    let size = page_size.map(|n| n as usize);
-    let start = ((page.unwrap_or(1).max(1) - 1) as usize).saturating_mul(size.unwrap_or(0));
-
-    if start >= total {
-        return Vec::new();
-    }
-
-    let end = match size {
-        Some(n) => start.saturating_add(n).min(total),
-        None => total,
-    };
-
-    envelopes[start..end].to_vec()
-}
-
-fn collect_conjunction<'a>(
-    node: &'a SearchEmailsFilterQuery,
-    out: &mut Vec<&'a SearchEmailsFilterQuery>,
-) -> Result<(), EmailClientStdError> {
-    use SearchEmailsFilterQuery as Q;
-
-    match node {
-        Q::And(left, right) => {
-            collect_conjunction(left, out)?;
-            collect_conjunction(right, out)
-        }
-        Q::Or(_, _) => Err(EmailClientStdError::OperationFailed(
-            "envelopes search `or` is not yet supported on JMAP",
-        )),
-        Q::Not(_) => Err(EmailClientStdError::OperationFailed(
-            "envelopes search `not` is not yet supported on JMAP",
-        )),
-        leaf => {
-            out.push(leaf);
-            Ok(())
-        }
-    }
-}
-
-fn apply_leaf(
-    filter: &mut EmailFilter,
-    post_filters: &mut Vec<PostFilter>,
-    leaf: &SearchEmailsFilterQuery,
-) -> Result<(), EmailClientStdError> {
-    use SearchEmailsFilterQuery as Q;
-
-    match leaf {
-        Q::From(pattern) => set_once(&mut filter.from, pattern.clone(), "from"),
-        Q::To(pattern) => set_once(&mut filter.to, pattern.clone(), "to"),
-        Q::Subject(pattern) => set_once(&mut filter.subject, pattern.clone(), "subject"),
-        Q::Body(pattern) => set_once(&mut filter.body, pattern.clone(), "body"),
-        Q::Flag(flag) => {
-            let keyword = crate::jmap::convert::keyword_from(flag);
-            set_once(&mut filter.has_keyword, keyword, "flag")
-        }
-        // Over-approximate via `after = start-of-day(D)` (the lowest
-        // `receivedAt` consistent with "sentAt-day == D"); the exact
-        // sent-at constraint is re-checked client-side.
-        Q::Date(target) => {
-            tighten_after(&mut filter.after, *target)?;
-            post_filters.push(PostFilter::Date(*target));
-            Ok(())
-        }
-        // Over-approximate via `after = start-of-day(D+1)` (the lowest
-        // `receivedAt` consistent with "sentAt-day > D"); the strict
-        // sent-at constraint is re-checked client-side.
-        Q::AfterDate(target) => {
-            let bumped = target.succ_opt().unwrap_or(*target);
-            tighten_after(&mut filter.after, bumped)?;
-            post_filters.push(PostFilter::AfterDate(*target));
-            Ok(())
-        }
-        Q::And(_, _) | Q::Or(_, _) | Q::Not(_) => {
-            // collect_conjunction already filtered these out
-            unreachable!()
-        }
-    }
-}
-
-fn set_once(
-    slot: &mut Option<String>,
-    value: String,
-    field: &'static str,
-) -> Result<(), EmailClientStdError> {
-    if slot.is_some() {
-        return Err(EmailClientStdError::OperationFailed(match field {
-            "from" => "JMAP filter accepts at most one `from` clause",
-            "to" => "JMAP filter accepts at most one `to` clause",
-            "subject" => "JMAP filter accepts at most one `subject` clause",
-            "body" => "JMAP filter accepts at most one `body` clause",
-            "flag" => "JMAP filter accepts at most one `flag` clause",
-            _ => "JMAP filter accepts at most one clause per field",
-        }));
-    }
-    *slot = Some(value);
-    Ok(())
-}
-
-/// Replaces `slot` with the tighter of the existing and the new lower
-/// bound. Both bounds are expressed as JMAP UTCDate strings anchored
-/// to midnight UTC on the given day.
-fn tighten_after(
-    slot: &mut Option<String>,
-    candidate: NaiveDate,
-) -> Result<(), EmailClientStdError> {
-    let candidate_str = utc_midnight(candidate);
-    match slot {
-        Some(existing) if existing.as_str() >= candidate_str.as_str() => Ok(()),
-        _ => {
-            *slot = Some(candidate_str);
-            Ok(())
-        }
-    }
-}
-
-fn utc_midnight(date: NaiveDate) -> String {
-    alloc::format!(
-        "{:04}-{:02}-{:02}T00:00:00Z",
-        date.year(),
-        date.month(),
-        date.day()
-    )
 }
 
 fn convert_sorter(sorter: &SearchEmailsSorter) -> EmailComparator {
@@ -368,11 +395,38 @@ fn convert_sorter(sorter: &SearchEmailsSorter) -> EmailComparator {
     }
 }
 
+fn paginate(envelopes: Vec<Envelope>, page: Option<u32>, page_size: Option<u32>) -> Vec<Envelope> {
+    let total = envelopes.len();
+    let size = page_size.map(|n| n as usize);
+    let start = ((page.unwrap_or(1).max(1) - 1) as usize).saturating_mul(size.unwrap_or(0));
+
+    if start >= total {
+        return Vec::new();
+    }
+
+    let end = match size {
+        Some(n) => start.saturating_add(n).min(total),
+        None => total,
+    };
+
+    envelopes[start..end].to_vec()
+}
+
+fn utc_midnight(date: NaiveDate) -> String {
+    alloc::format!(
+        "{:04}-{:02}-{:02}T00:00:00Z",
+        date.year(),
+        date.month(),
+        date.day()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use alloc::boxed::Box;
 
     use chrono::{DateTime, NaiveDate};
+    use io_jmap::rfc8620::filter::{FilterOperator, FilterOperatorKind};
 
     use super::*;
     use crate::{address::Address, flag::Flag};
@@ -398,85 +452,112 @@ mod tests {
         }
     }
 
+    fn pluck_user_filter(filter: Filter<EmailFilter>) -> Filter<EmailFilter> {
+        // build() always wraps the user filter in `AND(mailbox_scope,
+        // user_filter)` when a user filter is present.
+        let Filter::Operator(FilterOperator { conditions, .. }) = filter else {
+            panic!("expected top-level AND combinator");
+        };
+        conditions.into_iter().nth(1).expect("expected user filter")
+    }
+
     #[test]
-    fn or_and_not_are_rejected() {
-        let query = SearchEmailsQuery {
+    fn empty_query_yields_just_the_mailbox_scope() {
+        let c = build(None, "mbox-1".into());
+        match c.filter {
+            Filter::Condition(EmailFilter {
+                in_mailbox: Some(id),
+                ..
+            }) => assert_eq!(id, "mbox-1"),
+            other => panic!("expected mailbox-scope condition, got {other:?}"),
+        }
+        assert!(c.post_filters.is_empty());
+        assert_eq!(c.sort.len(), 1);
+        assert!(matches!(c.sort[0].property, EmailSortProperty::SentAt));
+        assert_eq!(c.sort[0].is_ascending, Some(false));
+    }
+
+    #[test]
+    fn or_translates_to_filter_operator() {
+        let q = SearchEmailsQuery {
             filter: Some(SearchEmailsFilterQuery::Or(
-                Box::new(SearchEmailsFilterQuery::From("a".into())),
-                Box::new(SearchEmailsFilterQuery::From("b".into())),
-            )),
-            sort: None,
-        };
-        assert!(build(Some(&query), EmailFilter::default()).is_err());
-
-        let query = SearchEmailsQuery {
-            filter: Some(SearchEmailsFilterQuery::Not(Box::new(
-                SearchEmailsFilterQuery::From("a".into()),
-            ))),
-            sort: None,
-        };
-        assert!(build(Some(&query), EmailFilter::default()).is_err());
-    }
-
-    #[test]
-    fn conjunction_folds_into_a_single_filter() {
-        let query = SearchEmailsQuery {
-            filter: Some(SearchEmailsFilterQuery::And(
-                Box::new(SearchEmailsFilterQuery::From("alice".into())),
-                Box::new(SearchEmailsFilterQuery::Subject("release".into())),
-            )),
-            sort: None,
-        };
-        let converted = build(Some(&query), EmailFilter::default()).unwrap();
-        assert_eq!(converted.filter.from.as_deref(), Some("alice"));
-        assert_eq!(converted.filter.subject.as_deref(), Some("release"));
-        assert!(converted.post_filters.is_empty());
-    }
-
-    #[test]
-    fn duplicate_clause_is_rejected() {
-        let query = SearchEmailsQuery {
-            filter: Some(SearchEmailsFilterQuery::And(
                 Box::new(SearchEmailsFilterQuery::From("alice".into())),
                 Box::new(SearchEmailsFilterQuery::From("bob".into())),
             )),
             sort: None,
         };
-        assert!(build(Some(&query), EmailFilter::default()).is_err());
+        let c = build(Some(&q), "mbox".into());
+        let inner = pluck_user_filter(c.filter);
+        let Filter::Operator(FilterOperator {
+            operator,
+            conditions,
+        }) = inner
+        else {
+            panic!("expected OR operator");
+        };
+        assert_eq!(operator, FilterOperatorKind::Or);
+        assert_eq!(conditions.len(), 2);
     }
 
     #[test]
-    fn date_clause_records_post_filter_and_tightens_after() {
-        let query = SearchEmailsQuery {
+    fn not_wraps_a_single_subfilter() {
+        let q = SearchEmailsQuery {
+            filter: Some(SearchEmailsFilterQuery::Not(Box::new(
+                SearchEmailsFilterQuery::From("a".into()),
+            ))),
+            sort: None,
+        };
+        let c = build(Some(&q), "mbox".into());
+        let inner = pluck_user_filter(c.filter);
+        let Filter::Operator(FilterOperator {
+            operator,
+            conditions,
+        }) = inner
+        else {
+            panic!("expected NOT operator");
+        };
+        assert_eq!(operator, FilterOperatorKind::Not);
+        assert_eq!(conditions.len(), 1);
+    }
+
+    #[test]
+    fn date_clause_records_post_filter_and_bounds_after() {
+        let q = SearchEmailsQuery {
             filter: Some(SearchEmailsFilterQuery::Date(naive(2026, 1, 15))),
             sort: None,
         };
-        let converted = build(Some(&query), EmailFilter::default()).unwrap();
-        assert_eq!(
-            converted.filter.after.as_deref(),
-            Some("2026-01-15T00:00:00Z")
-        );
+        let c = build(Some(&q), "mbox".into());
         assert!(matches!(
-            converted.post_filters.as_slice(),
+            c.post_filters.as_slice(),
             [PostFilter::Date(d)] if *d == naive(2026, 1, 15)
         ));
+        let inner = pluck_user_filter(c.filter);
+        match inner {
+            Filter::Condition(EmailFilter { after, .. }) => {
+                assert_eq!(after.as_deref(), Some("2026-01-15T00:00:00Z"));
+            }
+            other => panic!("expected condition, got {other:?}"),
+        }
     }
 
     #[test]
     fn after_clause_bumps_lower_bound_by_one_day() {
-        let query = SearchEmailsQuery {
+        let q = SearchEmailsQuery {
             filter: Some(SearchEmailsFilterQuery::AfterDate(naive(2026, 1, 15))),
             sort: None,
         };
-        let converted = build(Some(&query), EmailFilter::default()).unwrap();
-        assert_eq!(
-            converted.filter.after.as_deref(),
-            Some("2026-01-16T00:00:00Z")
-        );
+        let c = build(Some(&q), "mbox".into());
         assert!(matches!(
-            converted.post_filters.as_slice(),
+            c.post_filters.as_slice(),
             [PostFilter::AfterDate(d)] if *d == naive(2026, 1, 15)
         ));
+        let inner = pluck_user_filter(c.filter);
+        match inner {
+            Filter::Condition(EmailFilter { after, .. }) => {
+                assert_eq!(after.as_deref(), Some("2026-01-16T00:00:00Z"));
+            }
+            other => panic!("expected condition, got {other:?}"),
+        }
     }
 
     #[test]
@@ -484,8 +565,8 @@ mod tests {
         let post = [PostFilter::Date(naive(2026, 5, 15))];
         let on_day = envelope_at("2026-05-15T10:00:00+00:00");
         let next_day = envelope_at("2026-05-16T00:00:00+00:00");
-        assert!(post_filter(&on_day, &post));
-        assert!(!post_filter(&next_day, &post));
+        assert!(post_match(&on_day, &post));
+        assert!(!post_match(&next_day, &post));
     }
 
     #[test]
@@ -493,32 +574,27 @@ mod tests {
         let post = [PostFilter::AfterDate(naive(2026, 5, 15))];
         let on_day = envelope_at("2026-05-15T23:59:59+00:00");
         let next_day = envelope_at("2026-05-16T00:00:00+00:00");
-        assert!(!post_filter(&on_day, &post));
-        assert!(post_filter(&next_day, &post));
-    }
-
-    #[test]
-    fn empty_sort_defaults_to_sent_at_descending() {
-        let converted = build(None, EmailFilter::default()).unwrap();
-        assert_eq!(converted.sort.len(), 1);
-        assert!(matches!(
-            converted.sort[0].property,
-            EmailSortProperty::SentAt
-        ));
-        assert_eq!(converted.sort[0].is_ascending, Some(false));
+        assert!(!post_match(&on_day, &post));
+        assert!(post_match(&next_day, &post));
     }
 
     #[test]
     fn flag_clause_sets_has_keyword() {
         use crate::flag::IanaFlag;
 
-        let query = SearchEmailsQuery {
+        let q = SearchEmailsQuery {
             filter: Some(SearchEmailsFilterQuery::Flag(Flag::from_iana(
                 IanaFlag::Flagged,
             ))),
             sort: None,
         };
-        let converted = build(Some(&query), EmailFilter::default()).unwrap();
-        assert_eq!(converted.filter.has_keyword.as_deref(), Some("$flagged"));
+        let c = build(Some(&q), "mbox".into());
+        let inner = pluck_user_filter(c.filter);
+        match inner {
+            Filter::Condition(EmailFilter { has_keyword, .. }) => {
+                assert_eq!(has_keyword.as_deref(), Some("$flagged"));
+            }
+            other => panic!("expected condition, got {other:?}"),
+        }
     }
 }

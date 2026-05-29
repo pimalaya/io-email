@@ -1,29 +1,37 @@
-//! JMAP message send (`Blob/upload` + `Email/import` +
-//! `EmailSubmission/set`), wrapping a private orchestrator that
-//! uploads raw bytes, imports them into the caller-provided drafts
-//! mailbox with the `$draft` keyword, then submits them with the
-//! caller-provided identity.
+//! JMAP message-send coroutine.
+//!
+//! Three-stage state machine:
+//! 1. `Blob/upload` posts the raw RFC 5322 bytes to the session
+//!    `upload_url` and yields a blob id.
+//! 2. `Email/import` materialises the blob into the configured
+//!    drafts mailbox with the `$draft` keyword.
+//! 3. `EmailSubmission/set` queues the resulting email for delivery
+//!    under the configured identity. JMAP picks the SMTP envelope
+//!    from the email headers (`envelope: None`).
+//!
+//! `identity_id` and `drafts_mailbox_id` come from the
+//! [`JmapContext`] and must be populated before
+//! [`EmailClientStd::send_message`] is called.
+//!
+//! [`JmapContext`]: crate::client::JmapContext
+//! [`EmailClientStd::send_message`]: crate::client::EmailClientStd::send_message
 
+use alloc::{collections::BTreeMap, string::String, vec::Vec};
 use core::mem;
 
-use alloc::{
-    collections::BTreeMap,
-    string::{String, ToString},
-    vec::Vec,
-};
-
 use io_jmap::{
+    coroutine::{JmapCoroutine, JmapCoroutineState, JmapYield},
     rfc8620::{
-        blob_upload::{JmapBlobUpload, JmapBlobUploadError, JmapBlobUploadResult},
+        blob_upload::{JmapBlobUpload, JmapBlobUploadError, JmapBlobUploadOutput},
+        redirect::JmapRedirectYield,
         session::JmapSession,
     },
     rfc8621::{
-        capabilities,
         email::EmailImport,
-        email_import::{JmapEmailImport, JmapEmailImportError, JmapEmailImportResult},
+        email_import::{JmapEmailImport as InnerImport, JmapEmailImportError as ImportErr},
         email_submission::EmailSubmissionCreate,
         email_submission_set::{
-            JmapEmailSubmissionSet, JmapEmailSubmissionSetError, JmapEmailSubmissionSetResult,
+            JmapEmailSubmissionSet as InnerSubmit, JmapEmailSubmissionSetError as SubmitErr,
         },
     },
 };
@@ -32,257 +40,210 @@ use secrecy::SecretString;
 use thiserror::Error;
 use url::Url;
 
-/// Errors produced while orchestrating Blob/upload + Email/import +
-/// EmailSubmission/set for JMAP message submission.
+use crate::{
+    coroutine::{EmailBackend, EmailCoroutine, EmailCoroutineArg, EmailCoroutineState, JmapStep},
+    jmap::convert::account_id_of,
+};
+
+/// Errors produced by [`JmapMessageSend`].
 #[derive(Debug, Error)]
 pub enum JmapMessageSendError {
     #[error(transparent)]
     BlobUpload(#[from] JmapBlobUploadError),
     #[error(transparent)]
-    EmailImport(#[from] JmapEmailImportError),
+    Import(#[from] ImportErr),
     #[error(transparent)]
-    EmailSubmission(#[from] JmapEmailSubmissionSetError),
+    Submit(#[from] SubmitErr),
     #[error("Email/import did not create the staged email")]
-    ImportFailed,
+    NotImported,
     #[error("Email/import response did not include an email id")]
     MissingImportedEmailId,
+    #[error("JMAP blob upload reached unexpected redirection")]
+    UnsupportedRedirect,
     #[error("EmailSubmission/set did not submit the email")]
-    SubmissionFailed,
-    #[error("Resolved JMAP upload URL is invalid: {0}")]
+    NotSubmitted,
+    #[error("resolved JMAP upload URL is invalid: {0}")]
     InvalidUploadUrl(String),
-    #[error("JMAP message send was resumed after completion")]
-    AlreadyDone,
+    #[error("coroutine was resumed with the wrong EmailCoroutineArg variant")]
+    InvalidArg,
+    #[error("coroutine was resumed after completion")]
+    ResumedAfterDone,
 }
 
-/// Result returned by [`JmapMessageSend::resume`].
-#[derive(Debug)]
-pub enum JmapMessageSendResult {
-    Ok,
-    WantsRead,
-    WantsWrite(Vec<u8>),
-    Err(JmapMessageSendError),
-}
-
-enum State {
-    Uploading {
-        upload: JmapBlobUpload,
-        session: JmapSession,
-        http_auth: SecretString,
-        drafts_mailbox_id: String,
-        identity_id: String,
-    },
-    Importing {
-        import: JmapEmailImport,
-        session: JmapSession,
-        http_auth: SecretString,
-        identity_id: String,
-    },
-    Submitting(JmapEmailSubmissionSet),
-    Done,
-}
-
-/// I/O-free orchestrator: `Blob/upload` → `Email/import` →
-/// `EmailSubmission/set`.
-///
-/// The caller supplies the identity to send as and the drafts mailbox
-/// id to stage the email in. Both come from `Identity/get` and
-/// `Mailbox/query` (role = `drafts`) at session startup.
+/// I/O-free coroutine queuing a JMAP message for delivery.
 pub struct JmapMessageSend {
     state: State,
+    identity_id: String,
+    drafts_mailbox_id: String,
+    session: JmapSession,
+    http_auth: SecretString,
 }
 
 impl JmapMessageSend {
     pub fn new(
         session: &JmapSession,
         http_auth: &SecretString,
+        identity_id: &str,
+        drafts_mailbox_id: &str,
         raw: Vec<u8>,
-        identity_id: impl ToString,
-        drafts_mailbox_id: impl ToString,
     ) -> Result<Self, JmapMessageSendError> {
         trace!("prepare JMAP message send");
-
-        let account_id = session
-            .primary_accounts
-            .get(capabilities::MAIL)
-            .cloned()
-            .unwrap_or_default();
-
-        let upload_url_str = resolve_upload_url(&session.upload_url, &account_id);
-        let upload_url = Url::parse(&upload_url_str)
-            .map_err(|_| JmapMessageSendError::InvalidUploadUrl(upload_url_str))?;
-
+        let upload_url = resolve_upload_url(session)?;
         let upload = JmapBlobUpload::new(http_auth, &upload_url, "message/rfc822", raw);
-
         Ok(Self {
-            state: State::Uploading {
-                upload,
-                session: session.clone(),
-                http_auth: http_auth.clone(),
-                drafts_mailbox_id: drafts_mailbox_id.to_string(),
-                identity_id: identity_id.to_string(),
-            },
+            state: State::Uploading(upload),
+            identity_id: identity_id.into(),
+            drafts_mailbox_id: drafts_mailbox_id.into(),
+            session: session.clone(),
+            http_auth: http_auth.clone(),
         })
     }
+}
 
-    pub fn resume(&mut self, mut arg: Option<&[u8]>) -> JmapMessageSendResult {
-        loop {
-            match mem::replace(&mut self.state, State::Done) {
-                State::Uploading {
-                    mut upload,
-                    session,
-                    http_auth,
-                    drafts_mailbox_id,
-                    identity_id,
-                } => match upload.resume(arg.take()) {
-                    JmapBlobUploadResult::WantsRead => {
-                        self.state = State::Uploading {
-                            upload,
-                            session,
-                            http_auth,
-                            drafts_mailbox_id,
-                            identity_id,
-                        };
-                        return JmapMessageSendResult::WantsRead;
-                    }
-                    JmapBlobUploadResult::WantsWrite(bytes) => {
-                        self.state = State::Uploading {
-                            upload,
-                            session,
-                            http_auth,
-                            drafts_mailbox_id,
-                            identity_id,
-                        };
-                        return JmapMessageSendResult::WantsWrite(bytes);
-                    }
-                    JmapBlobUploadResult::Err(err) => {
-                        return JmapMessageSendResult::Err(err.into());
-                    }
-                    JmapBlobUploadResult::Ok { blob_id, .. } => {
-                        let mut mailbox_ids = BTreeMap::new();
-                        mailbox_ids.insert(drafts_mailbox_id, true);
+impl EmailCoroutine for JmapMessageSend {
+    type Yield = JmapStep;
+    type Return = Result<(), JmapMessageSendError>;
 
-                        let mut keywords = BTreeMap::new();
-                        keywords.insert("$draft".into(), true);
+    const BACKEND: EmailBackend = EmailBackend::Jmap;
 
-                        let mut emails = BTreeMap::new();
-                        emails.insert(
-                            "outgoing".into(),
-                            EmailImport {
-                                blob_id,
-                                mailbox_ids,
-                                keywords: Some(keywords),
-                                received_at: None,
-                            },
-                        );
+    fn resume(
+        &mut self,
+        arg: EmailCoroutineArg<'_>,
+    ) -> EmailCoroutineState<Self::Yield, Self::Return> {
+        #[allow(irrefutable_let_patterns)]
+        let EmailCoroutineArg::Jmap { bytes } = arg else {
+            return EmailCoroutineState::Complete(Err(JmapMessageSendError::InvalidArg));
+        };
 
-                        let import = match JmapEmailImport::new(&session, &http_auth, emails) {
-                            Ok(c) => c,
-                            Err(err) => return JmapMessageSendResult::Err(err.into()),
-                        };
-
-                        self.state = State::Importing {
-                            import,
-                            session,
-                            http_auth,
-                            identity_id,
-                        };
-                    }
-                },
-                State::Importing {
-                    mut import,
-                    session,
-                    http_auth,
-                    identity_id,
-                } => match import.resume(arg.take()) {
-                    JmapEmailImportResult::WantsRead => {
-                        self.state = State::Importing {
-                            import,
-                            session,
-                            http_auth,
-                            identity_id,
-                        };
-                        return JmapMessageSendResult::WantsRead;
-                    }
-                    JmapEmailImportResult::WantsWrite(bytes) => {
-                        self.state = State::Importing {
-                            import,
-                            session,
-                            http_auth,
-                            identity_id,
-                        };
-                        return JmapMessageSendResult::WantsWrite(bytes);
-                    }
-                    JmapEmailImportResult::Err(err) => {
-                        return JmapMessageSendResult::Err(err.into());
-                    }
-                    JmapEmailImportResult::Ok {
-                        mut created,
-                        not_created,
-                        ..
-                    } => {
-                        if !not_created.is_empty() {
-                            return JmapMessageSendResult::Err(JmapMessageSendError::ImportFailed);
-                        }
-
-                        let Some(email) = created.remove("outgoing") else {
-                            return JmapMessageSendResult::Err(JmapMessageSendError::ImportFailed);
-                        };
-
-                        let Some(email_id) = email.id else {
-                            return JmapMessageSendResult::Err(
-                                JmapMessageSendError::MissingImportedEmailId,
-                            );
-                        };
-
-                        let mut submissions = BTreeMap::new();
-                        submissions.insert(
-                            "outgoing".into(),
-                            EmailSubmissionCreate {
-                                identity_id,
-                                email_id,
-                                envelope: None,
-                            },
-                        );
-
-                        let submit =
-                            match JmapEmailSubmissionSet::new(&session, &http_auth, submissions) {
-                                Ok(c) => c,
-                                Err(err) => return JmapMessageSendResult::Err(err.into()),
-                            };
-
-                        self.state = State::Submitting(submit);
-                    }
-                },
-                State::Submitting(mut submit) => match submit.resume(arg.take()) {
-                    JmapEmailSubmissionSetResult::WantsRead => {
-                        self.state = State::Submitting(submit);
-                        return JmapMessageSendResult::WantsRead;
-                    }
-                    JmapEmailSubmissionSetResult::WantsWrite(bytes) => {
-                        self.state = State::Submitting(submit);
-                        return JmapMessageSendResult::WantsWrite(bytes);
-                    }
-                    JmapEmailSubmissionSetResult::Err(err) => {
-                        return JmapMessageSendResult::Err(err.into());
-                    }
-                    JmapEmailSubmissionSetResult::Ok { not_created, .. } => {
-                        if !not_created.is_empty() {
-                            return JmapMessageSendResult::Err(
-                                JmapMessageSendError::SubmissionFailed,
-                            );
-                        }
-
-                        return JmapMessageSendResult::Ok;
-                    }
-                },
-                State::Done => {
-                    return JmapMessageSendResult::Err(JmapMessageSendError::AlreadyDone);
+        match mem::replace(&mut self.state, State::Done) {
+            State::Uploading(mut upload) => match upload.resume(bytes) {
+                JmapCoroutineState::Yielded(JmapRedirectYield::WantsRead) => {
+                    self.state = State::Uploading(upload);
+                    EmailCoroutineState::Yielded(JmapStep::WantsRead)
                 }
+                JmapCoroutineState::Yielded(JmapRedirectYield::WantsWrite(out)) => {
+                    self.state = State::Uploading(upload);
+                    EmailCoroutineState::Yielded(JmapStep::WantsWrite(out))
+                }
+                JmapCoroutineState::Yielded(JmapRedirectYield::WantsRedirect { .. }) => {
+                    EmailCoroutineState::Complete(Err(JmapMessageSendError::UnsupportedRedirect))
+                }
+                JmapCoroutineState::Complete(Ok(JmapBlobUploadOutput { blob_id, .. })) => {
+                    let mut mailbox_ids = BTreeMap::new();
+                    mailbox_ids.insert(self.drafts_mailbox_id.clone(), true);
+
+                    let mut keywords = BTreeMap::new();
+                    keywords.insert("$draft".into(), true);
+
+                    let mut emails = BTreeMap::new();
+                    emails.insert(
+                        OUTGOING.into(),
+                        EmailImport {
+                            blob_id,
+                            mailbox_ids,
+                            keywords: Some(keywords),
+                            received_at: None,
+                        },
+                    );
+
+                    let import = match InnerImport::new(&self.session, &self.http_auth, emails) {
+                        Ok(i) => i,
+                        Err(err) => return EmailCoroutineState::Complete(Err(err.into())),
+                    };
+                    self.state = State::Importing(import);
+                    self.resume(EmailCoroutineArg::Jmap { bytes: None })
+                }
+                JmapCoroutineState::Complete(Err(err)) => {
+                    EmailCoroutineState::Complete(Err(err.into()))
+                }
+            },
+            State::Importing(mut import) => match import.resume(bytes) {
+                JmapCoroutineState::Yielded(JmapYield::WantsRead) => {
+                    self.state = State::Importing(import);
+                    EmailCoroutineState::Yielded(JmapStep::WantsRead)
+                }
+                JmapCoroutineState::Yielded(JmapYield::WantsWrite(out)) => {
+                    self.state = State::Importing(import);
+                    EmailCoroutineState::Yielded(JmapStep::WantsWrite(out))
+                }
+                JmapCoroutineState::Complete(Ok(mut ok)) => {
+                    if !ok.not_created.is_empty() {
+                        return EmailCoroutineState::Complete(Err(
+                            JmapMessageSendError::NotImported,
+                        ));
+                    }
+                    let Some(email) = ok.created.remove(OUTGOING) else {
+                        return EmailCoroutineState::Complete(Err(
+                            JmapMessageSendError::NotImported,
+                        ));
+                    };
+                    let Some(email_id) = email.id else {
+                        return EmailCoroutineState::Complete(Err(
+                            JmapMessageSendError::MissingImportedEmailId,
+                        ));
+                    };
+
+                    let mut submissions = BTreeMap::new();
+                    submissions.insert(
+                        OUTGOING.into(),
+                        EmailSubmissionCreate {
+                            identity_id: self.identity_id.clone(),
+                            email_id,
+                            envelope: None,
+                        },
+                    );
+                    let submit = match InnerSubmit::new(&self.session, &self.http_auth, submissions)
+                    {
+                        Ok(s) => s,
+                        Err(err) => return EmailCoroutineState::Complete(Err(err.into())),
+                    };
+                    self.state = State::Submitting(submit);
+                    self.resume(EmailCoroutineArg::Jmap { bytes: None })
+                }
+                JmapCoroutineState::Complete(Err(err)) => {
+                    EmailCoroutineState::Complete(Err(err.into()))
+                }
+            },
+            State::Submitting(mut submit) => match submit.resume(bytes) {
+                JmapCoroutineState::Yielded(JmapYield::WantsRead) => {
+                    self.state = State::Submitting(submit);
+                    EmailCoroutineState::Yielded(JmapStep::WantsRead)
+                }
+                JmapCoroutineState::Yielded(JmapYield::WantsWrite(out)) => {
+                    self.state = State::Submitting(submit);
+                    EmailCoroutineState::Yielded(JmapStep::WantsWrite(out))
+                }
+                JmapCoroutineState::Complete(Ok(ok)) => {
+                    if !ok.not_created.is_empty() {
+                        EmailCoroutineState::Complete(Err(JmapMessageSendError::NotSubmitted))
+                    } else {
+                        EmailCoroutineState::Complete(Ok(()))
+                    }
+                }
+                JmapCoroutineState::Complete(Err(err)) => {
+                    EmailCoroutineState::Complete(Err(err.into()))
+                }
+            },
+            State::Done => {
+                EmailCoroutineState::Complete(Err(JmapMessageSendError::ResumedAfterDone))
             }
         }
     }
 }
 
-fn resolve_upload_url(template: &str, account_id: &str) -> String {
-    template.replace("{accountId}", account_id)
+enum State {
+    Uploading(JmapBlobUpload),
+    Importing(InnerImport),
+    Submitting(InnerSubmit),
+    Done,
+}
+
+const OUTGOING: &str = "outgoing";
+
+/// Resolves the RFC 8620 upload URL template against the live
+/// `{accountId}` substitution.
+fn resolve_upload_url(session: &JmapSession) -> Result<Url, JmapMessageSendError> {
+    let account_id = account_id_of(session);
+    let url_str = session.upload_url.replace("{accountId}", &account_id);
+    Url::parse(&url_str).map_err(|_| JmapMessageSendError::InvalidUploadUrl(url_str))
 }

@@ -1,56 +1,88 @@
-//! Conversions between Maildir filesystem types and the shared types
-//! used by [`EmailClientStd`], plus the `From` impl that wraps an
-//! already-built [`MaildirClient`] into a fresh unified client with
-//! Maildir as the only registered backend.
+//! Shared helpers for the Maildir coroutines: flag conversions,
+//! mailbox-name → on-disk-path resolution, and path-type conversions
+//! between the shared [`PathBuf`] surface and io-maildir's
+//! [`MaildirPath`].
 
 use alloc::{
+    collections::{BTreeMap, BTreeSet},
     string::{String, ToString},
     vec::Vec,
 };
+use std::path::{Path, PathBuf};
 
-use io_maildir::{client::MaildirClient, flag::MaildirFlag as MdFlag, maildir::Maildir};
-
-use crate::{
-    client::{EmailClientStd, EmailClientStdError},
-    envelope::Envelope,
-    flag::Flag,
+use io_maildir::{
+    flag::{MaildirFlag, MaildirFlags},
+    path::MaildirPath,
 };
+use thiserror::Error;
 
-impl From<MaildirClient> for EmailClientStd {
-    fn from(client: MaildirClient) -> Self {
-        Self::new().with_maildir(client)
+use crate::flag::{Flag, IanaFlag};
+
+/// Errors produced by [`resolve_mailbox`].
+#[derive(Clone, Debug, Error)]
+#[error("invalid Maildir mailbox `{0}`")]
+pub struct InvalidMailboxName(pub String);
+
+/// Translates a logical mailbox name to its on-disk Maildir directory,
+/// following the layout configured on the [`MaildirContext`]:
+///
+/// - classic Maildir (`maildir_plus = false`): identity (`Work` →
+///   `<root>/Work/`); slashes are rejected;
+/// - Maildir++ (`maildir_plus = true`): `/`-separated names become
+///   dotted siblings under the root (`Work/Foo` → `<root>/.Work.Foo/`),
+///   and the empty string (or `INBOX`-like default handled by the
+///   caller) maps to the root itself.
+///
+/// [`MaildirContext`]: crate::client::MaildirContext
+pub(crate) fn resolve_mailbox(
+    root: &Path,
+    maildir_plus: bool,
+    name: &str,
+) -> Result<PathBuf, InvalidMailboxName> {
+    if maildir_plus {
+        let trimmed = name.trim_matches('/');
+        if trimmed.is_empty() {
+            return Ok(root.to_path_buf());
+        }
+        let mut physical = String::from(".");
+        physical.push_str(&trimmed.replace('/', "."));
+        return Ok(root.join(physical));
     }
+
+    if name.contains('/') || name.contains("..") {
+        return Err(InvalidMailboxName(name.to_string()));
+    }
+    if name.is_empty() {
+        return Err(InvalidMailboxName(name.to_string()));
+    }
+    Ok(root.join(name))
 }
 
-/// Maps a shared [`Flag`] to a [`MdFlag`].
-///
-/// IANA-registered keywords without a Maildir info-section letter
-/// (`Forwarded`, `Junk`, custom) become [`MdFlag::Keyword`] carrying
-/// the wire spelling; the MaildirClient then ferries them through the
-/// dovecot-keywords file or a configured header. Returns `None` only
-/// when the flag has no usable representation at all.
-pub(crate) fn flag_to_maildir(flag: &Flag) -> Option<MdFlag> {
-    use crate::flag::IanaFlag;
-
+/// Maps a shared [`Flag`] onto a [`MaildirFlag`]. Non-IANA keywords
+/// flow through as [`MaildirFlag::Keyword`], preserving the wire
+/// spelling for the dovecot-keywords sidecar.
+pub(crate) fn flag_to_maildir(flag: &Flag) -> MaildirFlag {
     match flag.iana() {
-        Some(IanaFlag::Seen) => Some(MdFlag::Seen),
-        Some(IanaFlag::Answered) => Some(MdFlag::Replied),
-        Some(IanaFlag::Flagged) => Some(MdFlag::Flagged),
-        Some(IanaFlag::Draft) => Some(MdFlag::Draft),
-        Some(IanaFlag::Deleted) => Some(MdFlag::Trashed),
-        Some(IanaFlag::Forwarded) => Some(MdFlag::Passed),
-        Some(_) | None => Some(MdFlag::Keyword(flag.raw().to_string())),
+        Some(IanaFlag::Seen) => MaildirFlag::Seen,
+        Some(IanaFlag::Answered) => MaildirFlag::Replied,
+        Some(IanaFlag::Flagged) => MaildirFlag::Flagged,
+        Some(IanaFlag::Draft) => MaildirFlag::Draft,
+        Some(IanaFlag::Deleted) => MaildirFlag::Trashed,
+        Some(IanaFlag::Forwarded) => MaildirFlag::Passed,
+        Some(_) | None => MaildirFlag::Keyword(flag.raw().to_string()),
     }
 }
 
-/// Builds a shared [`Flag`] from a Maildir info-section letter.
-///
-/// Maildir letters have no wire casing, so the canonical IANA
-/// spelling is synthesised via [`Flag::from_iana`]. Returns `None`
-/// for letters outside the standard six.
-pub(crate) fn flag_from_char(c: char) -> Option<Flag> {
-    use crate::flag::IanaFlag;
+/// Builds a [`MaildirFlags`] set from the shared flag slice for the
+/// inner io-maildir coroutines.
+pub(crate) fn flags_to_maildir(flags: &[Flag]) -> MaildirFlags {
+    flags.iter().map(flag_to_maildir).collect()
+}
 
+/// Builds a shared [`Flag`] from a Maildir info-section letter
+/// (`S`, `R`, `F`, `D`, `T`, `P`). Returns `None` for letters outside
+/// the standard six (dovecot custom-keyword slots `a..z` etc.).
+pub(crate) fn flag_from_char(c: char) -> Option<Flag> {
     match c {
         'S' => Some(Flag::from_iana(IanaFlag::Seen)),
         'R' => Some(Flag::from_iana(IanaFlag::Answered)),
@@ -62,126 +94,61 @@ pub(crate) fn flag_from_char(c: char) -> Option<Flag> {
     }
 }
 
-/// Builds a shared [`Flag`] from a [`MdFlag`]. Keyword variants
-/// preserve the wire spelling verbatim through [`Flag::from_raw`].
-pub(crate) fn flag_from_maildir(flag: &MdFlag) -> Option<Flag> {
-    use crate::flag::IanaFlag;
-
-    match flag {
-        MdFlag::Seen => Some(Flag::from_iana(IanaFlag::Seen)),
-        MdFlag::Replied => Some(Flag::from_iana(IanaFlag::Answered)),
-        MdFlag::Flagged => Some(Flag::from_iana(IanaFlag::Flagged)),
-        MdFlag::Draft => Some(Flag::from_iana(IanaFlag::Draft)),
-        MdFlag::Trashed => Some(Flag::from_iana(IanaFlag::Deleted)),
-        MdFlag::Passed => Some(Flag::from_iana(IanaFlag::Forwarded)),
-        MdFlag::Keyword(raw) => Some(Flag::from_raw(raw.clone())),
-    }
+/// Translates a Maildir-path set out to the shared [`PathBuf`] surface.
+pub(crate) fn paths_out(paths: BTreeSet<MaildirPath>) -> BTreeSet<PathBuf> {
+    paths.into_iter().map(PathBuf::from).collect()
 }
 
-/// Opens the Maildir at `<client.root()>/<physical_name>`, where the
-/// physical name follows the configured layout:
-///
-/// - default Maildir: identity (`Work` → `Work/`);
-/// - Maildir++ (`client.maildir_plus = true`): logical `/`-separated
-///   names are translated to dotted siblings with a leading dot
-///   (`Work/Foo` → `.Work.Foo/`).
-///
-/// Returns [`EmailClientStdError::InvalidMailbox`] when the path does
-/// not point at a valid Maildir layout.
-pub(crate) fn open_maildir(
-    client: &MaildirClient,
-    name: &str,
-) -> Result<Maildir, EmailClientStdError> {
-    let physical = physical_mailbox_name(client, name)?;
-    let path = if physical.is_empty() {
-        client.root().clone()
-    } else {
-        client.root().join(&physical)
-    };
-    client
-        .load_maildir(path.clone())
-        .map_err(|_| EmailClientStdError::InvalidMailbox(path.into_string()))
+/// Translates a rename / copy pair list out to the shared surface.
+pub(crate) fn pairs_out(pairs: Vec<(MaildirPath, MaildirPath)>) -> Vec<(PathBuf, PathBuf)> {
+    pairs
+        .into_iter()
+        .map(|(from, to)| (from.into(), to.into()))
+        .collect()
 }
 
-/// Translates a shared mailbox name into the physical directory name
-/// honoured by the underlying filesystem. Returns the empty string
-/// when `name` denotes the root Maildir (Maildir++ inbox alias).
-pub(crate) fn physical_mailbox_name(
-    client: &MaildirClient,
-    name: &str,
-) -> Result<String, EmailClientStdError> {
-    if client.maildir_plus && name == client.maildirpp_inbox {
-        return Ok(String::new());
-    }
-
-    if client.maildir_plus {
-        let trimmed = name.trim_matches('/');
-        if trimmed.is_empty() {
-            return Err(EmailClientStdError::InvalidMailbox(name.into()));
-        }
-
-        let mut physical = String::from(".");
-        physical.push_str(&trimmed.replace('/', "."));
-        return Ok(physical);
-    }
-
-    if client.fs_layout {
-        let trimmed = name.trim_matches('/');
-        if trimmed.is_empty() || trimmed.contains("..") {
-            return Err(EmailClientStdError::InvalidMailbox(name.into()));
-        }
-        return Ok(trimmed.to_string());
-    }
-
-    if name.contains('/') {
-        return Err(EmailClientStdError::InvalidMailbox(name.into()));
-    }
-    Ok(name.to_string())
+/// Translates a file-create map out to the shared surface.
+pub(crate) fn files_out(files: BTreeMap<MaildirPath, Vec<u8>>) -> BTreeMap<PathBuf, Vec<u8>> {
+    files.into_iter().map(|(k, v)| (k.into(), v)).collect()
 }
 
-/// Reverse of [`physical_mailbox_name`]: derives the logical mailbox
-/// name from a physical directory name reported by `list_maildirs`.
-/// `physical` empty (or matching the root path) maps to the Maildir++
-/// inbox alias.
-pub(crate) fn logical_mailbox_name(client: &MaildirClient, physical: &str) -> String {
-    if client.maildir_plus && physical.is_empty() {
-        return client.maildirpp_inbox.clone();
-    }
+/// Translates a shared bool-keyed map back to a Maildir-path-keyed
+/// map (FileExists / DirExists replies).
+pub(crate) fn probes_in(probes: BTreeMap<PathBuf, bool>) -> BTreeMap<MaildirPath, bool> {
+    probes.into_iter().map(|(k, v)| (k.into(), v)).collect()
+}
 
-    if !client.maildir_plus {
-        return physical.to_string();
-    }
+/// Translates a shared DirRead reply back to Maildir-path types.
+pub(crate) fn dirread_in(
+    entries: BTreeMap<PathBuf, BTreeSet<PathBuf>>,
+) -> BTreeMap<MaildirPath, BTreeSet<MaildirPath>> {
+    entries
+        .into_iter()
+        .map(|(k, v)| (k.into(), v.into_iter().map(MaildirPath::from).collect()))
+        .collect()
+}
 
-    let stripped = physical.strip_prefix('.').unwrap_or(physical);
-    stripped.replace('.', "/")
+/// Translates a shared FileRead reply back to Maildir-path types.
+pub(crate) fn fileread_in(files: BTreeMap<PathBuf, Vec<u8>>) -> BTreeMap<MaildirPath, Vec<u8>> {
+    files.into_iter().map(|(k, v)| (k.into(), v)).collect()
 }
 
 /// 1-indexed pagination on an in-memory list. `page_size = None`
 /// returns the full slice; `page_size = 0` or a page past the end
-/// returns an empty vector.
-pub(crate) fn paginate(
-    envelopes: Vec<Envelope>,
-    page: Option<u32>,
-    page_size: Option<u32>,
-) -> Vec<Envelope> {
+/// returns an empty vector. Shared between Maildir and m2dir
+/// envelope listings whose backends don't paginate at the filesystem
+/// level.
+pub(crate) fn paginate<T>(items: Vec<T>, page: Option<u32>, page_size: Option<u32>) -> Vec<T> {
     let Some(size) = page_size else {
-        return envelopes;
+        return items;
     };
-
     if size == 0 {
         return Vec::new();
     }
-
     let page = page.unwrap_or(1).max(1);
     let skip = ((page - 1) as usize).saturating_mul(size as usize);
-
-    if skip >= envelopes.len() {
+    if skip >= items.len() {
         return Vec::new();
     }
-
-    envelopes
-        .into_iter()
-        .skip(skip)
-        .take(size as usize)
-        .collect()
+    items.into_iter().skip(skip).take(size as usize).collect()
 }

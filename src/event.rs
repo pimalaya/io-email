@@ -1,6 +1,6 @@
 //! Watch event shared across all protocols.
 //!
-//! Surfaced by [`crate::client::EmailClientStd::watch_envelopes`] as a
+//! Surfaced by [`crate::client::EmailClientStd::watch_mailbox`] as a
 //! continuous stream. Each variant is the pre-diffed delta the backend
 //! observed: envelopes added or removed from the watched mailbox, and
 //! per-message flag additions or removals computed against the watcher's
@@ -10,7 +10,7 @@ use alloc::{collections::BTreeSet, string::String};
 
 use crate::{envelope::Envelope, flag::Flag};
 
-/// Delta produced by a [`crate::client::EmailClientStd::watch_envelopes`]
+/// Delta produced by a [`crate::client::EmailClientStd::watch_mailbox`]
 /// stream.
 ///
 /// `mailbox` is the watched mailbox name (always the same value for the

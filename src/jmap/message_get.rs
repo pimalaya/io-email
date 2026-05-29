@@ -1,23 +1,30 @@
-//! JMAP message get (`Email/get` + `Blob/download`), wrapping a private
-//! orchestrator. Resolves the message blob id, then downloads its raw
-//! RFC 5322 bytes.
-
-use core::mem;
+//! JMAP message-get coroutine.
+//!
+//! Two-stage state machine:
+//! 1. `Email/get(properties: [blobId])` resolves the email id to a
+//!    download blob id.
+//! 2. `Blob/download` against `{accountId, blobId}` returns the raw
+//!    RFC 5322 bytes. Redirects (RFC 8620 §6.2 allows servers to
+//!    relocate the blob) are not followed: the coroutine surfaces
+//!    them as an error, matching the dead-code behaviour.
 
 use alloc::{
     string::{String, ToString},
     vec,
     vec::Vec,
 };
+use core::mem;
 
 use io_jmap::{
+    coroutine::{JmapCoroutine, JmapCoroutineState, JmapYield},
     rfc8620::{
-        blob_download::{JmapBlobDownload, JmapBlobDownloadError, JmapBlobDownloadResult},
+        blob_download::{JmapBlobDownload, JmapBlobDownloadError, JmapBlobDownloadOutput},
+        redirect::JmapRedirectYield,
         session::JmapSession,
     },
     rfc8621::{
-        capabilities,
-        email_get::{JmapEmailGet, JmapEmailGetError, JmapEmailGetResult},
+        email::EmailProperty,
+        email_get::{JmapEmailGet as InnerGet, JmapEmailGetError as InnerErr},
     },
 };
 use log::trace;
@@ -25,171 +32,154 @@ use secrecy::SecretString;
 use thiserror::Error;
 use url::Url;
 
-/// Errors produced while orchestrating Email/get + Blob/download for
-/// JMAP raw message retrieval.
+use crate::{
+    coroutine::{EmailBackend, EmailCoroutine, EmailCoroutineArg, EmailCoroutineState, JmapStep},
+    jmap::convert::account_id_of,
+};
+
+/// Errors produced by [`JmapMessageGet`].
 #[derive(Debug, Error)]
 pub enum JmapMessageGetError {
     #[error(transparent)]
-    EmailGet(#[from] JmapEmailGetError),
+    EmailGet(#[from] InnerErr),
     #[error(transparent)]
     BlobDownload(#[from] JmapBlobDownloadError),
     #[error("Email/get returned no email for the requested id")]
     EmailNotFound,
     #[error("Email/get response did not include a blobId")]
     MissingBlobId,
-    #[error("Resolved JMAP download URL is invalid: {0}")]
+    #[error("resolved JMAP download URL is invalid: {0}")]
     InvalidDownloadUrl(String),
     #[error("JMAP blob download was redirected; not yet supported")]
     UnsupportedRedirect,
-    #[error("JMAP message get was resumed after completion")]
-    AlreadyDone,
+    #[error("coroutine was resumed with the wrong EmailCoroutineArg variant")]
+    InvalidArg,
+    #[error("coroutine was resumed after completion")]
+    ResumedAfterDone,
 }
 
-/// Result returned by [`JmapMessageGet::resume`].
-#[derive(Debug)]
-pub enum JmapMessageGetResult {
-    Ok(Vec<u8>),
-    WantsRead,
-    WantsWrite(Vec<u8>),
-    Err(JmapMessageGetError),
-}
-
-enum State {
-    GettingEmail {
-        get: JmapEmailGet,
-        download_url_template: String,
-        account_id: String,
-        http_auth: SecretString,
-    },
-    Downloading(JmapBlobDownload),
-    Done,
-}
-
-/// I/O-free coroutine wrapping `Email/get` + `Blob/download`. Returns
-/// raw RFC 5322 bytes.
+/// I/O-free coroutine fetching the raw RFC 5322 bytes of a JMAP email.
 pub struct JmapMessageGet {
     state: State,
+    http_auth: SecretString,
+    download_url_template: String,
+    account_id: String,
 }
 
 impl JmapMessageGet {
     pub fn new(
         session: &JmapSession,
         http_auth: &SecretString,
-        email_id: impl ToString,
+        _mailbox: &str,
+        id: &str,
     ) -> Result<Self, JmapMessageGetError> {
         trace!("prepare JMAP message get");
-
-        let get = JmapEmailGet::new(
+        let get = InnerGet::new(
             session,
             http_auth,
-            vec![email_id.to_string()],
-            Some(vec![io_jmap::rfc8621::email::EmailProperty::BlobId]),
+            vec![id.to_string()],
+            Some(vec![EmailProperty::BlobId]),
             false,
             false,
             0,
         )?;
-
-        let account_id = session
-            .primary_accounts
-            .get(capabilities::MAIL)
-            .cloned()
-            .unwrap_or_default();
-
         Ok(Self {
-            state: State::GettingEmail {
-                get,
-                download_url_template: session.download_url.clone(),
-                account_id,
-                http_auth: http_auth.clone(),
-            },
+            state: State::GettingEmail(get),
+            http_auth: http_auth.clone(),
+            download_url_template: session.download_url.clone(),
+            account_id: account_id_of(session),
         })
     }
+}
 
-    pub fn resume(&mut self, mut arg: Option<&[u8]>) -> JmapMessageGetResult {
-        loop {
-            match mem::replace(&mut self.state, State::Done) {
-                State::GettingEmail {
-                    mut get,
-                    download_url_template,
-                    account_id,
-                    http_auth,
-                } => match get.resume(arg.take()) {
-                    JmapEmailGetResult::WantsRead => {
-                        self.state = State::GettingEmail {
-                            get,
-                            download_url_template,
-                            account_id,
-                            http_auth,
-                        };
-                        return JmapMessageGetResult::WantsRead;
-                    }
-                    JmapEmailGetResult::WantsWrite(bytes) => {
-                        self.state = State::GettingEmail {
-                            get,
-                            download_url_template,
-                            account_id,
-                            http_auth,
-                        };
-                        return JmapMessageGetResult::WantsWrite(bytes);
-                    }
-                    JmapEmailGetResult::Err(err) => return JmapMessageGetResult::Err(err.into()),
-                    JmapEmailGetResult::Ok { mut emails, .. } => {
-                        let Some(email) = emails.pop() else {
-                            return JmapMessageGetResult::Err(JmapMessageGetError::EmailNotFound);
-                        };
+impl EmailCoroutine for JmapMessageGet {
+    type Yield = JmapStep;
+    type Return = Result<Vec<u8>, JmapMessageGetError>;
 
-                        let Some(blob_id) = email.blob_id else {
-                            return JmapMessageGetResult::Err(JmapMessageGetError::MissingBlobId);
-                        };
+    const BACKEND: EmailBackend = EmailBackend::Jmap;
 
-                        let url_str =
-                            resolve_download_url(&download_url_template, &account_id, &blob_id);
+    fn resume(
+        &mut self,
+        arg: EmailCoroutineArg<'_>,
+    ) -> EmailCoroutineState<Self::Yield, Self::Return> {
+        #[allow(irrefutable_let_patterns)]
+        let EmailCoroutineArg::Jmap { bytes } = arg else {
+            return EmailCoroutineState::Complete(Err(JmapMessageGetError::InvalidArg));
+        };
 
-                        let url = match Url::parse(&url_str) {
-                            Ok(u) => u,
-                            Err(_) => {
-                                return JmapMessageGetResult::Err(
-                                    JmapMessageGetError::InvalidDownloadUrl(url_str),
-                                );
-                            }
-                        };
-
-                        let download = JmapBlobDownload::new(&http_auth, &url);
-                        self.state = State::Downloading(download);
-                    }
-                },
-                State::Downloading(mut download) => match download.resume(arg.take()) {
-                    JmapBlobDownloadResult::WantsRead => {
-                        self.state = State::Downloading(download);
-                        return JmapMessageGetResult::WantsRead;
-                    }
-                    JmapBlobDownloadResult::WantsWrite(bytes) => {
-                        self.state = State::Downloading(download);
-                        return JmapMessageGetResult::WantsWrite(bytes);
-                    }
-                    JmapBlobDownloadResult::WantsRedirect { .. } => {
-                        return JmapMessageGetResult::Err(JmapMessageGetError::UnsupportedRedirect);
-                    }
-                    JmapBlobDownloadResult::Err(err) => {
-                        return JmapMessageGetResult::Err(err.into());
-                    }
-                    JmapBlobDownloadResult::Ok { data, .. } => {
-                        return JmapMessageGetResult::Ok(data);
-                    }
-                },
-                State::Done => {
-                    return JmapMessageGetResult::Err(JmapMessageGetError::AlreadyDone);
+        match mem::replace(&mut self.state, State::Done) {
+            State::GettingEmail(mut get) => match get.resume(bytes) {
+                JmapCoroutineState::Yielded(JmapYield::WantsRead) => {
+                    self.state = State::GettingEmail(get);
+                    EmailCoroutineState::Yielded(JmapStep::WantsRead)
                 }
+                JmapCoroutineState::Yielded(JmapYield::WantsWrite(out)) => {
+                    self.state = State::GettingEmail(get);
+                    EmailCoroutineState::Yielded(JmapStep::WantsWrite(out))
+                }
+                JmapCoroutineState::Complete(Ok(ok)) => {
+                    let Some(email) = ok.emails.into_iter().next() else {
+                        return EmailCoroutineState::Complete(Err(
+                            JmapMessageGetError::EmailNotFound,
+                        ));
+                    };
+                    let Some(blob_id) = email.blob_id else {
+                        return EmailCoroutineState::Complete(Err(
+                            JmapMessageGetError::MissingBlobId,
+                        ));
+                    };
+                    let url_str = resolve_download_url(
+                        &self.download_url_template,
+                        &self.account_id,
+                        &blob_id,
+                    );
+                    let Ok(url) = Url::parse(&url_str) else {
+                        return EmailCoroutineState::Complete(Err(
+                            JmapMessageGetError::InvalidDownloadUrl(url_str),
+                        ));
+                    };
+                    self.state = State::Downloading(JmapBlobDownload::new(&self.http_auth, &url));
+                    self.resume(EmailCoroutineArg::Jmap { bytes: None })
+                }
+                JmapCoroutineState::Complete(Err(err)) => {
+                    EmailCoroutineState::Complete(Err(err.into()))
+                }
+            },
+            State::Downloading(mut dl) => match dl.resume(bytes) {
+                JmapCoroutineState::Yielded(JmapRedirectYield::WantsRead) => {
+                    self.state = State::Downloading(dl);
+                    EmailCoroutineState::Yielded(JmapStep::WantsRead)
+                }
+                JmapCoroutineState::Yielded(JmapRedirectYield::WantsWrite(out)) => {
+                    self.state = State::Downloading(dl);
+                    EmailCoroutineState::Yielded(JmapStep::WantsWrite(out))
+                }
+                JmapCoroutineState::Yielded(JmapRedirectYield::WantsRedirect { .. }) => {
+                    EmailCoroutineState::Complete(Err(JmapMessageGetError::UnsupportedRedirect))
+                }
+                JmapCoroutineState::Complete(Ok(JmapBlobDownloadOutput { data, .. })) => {
+                    EmailCoroutineState::Complete(Ok(data))
+                }
+                JmapCoroutineState::Complete(Err(err)) => {
+                    EmailCoroutineState::Complete(Err(err.into()))
+                }
+            },
+            State::Done => {
+                EmailCoroutineState::Complete(Err(JmapMessageGetError::ResumedAfterDone))
             }
         }
     }
 }
 
-pub(crate) fn resolve_download_url(template: &str, account_id: &str, blob_id: &str) -> String {
-    // Use the RFC-suggested defaults for an `Email/get` raw blob
-    // download: MIME type `message/rfc822` (URL-encoded) and file name
-    // `message.eml`. Some providers (e.g. Fastmail) rely on the type
-    // hint to route the request to the correct download authority.
+enum State {
+    GettingEmail(InnerGet),
+    Downloading(JmapBlobDownload),
+    Done,
+}
+
+/// Resolves the RFC 8620 download URL template against the live
+/// `{accountId, blobId, type, name}` substitutions.
+fn resolve_download_url(template: &str, account_id: &str, blob_id: &str) -> String {
     template
         .replace("{accountId}", account_id)
         .replace("{blobId}", blob_id)

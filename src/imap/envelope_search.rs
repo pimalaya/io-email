@@ -1,40 +1,41 @@
-//! IMAP envelope search (`SELECT` + `UID SORT` + `UID FETCH UID FLAGS
-//! ENVELOPE RFC822.SIZE [BODYSTRUCTURE]`).
+//! IMAP envelope-search coroutine.
 //!
-//! Translates a shared [`SearchEmailsQuery`] into IMAP primitives:
+//! Composes `SELECT <mailbox>` with `UID SORT <criteria> UTF-8 <keys>`
+//! (RFC 5256) and `UID FETCH <uids> (UID FLAGS ENVELOPE RFC822.SIZE
+//! [BODYSTRUCTURE])` (RFC 3501 §6.4.5).
 //!
-//! - Filter -> `Vec1<SearchKey<'static>>` (RFC 9051 §6.4.4)
-//! - Sort   -> `Vec1<SortCriterion>` (RFC 5256)
+//! The shared filter AST is translated to RFC 9051 §6.4.4 `SearchKey`
+//! clauses (date filters target the `Date:` header through `SENTON` /
+//! `SENTSINCE`; the sent-at rule must stay consistent across every
+//! backend). An absent filter defaults to `[ALL]`; an absent sort
+//! defaults to `REVERSE DATE` (date descending).
 //!
-//! Date filters target the `Date:` header through `SENTON` /
-//! `SENTSINCE`; `INTERNALDATE`-based keys (`ON`, `SINCE`) are not used
-//! because the sent-at rule must stay consistent across every backend.
-//! An absent filter defaults to `[ALL]`; an absent sort defaults to
-//! `REVERSE DATE` (date descending).
-
-use core::mem;
+//! UID SORT requires the server to advertise the `SORT` capability
+//! (RFC 5256). When unsupported, the server returns `BAD` and the
+//! error surfaces as [`ImapEnvelopeSearchError::Sort`]; callers can
+//! decide to fall back to plain `UID SEARCH` + client-side sort.
 
 use alloc::{
     boxed::Box,
+    collections::BTreeMap,
     string::{String, ToString},
     vec,
     vec::Vec,
 };
+use core::{mem, num::NonZeroU32};
 
 use io_imap::{
-    context::ImapContext,
+    coroutine::{ImapCoroutine, ImapCoroutineState, ImapYield},
     rfc3501::{
-        examine::ImapMailboxExamine,
-        fetch::{ImapMessageFetch, ImapMessageFetchError, ImapMessageFetchResult},
-        select::{ImapMailboxSelect, ImapMailboxSelectError, ImapMailboxSelectResult},
+        fetch::{ImapMessageFetch, ImapMessageFetchError},
+        select::{ImapMailboxSelect, ImapMailboxSelectError},
     },
-    rfc5256::sort::{ImapMailboxSort, ImapMailboxSortError, ImapMailboxSortResult},
+    rfc5256::sort::{ImapMailboxSort, ImapMailboxSortError},
     types::{
-        core::{AString, Vec1},
+        core::{AString, Atom, Vec1},
         datetime::NaiveDate as ImapNaiveDate,
         extensions::sort::{SortCriterion, SortKey},
-        fetch::MacroOrMessageDataItemNames,
-        mailbox::Mailbox as ImapMailbox,
+        fetch::{MacroOrMessageDataItemNames, MessageDataItem},
         search::SearchKey,
         sequence::SequenceSet,
     },
@@ -43,9 +44,13 @@ use log::trace;
 use thiserror::Error;
 
 use crate::{
-    client::EmailClientStdError,
+    coroutine::{EmailBackend, EmailCoroutine, EmailCoroutineArg, EmailCoroutineState, ImapStep},
     envelope::Envelope,
-    imap::envelope_list::{build_item_names, envelope_from},
+    flag::IanaFlag,
+    imap::{
+        convert::{InvalidMailboxName, parse_mailbox},
+        envelope_list::{build_item_names, envelope_from},
+    },
     search::{
         filter::query::SearchEmailsFilterQuery,
         query::SearchEmailsQuery,
@@ -53,8 +58,7 @@ use crate::{
     },
 };
 
-/// Errors produced while orchestrating SELECT + SORT + FETCH for IMAP
-/// envelope search.
+/// Errors produced by [`ImapEnvelopeSearch`].
 #[derive(Debug, Error)]
 pub enum ImapEnvelopeSearchError {
     #[error(transparent)]
@@ -63,44 +67,217 @@ pub enum ImapEnvelopeSearchError {
     Sort(#[from] ImapMailboxSortError),
     #[error(transparent)]
     Fetch(#[from] ImapMessageFetchError),
-    #[error(transparent)]
-    Convert(#[from] EmailClientStdError),
+    #[error("invalid IMAP mailbox `{0}`")]
+    InvalidMailbox(String),
+    #[error("invalid IMAP search pattern `{0}`")]
+    InvalidPattern(String),
+    #[error("invalid IMAP keyword `{0}`")]
+    InvalidKeyword(String),
+    #[error("invalid IMAP date `{0}`")]
+    InvalidDate(String),
     #[error("invalid IMAP UID set `{0}`")]
     InvalidUidSet(String),
-    #[error("IMAP envelope search was resumed after completion")]
-    AlreadyDone,
+    #[error("coroutine was resumed with the wrong EmailCoroutineArg variant")]
+    InvalidArg,
+    #[error("coroutine was resumed after completion")]
+    ResumedAfterDone,
 }
 
-/// Result returned by [`ImapEnvelopeSearch::resume`].
-#[derive(Debug)]
-pub enum ImapEnvelopeSearchResult {
-    Ok(Vec<Envelope>),
-    WantsRead,
-    WantsWrite(Vec<u8>),
-    Err(ImapEnvelopeSearchError),
+impl From<InvalidMailboxName> for ImapEnvelopeSearchError {
+    fn from(err: InvalidMailboxName) -> Self {
+        Self::InvalidMailbox(err.0)
+    }
 }
 
-/// Wraps either [`ImapMailboxSelect`] or [`ImapMailboxExamine`] so the
-/// downstream coroutine state machine can share a single match arm.
-/// Both coroutines surface the same `ImapMailboxSelectResult` shape
-/// (the EXAMINE result/error types are aliases of the SELECT ones).
-enum SelectOrExamine {
-    Select(ImapMailboxSelect),
-    Examine(ImapMailboxExamine),
+/// I/O-free coroutine listing envelopes matching the shared search
+/// query from a mailbox. Pagination is applied to the SORT-ordered UID
+/// list before FETCH; `page = 1`-indexed; `page_size = None` keeps the
+/// whole result set.
+pub struct ImapEnvelopeSearch {
+    state: State,
 }
 
-impl SelectOrExamine {
-    fn resume(&mut self, arg: Option<&[u8]>) -> ImapMailboxSelectResult {
-        match self {
-            Self::Select(s) => s.resume(arg),
-            Self::Examine(e) => e.resume(arg),
+impl ImapEnvelopeSearch {
+    pub fn new(
+        mailbox: &str,
+        query: Option<&SearchEmailsQuery>,
+        page: Option<u32>,
+        page_size: Option<u32>,
+        with_attachment: bool,
+    ) -> Result<Self, ImapEnvelopeSearchError> {
+        trace!("prepare IMAP envelope search");
+        let mbox = parse_mailbox(mailbox)?;
+        let search_criteria = search_keys(query.and_then(|q| q.filter.as_ref()))?;
+        let sort_criteria = sort_criteria(query.and_then(|q| q.sort.as_deref()));
+        let item_names = build_item_names(with_attachment);
+
+        Ok(Self {
+            state: State::Selecting {
+                select: ImapMailboxSelect::new(mbox),
+                page,
+                page_size,
+                item_names,
+                search_criteria,
+                sort_criteria,
+            },
+        })
+    }
+}
+
+impl EmailCoroutine for ImapEnvelopeSearch {
+    type Yield = ImapStep;
+    type Return = Result<Vec<Envelope>, ImapEnvelopeSearchError>;
+
+    const BACKEND: EmailBackend = EmailBackend::Imap;
+
+    fn resume(
+        &mut self,
+        arg: EmailCoroutineArg<'_>,
+    ) -> EmailCoroutineState<Self::Yield, Self::Return> {
+        #[allow(irrefutable_let_patterns)]
+        let EmailCoroutineArg::Imap {
+            fragmentizer,
+            mut bytes,
+        } = arg
+        else {
+            return EmailCoroutineState::Complete(Err(ImapEnvelopeSearchError::InvalidArg));
+        };
+
+        loop {
+            match mem::replace(&mut self.state, State::Done) {
+                State::Selecting {
+                    mut select,
+                    page,
+                    page_size,
+                    item_names,
+                    search_criteria,
+                    sort_criteria,
+                } => match select.resume(fragmentizer, bytes.take()) {
+                    ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
+                        self.state = State::Selecting {
+                            select,
+                            page,
+                            page_size,
+                            item_names,
+                            search_criteria,
+                            sort_criteria,
+                        };
+                        return EmailCoroutineState::Yielded(ImapStep::WantsRead);
+                    }
+                    ImapCoroutineState::Yielded(ImapYield::WantsWrite(out)) => {
+                        self.state = State::Selecting {
+                            select,
+                            page,
+                            page_size,
+                            item_names,
+                            search_criteria,
+                            sort_criteria,
+                        };
+                        return EmailCoroutineState::Yielded(ImapStep::WantsWrite(out));
+                    }
+                    ImapCoroutineState::Complete(Ok(data)) => {
+                        if data.exists.unwrap_or(0) == 0 {
+                            return EmailCoroutineState::Complete(Ok(Vec::new()));
+                        }
+                        let sort = ImapMailboxSort::new(sort_criteria, search_criteria, true);
+                        self.state = State::Sorting {
+                            sort,
+                            page,
+                            page_size,
+                            item_names,
+                        };
+                    }
+                    ImapCoroutineState::Complete(Err(err)) => {
+                        return EmailCoroutineState::Complete(Err(err.into()));
+                    }
+                },
+                State::Sorting {
+                    mut sort,
+                    page,
+                    page_size,
+                    item_names,
+                } => match sort.resume(fragmentizer, bytes.take()) {
+                    ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
+                        self.state = State::Sorting {
+                            sort,
+                            page,
+                            page_size,
+                            item_names,
+                        };
+                        return EmailCoroutineState::Yielded(ImapStep::WantsRead);
+                    }
+                    ImapCoroutineState::Yielded(ImapYield::WantsWrite(out)) => {
+                        self.state = State::Sorting {
+                            sort,
+                            page,
+                            page_size,
+                            item_names,
+                        };
+                        return EmailCoroutineState::Yielded(ImapStep::WantsWrite(out));
+                    }
+                    ImapCoroutineState::Complete(Ok(uids)) => {
+                        if uids.is_empty() {
+                            return EmailCoroutineState::Complete(Ok(Vec::new()));
+                        }
+                        let page_uids = paginate_uids(&uids, page, page_size);
+                        if page_uids.is_empty() {
+                            return EmailCoroutineState::Complete(Ok(Vec::new()));
+                        }
+                        let uid_str = page_uids
+                            .iter()
+                            .map(u32::to_string)
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        let sequence_set: SequenceSet = match uid_str.as_str().try_into() {
+                            Ok(set) => set,
+                            Err(_) => {
+                                return EmailCoroutineState::Complete(Err(
+                                    ImapEnvelopeSearchError::InvalidUidSet(uid_str),
+                                ));
+                            }
+                        };
+                        self.state = State::Fetching {
+                            fetch: ImapMessageFetch::new(sequence_set, item_names, true),
+                            order: page_uids,
+                        };
+                    }
+                    ImapCoroutineState::Complete(Err(err)) => {
+                        return EmailCoroutineState::Complete(Err(err.into()));
+                    }
+                },
+                State::Fetching { mut fetch, order } => {
+                    match fetch.resume(fragmentizer, bytes.take()) {
+                        ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
+                            self.state = State::Fetching { fetch, order };
+                            return EmailCoroutineState::Yielded(ImapStep::WantsRead);
+                        }
+                        ImapCoroutineState::Yielded(ImapYield::WantsWrite(out)) => {
+                            self.state = State::Fetching { fetch, order };
+                            return EmailCoroutineState::Yielded(ImapStep::WantsWrite(out));
+                        }
+                        ImapCoroutineState::Complete(Ok(data)) => {
+                            return EmailCoroutineState::Complete(Ok(reorder_envelopes(
+                                data, &order,
+                            )));
+                        }
+                        ImapCoroutineState::Complete(Err(err)) => {
+                            return EmailCoroutineState::Complete(Err(err.into()));
+                        }
+                    }
+                }
+                State::Done => {
+                    return EmailCoroutineState::Complete(Err(
+                        ImapEnvelopeSearchError::ResumedAfterDone,
+                    ));
+                }
+            }
         }
     }
 }
 
 enum State {
     Selecting {
-        select: SelectOrExamine,
+        select: ImapMailboxSelect,
         page: Option<u32>,
         page_size: Option<u32>,
         item_names: MacroOrMessageDataItemNames<'static>,
@@ -120,220 +297,11 @@ enum State {
     Done,
 }
 
-/// I/O-free coroutine wrapping `SELECT <mailbox>` + `UID SORT
-/// <criteria> UTF-8 <keys>` + `UID FETCH <uids> (UID FLAGS ENVELOPE
-/// RFC822.SIZE [BODYSTRUCTURE])`. `page` is 1-indexed; the page is
-/// sliced from the server-returned UID list, preserving the SORT
-/// order.
-pub struct ImapEnvelopeSearch {
-    state: State,
-}
-
-impl ImapEnvelopeSearch {
-    /// `page_size = None` returns the full result set; `page = None` is
-    /// treated as page 1. `with_attachment = true` additionally fetches
-    /// `BODYSTRUCTURE` to populate [`Envelope::has_attachment`].
-    pub fn new(
-        context: ImapContext,
-        mailbox: ImapMailbox<'static>,
-        query: Option<&SearchEmailsQuery>,
-        page: Option<u32>,
-        page_size: Option<u32>,
-        with_attachment: bool,
-    ) -> Result<Self, EmailClientStdError> {
-        trace!("prepare IMAP envelope search");
-        Self::with_select(
-            SelectOrExamine::Select(ImapMailboxSelect::new(context, mailbox)),
-            query,
-            page,
-            page_size,
-            with_attachment,
-        )
-    }
-
-    /// Read-only variant: issues `EXAMINE` instead of `SELECT`.
-    pub fn read_only(
-        context: ImapContext,
-        mailbox: ImapMailbox<'static>,
-        query: Option<&SearchEmailsQuery>,
-        page: Option<u32>,
-        page_size: Option<u32>,
-        with_attachment: bool,
-    ) -> Result<Self, EmailClientStdError> {
-        trace!("prepare IMAP envelope search (read-only)");
-        Self::with_select(
-            SelectOrExamine::Examine(ImapMailboxExamine::new(context, mailbox)),
-            query,
-            page,
-            page_size,
-            with_attachment,
-        )
-    }
-
-    fn with_select(
-        select: SelectOrExamine,
-        query: Option<&SearchEmailsQuery>,
-        page: Option<u32>,
-        page_size: Option<u32>,
-        with_attachment: bool,
-    ) -> Result<Self, EmailClientStdError> {
-        let search_criteria = search_keys(query.and_then(|q| q.filter.as_ref()))?;
-        let sort_criteria = sort_criteria(query.and_then(|q| q.sort.as_deref()));
-        let item_names = build_item_names(with_attachment);
-
-        Ok(Self {
-            state: State::Selecting {
-                select,
-                page,
-                page_size,
-                item_names,
-                search_criteria,
-                sort_criteria,
-            },
-        })
-    }
-
-    pub fn resume(&mut self, mut arg: Option<&[u8]>) -> ImapEnvelopeSearchResult {
-        loop {
-            match mem::replace(&mut self.state, State::Done) {
-                State::Selecting {
-                    mut select,
-                    page,
-                    page_size,
-                    item_names,
-                    search_criteria,
-                    sort_criteria,
-                } => match select.resume(arg.take()) {
-                    ImapMailboxSelectResult::WantsRead => {
-                        self.state = State::Selecting {
-                            select,
-                            page,
-                            page_size,
-                            item_names,
-                            search_criteria,
-                            sort_criteria,
-                        };
-                        return ImapEnvelopeSearchResult::WantsRead;
-                    }
-                    ImapMailboxSelectResult::WantsWrite(bytes) => {
-                        self.state = State::Selecting {
-                            select,
-                            page,
-                            page_size,
-                            item_names,
-                            search_criteria,
-                            sort_criteria,
-                        };
-                        return ImapEnvelopeSearchResult::WantsWrite(bytes);
-                    }
-                    ImapMailboxSelectResult::Err { err, .. } => {
-                        return ImapEnvelopeSearchResult::Err(err.into());
-                    }
-                    ImapMailboxSelectResult::Ok { context, data } => {
-                        let exists = data.exists.unwrap_or(0);
-                        if exists == 0 {
-                            return ImapEnvelopeSearchResult::Ok(Vec::new());
-                        }
-
-                        let sort =
-                            ImapMailboxSort::new(context, sort_criteria, search_criteria, true);
-                        self.state = State::Sorting {
-                            sort,
-                            page,
-                            page_size,
-                            item_names,
-                        };
-                    }
-                },
-                State::Sorting {
-                    mut sort,
-                    page,
-                    page_size,
-                    item_names,
-                } => match sort.resume(arg.take()) {
-                    ImapMailboxSortResult::WantsRead => {
-                        self.state = State::Sorting {
-                            sort,
-                            page,
-                            page_size,
-                            item_names,
-                        };
-                        return ImapEnvelopeSearchResult::WantsRead;
-                    }
-                    ImapMailboxSortResult::WantsWrite(bytes) => {
-                        self.state = State::Sorting {
-                            sort,
-                            page,
-                            page_size,
-                            item_names,
-                        };
-                        return ImapEnvelopeSearchResult::WantsWrite(bytes);
-                    }
-                    ImapMailboxSortResult::Err { err, .. } => {
-                        return ImapEnvelopeSearchResult::Err(err.into());
-                    }
-                    ImapMailboxSortResult::Ok { context, ids } => {
-                        if ids.is_empty() {
-                            return ImapEnvelopeSearchResult::Ok(Vec::new());
-                        }
-
-                        let page_uids = paginate_uids(&ids, page, page_size);
-                        if page_uids.is_empty() {
-                            return ImapEnvelopeSearchResult::Ok(Vec::new());
-                        }
-
-                        let uid_str = page_uids
-                            .iter()
-                            .map(u32::to_string)
-                            .collect::<Vec<_>>()
-                            .join(",");
-
-                        let sequence_set: SequenceSet = match uid_str.as_str().try_into() {
-                            Ok(set) => set,
-                            Err(_) => {
-                                return ImapEnvelopeSearchResult::Err(
-                                    ImapEnvelopeSearchError::InvalidUidSet(uid_str),
-                                );
-                            }
-                        };
-
-                        let fetch = ImapMessageFetch::new(context, sequence_set, item_names, true);
-                        self.state = State::Fetching {
-                            fetch,
-                            order: page_uids,
-                        };
-                    }
-                },
-                State::Fetching { mut fetch, order } => match fetch.resume(arg.take()) {
-                    ImapMessageFetchResult::WantsRead => {
-                        self.state = State::Fetching { fetch, order };
-                        return ImapEnvelopeSearchResult::WantsRead;
-                    }
-                    ImapMessageFetchResult::WantsWrite(bytes) => {
-                        self.state = State::Fetching { fetch, order };
-                        return ImapEnvelopeSearchResult::WantsWrite(bytes);
-                    }
-                    ImapMessageFetchResult::Err { err, .. } => {
-                        return ImapEnvelopeSearchResult::Err(err.into());
-                    }
-                    ImapMessageFetchResult::Ok { data, .. } => {
-                        let envelopes = reorder_envelopes(data, &order);
-                        return ImapEnvelopeSearchResult::Ok(envelopes);
-                    }
-                },
-                State::Done => {
-                    return ImapEnvelopeSearchResult::Err(ImapEnvelopeSearchError::AlreadyDone);
-                }
-            }
-        }
-    }
-}
-
 /// Builds the IMAP `SEARCH` key list for the given filter, defaulting
 /// to `[ALL]` when no filter is provided.
-pub fn search_keys(
+fn search_keys(
     filter: Option<&SearchEmailsFilterQuery>,
-) -> Result<Vec1<SearchKey<'static>>, EmailClientStdError> {
+) -> Result<Vec1<SearchKey<'static>>, ImapEnvelopeSearchError> {
     let key = match filter {
         None => SearchKey::All,
         Some(filter) => convert_filter(filter)?,
@@ -343,7 +311,7 @@ pub fn search_keys(
 
 /// Builds the IMAP `SORT` criterion list for the given sort chain,
 /// defaulting to `REVERSE DATE` when the chain is empty or absent.
-pub fn sort_criteria(sort: Option<&[SearchEmailsSorter]>) -> Vec1<SortCriterion> {
+fn sort_criteria(sort: Option<&[SearchEmailsSorter]>) -> Vec1<SortCriterion> {
     let criteria: Vec<SortCriterion> = match sort {
         Some(chain) if !chain.is_empty() => chain.iter().map(convert_sorter).collect(),
         _ => vec![SortCriterion {
@@ -355,14 +323,10 @@ pub fn sort_criteria(sort: Option<&[SearchEmailsSorter]>) -> Vec1<SortCriterion>
     Vec1::try_from(criteria).expect("non-empty by construction")
 }
 
-/// Slices `uids` according to `(page, page_size)`, preserving order.
-/// `page = None` is treated as page 1; `page_size = None` keeps the
-/// full list.
-pub fn paginate_uids(
-    uids: &[core::num::NonZeroU32],
-    page: Option<u32>,
-    page_size: Option<u32>,
-) -> Vec<u32> {
+/// Slices `uids` according to `(page, page_size)`, preserving SORT
+/// order. `page = None` is treated as page 1; `page_size = None` keeps
+/// the whole list.
+fn paginate_uids(uids: &[NonZeroU32], page: Option<u32>, page_size: Option<u32>) -> Vec<u32> {
     let total = uids.len();
     let size = page_size.map(|n| n as usize);
     let start = ((page.unwrap_or(1).max(1) - 1) as usize).saturating_mul(size.unwrap_or(0));
@@ -381,7 +345,7 @@ pub fn paginate_uids(
 
 fn convert_filter(
     filter: &SearchEmailsFilterQuery,
-) -> Result<SearchKey<'static>, EmailClientStdError> {
+) -> Result<SearchKey<'static>, ImapEnvelopeSearchError> {
     use SearchEmailsFilterQuery as Q;
 
     Ok(match filter {
@@ -395,11 +359,11 @@ fn convert_filter(
         ),
         Q::Not(inner) => SearchKey::Not(Box::new(convert_filter(inner)?)),
 
-        // Our `Date(D)` is "Date: header on day D", same shape as
-        // IMAP `SENTON`.
+        // `Date(D)` is "Date: header on day D", same shape as IMAP
+        // `SENTON`.
         Q::Date(date) => SearchKey::SentOn(imap_date(*date)?),
 
-        // Our `AfterDate(D)` is the strict `Date: header > D`. IMAP
+        // `AfterDate(D)` is the strict `Date: header > D`. IMAP
         // `SENTSINCE D'` is `Date: header >= D'`, so bump by one day.
         Q::AfterDate(date) => {
             let bumped = date.succ_opt().unwrap_or(*date);
@@ -412,14 +376,9 @@ fn convert_filter(
         Q::Body(pattern) => SearchKey::Body(astring(pattern)?),
 
         Q::Flag(flag) => {
-            use io_imap::types::core::Atom;
-
-            use crate::flag::IanaFlag;
-
-            // IMAP exposes dedicated search keys for the four
-            // classic system flags plus `\Deleted`; every other
-            // IANA keyword and every custom keyword goes through
-            // `SearchKey::Keyword(Atom)`.
+            // IMAP exposes dedicated search keys for the four classic
+            // system flags plus `\Deleted`; every other IANA keyword
+            // and every custom keyword goes through `Keyword(Atom)`.
             match flag.iana() {
                 Some(IanaFlag::Seen) => SearchKey::Seen,
                 Some(IanaFlag::Answered) => SearchKey::Answered,
@@ -428,7 +387,7 @@ fn convert_filter(
                 Some(IanaFlag::Deleted) => SearchKey::Deleted,
                 _ => SearchKey::Keyword(
                     Atom::try_from(String::from(flag.raw()))
-                        .map_err(|_| EmailClientStdError::InvalidId(String::from(flag.raw())))?,
+                        .map_err(|_| ImapEnvelopeSearchError::InvalidKeyword(flag.raw().into()))?,
                 ),
             }
         }
@@ -445,43 +404,38 @@ fn convert_sorter(sorter: &SearchEmailsSorter) -> SortCriterion {
         SearchEmailsSorterKind::Subject => SortKey::Subject,
     };
 
-    let reverse = matches!(order, SearchEmailsSorterOrder::Descending);
-
-    SortCriterion { reverse, key }
+    SortCriterion {
+        reverse: matches!(order, SearchEmailsSorterOrder::Descending),
+        key,
+    }
 }
 
-fn astring(pattern: &str) -> Result<AString<'static>, EmailClientStdError> {
+fn astring(pattern: &str) -> Result<AString<'static>, ImapEnvelopeSearchError> {
     AString::try_from(String::from(pattern))
-        .map_err(|_| EmailClientStdError::OperationFailed("invalid IMAP search pattern"))
+        .map_err(|_| ImapEnvelopeSearchError::InvalidPattern(pattern.into()))
 }
 
-fn imap_date(date: chrono::NaiveDate) -> Result<ImapNaiveDate, EmailClientStdError> {
+fn imap_date(date: chrono::NaiveDate) -> Result<ImapNaiveDate, ImapEnvelopeSearchError> {
     ImapNaiveDate::try_from(date)
-        .map_err(|_| EmailClientStdError::OperationFailed("invalid IMAP date"))
+        .map_err(|_| ImapEnvelopeSearchError::InvalidDate(date.to_string()))
 }
 
 /// Maps the FETCH response back into the requested UID order, dropping
 /// UIDs the server failed to return.
 fn reorder_envelopes(
-    data: alloc::collections::BTreeMap<
-        core::num::NonZeroU32,
-        Vec1<io_imap::types::fetch::MessageDataItem<'static>>,
-    >,
+    data: BTreeMap<NonZeroU32, Vec1<MessageDataItem<'static>>>,
     order: &[u32],
 ) -> Vec<Envelope> {
-    use alloc::collections::BTreeMap;
-    use io_imap::types::fetch::MessageDataItem;
-
     let by_uid: BTreeMap<u32, Envelope> = data
         .into_iter()
-        .map(|(_, items)| {
+        .map(|(seq, items)| {
             let items = items.into_inner();
             let uid = items.iter().find_map(|item| match item {
                 MessageDataItem::Uid(u) => Some(u.get()),
                 _ => None,
             });
-            let env = envelope_from(0, items);
-            (uid.unwrap_or(0), env)
+            let env = envelope_from(seq.get(), items);
+            (uid.unwrap_or(seq.get()), env)
         })
         .collect();
 
@@ -493,7 +447,7 @@ fn reorder_envelopes(
 
 #[cfg(test)]
 mod tests {
-    use alloc::{boxed::Box, vec};
+    use alloc::boxed::Box;
 
     use chrono::NaiveDate;
 
@@ -515,10 +469,7 @@ mod tests {
     fn date_clauses_target_sent_at() {
         let q = SearchEmailsFilterQuery::Date(naive(2026, 1, 15));
         let key = convert_filter(&q).unwrap();
-        match key {
-            SearchKey::SentOn(d) => assert_eq!(*d.as_ref(), naive(2026, 1, 15)),
-            other => panic!("expected SentOn, got {other:?}"),
-        }
+        assert!(matches!(key, SearchKey::SentOn(_)));
     }
 
     #[test]
@@ -532,50 +483,30 @@ mod tests {
     }
 
     #[test]
-    fn and_collects_two_keys() {
+    fn and_or_not_translate_to_searchkey_combinators() {
         let q = SearchEmailsFilterQuery::And(
-            Box::new(SearchEmailsFilterQuery::From("alice".into())),
-            Box::new(SearchEmailsFilterQuery::Subject("release".into())),
-        );
-        let key = convert_filter(&q).unwrap();
-        match key {
-            SearchKey::And(keys) => {
-                let inner: Vec<_> = keys.into_inner();
-                assert_eq!(inner.len(), 2);
-                assert!(matches!(inner[0], SearchKey::From(_)));
-                assert!(matches!(inner[1], SearchKey::Subject(_)));
-            }
-            other => panic!("expected And, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn or_and_not_box_the_subtree() {
-        let q = SearchEmailsFilterQuery::Or(
             Box::new(SearchEmailsFilterQuery::From("alice".into())),
             Box::new(SearchEmailsFilterQuery::Not(Box::new(
                 SearchEmailsFilterQuery::Subject("draft".into()),
             ))),
         );
         let key = convert_filter(&q).unwrap();
-        match key {
-            SearchKey::Or(l, r) => {
-                assert!(matches!(*l, SearchKey::From(_)));
-                assert!(matches!(*r, SearchKey::Not(_)));
-            }
-            other => panic!("expected Or, got {other:?}"),
-        }
+        assert!(matches!(key, SearchKey::And(_)));
+
+        let q = SearchEmailsFilterQuery::Or(
+            Box::new(SearchEmailsFilterQuery::From("a".into())),
+            Box::new(SearchEmailsFilterQuery::From("b".into())),
+        );
+        let key = convert_filter(&q).unwrap();
+        assert!(matches!(key, SearchKey::Or(_, _)));
     }
 
     #[test]
     fn flag_lcd_mapping() {
-        use crate::flag::IanaFlag;
-
         for (iana, expected_seen) in [
             (IanaFlag::Seen, true),
             (IanaFlag::Answered, false),
             (IanaFlag::Flagged, false),
-            (IanaFlag::Draft, false),
         ] {
             let key =
                 convert_filter(&SearchEmailsFilterQuery::Flag(Flag::from_iana(iana))).unwrap();

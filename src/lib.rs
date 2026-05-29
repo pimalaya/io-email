@@ -2,7 +2,6 @@
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 #![doc = include_str!("../README.md")]
 
-#[cfg_attr(any(feature = "imap", feature = "jmap"), macro_use)]
 extern crate alloc;
 #[cfg(feature = "client")]
 extern crate std;
@@ -17,6 +16,7 @@ pub mod address;
     feature = "smtp"
 ))]
 pub mod client;
+pub mod coroutine;
 pub mod envelope;
 pub mod event;
 pub mod flag;
@@ -33,6 +33,3 @@ pub mod maildir;
 pub mod search;
 #[cfg(feature = "smtp")]
 pub mod smtp;
-#[cfg(feature = "client")]
-#[cfg(any(feature = "imap", feature = "jmap", feature = "maildir"))]
-pub mod watch;

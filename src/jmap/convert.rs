@@ -1,28 +1,32 @@
-//! Conversions between JMAP wire types and the shared types used by
-//! [`EmailClientStd`], plus the `From` impl that wraps an
-//! already-built [`JmapClientStd`] into a fresh unified client with
-//! JMAP as the only registered backend.
+//! Shared helpers for the JMAP coroutines: keyword translation,
+//! pagination, account id extraction, exact-name mailbox lookup, and
+//! the `Email` → [`Envelope`] conversion used by `envelope_list` and
+//! `message_*`.
 
-use alloc::string::{String, ToString};
+use alloc::{
+    string::{String, ToString},
+    vec,
+    vec::Vec,
+};
 
-use io_jmap::{client::JmapClientStd, rfc8621::email::EmailFilter};
+use chrono::{DateTime, FixedOffset};
+use io_jmap::rfc8620::session::JmapSession;
+use io_jmap::rfc8621::{
+    capabilities,
+    email::{Email, EmailAddress as JmapAddress, EmailProperty},
+    mailbox::Mailbox as JmapMailbox,
+};
 
-use crate::{client::EmailClientStd, flag::Flag};
+use crate::{
+    address::Address,
+    envelope::{Envelope, normalize_message_id},
+    flag::{Flag, IanaFlag},
+};
 
-impl From<JmapClientStd> for EmailClientStd {
-    fn from(client: JmapClientStd) -> Self {
-        Self::new().with_jmap(client)
-    }
-}
-
-/// Maps a shared [`Flag`] to its JMAP keyword.
-///
-/// IANA-classified flags render as the lowercase canonical keyword
-/// (`$seen`, `$forwarded`, …) per RFC 8621 §4.1.1; custom user
-/// keywords pass through their raw wire spelling unchanged.
+/// Maps a shared [`Flag`] to its JMAP keyword (RFC 8621 §4.1.1).
+/// IANA-classified flags use the lowercase canonical form; custom
+/// keywords pass through their raw wire spelling.
 pub(crate) fn keyword_from(flag: &Flag) -> String {
-    use crate::flag::IanaFlag;
-
     match flag.iana() {
         Some(IanaFlag::Seen) => "$seen".into(),
         Some(IanaFlag::Answered) => "$answered".into(),
@@ -39,19 +43,6 @@ pub(crate) fn keyword_from(flag: &Flag) -> String {
     }
 }
 
-/// Translates a shared mailbox name into a JMAP [`EmailFilter`].
-/// Returns `None` when no mailbox is selected (queries the whole
-/// account).
-pub(crate) fn mailbox_filter(mailbox: &str) -> Option<EmailFilter> {
-    if mailbox.is_empty() {
-        return None;
-    }
-    Some(EmailFilter {
-        in_mailbox: Some(mailbox.to_string()),
-        ..EmailFilter::default()
-    })
-}
-
 /// Translates 1-indexed `(page, page_size)` into JMAP
 /// `(position, limit)`. Both stay `None` when no page size is
 /// requested.
@@ -62,9 +53,105 @@ pub(crate) fn compute_position_limit(
     let Some(size) = page_size else {
         return (None, None);
     };
-
     let page = page.unwrap_or(1).max(1);
     let position = ((page - 1) as u64).saturating_mul(size as u64);
-
     (Some(position), Some(size as u64))
+}
+
+/// Extracts the primary mail account id from a JMAP session, falling
+/// back to an empty string when the session advertises no mail
+/// account (mostly a defensive default).
+pub(crate) fn account_id_of(session: &JmapSession) -> String {
+    session
+        .primary_accounts
+        .get(capabilities::MAIL)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Finds the mailbox whose `name` matches `target` exactly within a
+/// `Mailbox/get` result list. `Mailbox/query` filters with a substring
+/// match, so the post-filter is needed to avoid picking `Inbox.Sub`
+/// when the caller asked for `Inbox`.
+pub(crate) fn find_mailbox_id(mailboxes: &[JmapMailbox], target: &str) -> Option<String> {
+    mailboxes
+        .iter()
+        .find(|m| m.name.as_deref() == Some(target))
+        .and_then(|m| m.id.clone())
+}
+
+/// Properties requested from `Email/get` to populate an [`Envelope`].
+/// Uses `sentAt` (author-claimed `Date:`) rather than `receivedAt` for
+/// cross-backend consistency.
+pub(crate) fn envelope_properties() -> Vec<EmailProperty> {
+    vec![
+        EmailProperty::Id,
+        EmailProperty::Keywords,
+        EmailProperty::Subject,
+        EmailProperty::From,
+        EmailProperty::To,
+        EmailProperty::SentAt,
+        EmailProperty::Size,
+        EmailProperty::HasAttachment,
+        EmailProperty::MessageId,
+    ]
+}
+
+/// Folds a JMAP [`Email`] object into the shared [`Envelope`] shape.
+pub(crate) fn envelope_from(email: Email) -> Envelope {
+    let id = email.id.unwrap_or_default();
+    let flags = email
+        .keywords
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(k, v)| if v { Some(Flag::from_raw(k)) } else { None })
+        .collect();
+    let subject = email.subject.unwrap_or_default();
+    let from = email
+        .from
+        .unwrap_or_default()
+        .into_iter()
+        .map(address_from)
+        .collect();
+    let to = email
+        .to
+        .unwrap_or_default()
+        .into_iter()
+        .map(address_from)
+        .collect();
+    let date = email.sent_at.as_deref().and_then(parse_rfc3339);
+    let size = email.size.unwrap_or(0);
+    let has_attachment = email.has_attachment;
+    // JMAP returns `messageId` as a list (RFC 5322 allows multiple
+    // header instances). The first non-empty entry is the canonical
+    // value.
+    let message_id = email
+        .message_id
+        .and_then(|ids| ids.into_iter().find_map(|s| normalize_message_id(&s)));
+    Envelope {
+        id,
+        message_id,
+        flags,
+        subject,
+        from,
+        to,
+        date,
+        size,
+        has_attachment,
+    }
+}
+
+fn address_from(addr: JmapAddress) -> Address {
+    Address {
+        name: addr.name,
+        email: addr.email,
+    }
+}
+
+fn parse_rfc3339(raw: &str) -> Option<DateTime<FixedOffset>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    DateTime::parse_from_rfc3339(trimmed).ok()
 }

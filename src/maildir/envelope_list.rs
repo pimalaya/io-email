@@ -1,64 +1,68 @@
-//! Maildir envelope listing, wrapping
-//! [`io_maildir::coroutines::message_list::MaildirMessagesList`].
+//! Maildir envelope-listing coroutine.
 //!
-//! Maildir has no inherent ordering; envelopes are sorted by date
-//! descending and then paginated. `page` is 1-indexed.
+//! Composes two io-maildir state machines:
+//! 1. [`MaildirMessagesList`] walks `cur/` + `new/` and returns one
+//!    [`MaildirEntry`] per file.
+//! 2. A second pass batches the entry paths through
+//!    [`FsStep::WantsFileRead`]; the driver reads each
+//!    file and feeds the bytes back so the coroutine can parse RFC
+//!    5322 headers (subject, from, to, date, message-id) via
+//!    [`mail_parser::Message`].
+//!
+//! Sorting is by `Date:` header descending; pagination is 1-indexed
+//! on the in-memory result.
+//!
+//! [`MaildirMessagesList`]: io_maildir::coroutines::message_list::MaildirMessagesList
 
 use alloc::{
     collections::{BTreeMap, BTreeSet},
-    string::{String, ToString},
+    string::ToString,
     vec::Vec,
 };
 use core::mem;
+use std::path::PathBuf;
 
 use chrono::DateTime;
 use io_maildir::{
+    coroutine::{MaildirCoroutine, MaildirCoroutineState, MaildirReply, MaildirYield},
     coroutines::message_list::{
-        MaildirMessagesList as InnerMaildirMessagesList, MaildirMessagesListArg,
-        MaildirMessagesListError, MaildirMessagesListResult,
+        MaildirMessagesList as InnerList, MaildirMessagesListError as InnerErr,
     },
     entry::MaildirEntry,
-    flag::{KeywordHeader, MaildirFlag, MaildirFlags},
-    headers::extract_keywords_header,
     maildir::Maildir,
     message::MaildirMessage,
     path::MaildirPath,
 };
 use log::trace;
 use mail_parser::Address as MailParserAddress;
+use thiserror::Error;
 
 use crate::{
     address::Address,
+    coroutine::{
+        EmailBackend, EmailCoroutine, EmailCoroutineArg, EmailCoroutineState, FsBatch, FsStep,
+    },
     envelope::{Envelope, normalize_message_id},
     flag::Flag,
-    maildir::convert::flag_from_maildir,
+    maildir::convert::{
+        InvalidMailboxName, dirread_in, flag_from_char, paginate, paths_out, probes_in,
+        resolve_mailbox,
+    },
 };
 
-/// Argument fed back to [`MaildirEnvelopeList::resume`].
-#[derive(Debug)]
-pub enum MaildirEnvelopeListArg {
-    DirRead(BTreeMap<MaildirPath, BTreeSet<MaildirPath>>),
-    FileExists(BTreeMap<MaildirPath, bool>),
-    FileRead(BTreeMap<MaildirPath, Vec<u8>>),
-}
-
-/// Result returned by [`MaildirEnvelopeList::resume`].
-#[derive(Debug)]
-pub enum MaildirEnvelopeListResult {
-    Ok(Vec<Envelope>),
-    WantsDirRead(BTreeSet<MaildirPath>),
-    WantsFileExists(BTreeSet<MaildirPath>),
-    WantsFileRead(BTreeSet<MaildirPath>),
-    Err(MaildirMessagesListError),
-}
-
-/// Internal state of [`MaildirEnvelopeList`].
-#[derive(Default)]
-enum State {
-    Listing(InnerMaildirMessagesList),
-    Reading(BTreeSet<MaildirEntry>),
-    #[default]
-    Done,
+/// Errors produced by [`MaildirEnvelopeList`].
+#[derive(Debug, Error)]
+pub enum MaildirEnvelopeListError {
+    #[error(transparent)]
+    List(#[from] InnerErr),
+    #[error(transparent)]
+    InvalidMailbox(#[from] InvalidMailboxName),
+    #[error("coroutine was resumed with the wrong EmailCoroutineArg variant")]
+    InvalidArg,
+    #[error("coroutine was resumed with an FsBatch variant it did not request")]
+    UnexpectedBatch,
+    #[error("coroutine was resumed after completion")]
+    ResumedAfterDone,
 }
 
 /// I/O-free coroutine listing every message inside a single Maildir,
@@ -70,117 +74,126 @@ pub struct MaildirEnvelopeList {
 }
 
 impl MaildirEnvelopeList {
-    pub fn new(maildir: Maildir, page: Option<u32>, page_size: Option<u32>) -> Self {
+    pub fn new(
+        root: impl Into<PathBuf>,
+        maildir_plus: bool,
+        mailbox: &str,
+        page: Option<u32>,
+        page_size: Option<u32>,
+    ) -> Result<Self, MaildirEnvelopeListError> {
         trace!("prepare Maildir envelope listing");
-        Self {
-            state: State::Listing(InnerMaildirMessagesList::new(maildir)),
+        let path = resolve_mailbox(&root.into(), maildir_plus, mailbox)?;
+        let maildir = Maildir::from_path(path);
+        Ok(Self {
+            state: State::Listing(InnerList::new(maildir)),
             page,
             page_size,
-        }
+        })
     }
+}
 
-    pub fn resume(&mut self, arg: Option<MaildirEnvelopeListArg>) -> MaildirEnvelopeListResult {
-        match (mem::take(&mut self.state), arg) {
-            (State::Listing(mut inner), arg) => {
-                let inner_arg = match arg {
+impl EmailCoroutine for MaildirEnvelopeList {
+    type Yield = FsStep;
+    type Return = Result<Vec<Envelope>, MaildirEnvelopeListError>;
+
+    const BACKEND: EmailBackend = EmailBackend::Maildir;
+
+    fn resume(
+        &mut self,
+        arg: EmailCoroutineArg<'_>,
+    ) -> EmailCoroutineState<Self::Yield, Self::Return> {
+        #[allow(irrefutable_let_patterns)]
+        let EmailCoroutineArg::Fs { batch } = arg else {
+            return EmailCoroutineState::Complete(Err(MaildirEnvelopeListError::InvalidArg));
+        };
+
+        match mem::replace(&mut self.state, State::Done) {
+            State::Listing(mut inner) => {
+                let inner_arg = match batch {
                     None => None,
-                    Some(MaildirEnvelopeListArg::DirRead(entries)) => {
-                        Some(MaildirMessagesListArg::DirRead(entries))
+                    Some(FsBatch::DirRead(entries)) => {
+                        Some(MaildirReply::DirRead(dirread_in(entries)))
                     }
-                    Some(MaildirEnvelopeListArg::FileExists(probes)) => {
-                        Some(MaildirMessagesListArg::FileExists(probes))
+                    Some(FsBatch::FileExists(probes)) => {
+                        Some(MaildirReply::FileExists(probes_in(probes)))
                     }
-                    Some(MaildirEnvelopeListArg::FileRead(_)) => {
-                        // FileRead is consumed in State::Reading; if the
-                        // caller feeds it back during listing, surface
-                        // an invalid-arg error through the inner state.
-                        return MaildirEnvelopeListResult::Err(MaildirMessagesListError::Invalid(
-                            Some(MaildirMessagesListArg::FileExists(BTreeMap::new())),
-                            io_maildir::coroutines::message_list::State::Invalid,
+                    Some(_) => {
+                        return EmailCoroutineState::Complete(Err(
+                            MaildirEnvelopeListError::UnexpectedBatch,
                         ));
                     }
                 };
-
                 match inner.resume(inner_arg) {
-                    MaildirMessagesListResult::WantsDirRead(paths) => {
+                    MaildirCoroutineState::Yielded(MaildirYield::WantsDirRead(paths)) => {
                         self.state = State::Listing(inner);
-                        MaildirEnvelopeListResult::WantsDirRead(paths)
+                        EmailCoroutineState::Yielded(FsStep::WantsDirRead(paths_out(paths)))
                     }
-                    MaildirMessagesListResult::WantsFileExists(paths) => {
+                    MaildirCoroutineState::Yielded(MaildirYield::WantsFileExists(paths)) => {
                         self.state = State::Listing(inner);
-                        MaildirEnvelopeListResult::WantsFileExists(paths)
+                        EmailCoroutineState::Yielded(FsStep::WantsFileExists(paths_out(paths)))
                     }
-                    MaildirMessagesListResult::Ok(entries) => {
+                    MaildirCoroutineState::Complete(Ok(entries)) => {
                         if entries.is_empty() {
-                            return MaildirEnvelopeListResult::Ok(Vec::new());
+                            return EmailCoroutineState::Complete(Ok(Vec::new()));
                         }
-                        let paths: BTreeSet<MaildirPath> =
-                            entries.iter().map(|e| e.path().clone()).collect();
+                        let paths: BTreeSet<PathBuf> = entries
+                            .iter()
+                            .map(|e| PathBuf::from(e.path().clone()))
+                            .collect();
                         self.state = State::Reading(entries);
-                        MaildirEnvelopeListResult::WantsFileRead(paths)
+                        EmailCoroutineState::Yielded(FsStep::WantsFileRead(paths))
                     }
-                    MaildirMessagesListResult::Err(err) => MaildirEnvelopeListResult::Err(err),
+                    MaildirCoroutineState::Complete(Err(err)) => {
+                        EmailCoroutineState::Complete(Err(err.into()))
+                    }
+                    other => {
+                        let _ = other;
+                        unreachable!("MaildirMessagesList never yields this state");
+                    }
                 }
             }
-            (State::Reading(entries), Some(MaildirEnvelopeListArg::FileRead(mut contents))) => {
+            State::Reading(entries) => {
+                let Some(FsBatch::FileRead(contents)) = batch else {
+                    self.state = State::Reading(entries);
+                    return EmailCoroutineState::Complete(Err(
+                        MaildirEnvelopeListError::UnexpectedBatch,
+                    ));
+                };
+                let mut contents: BTreeMap<MaildirPath, Vec<u8>> =
+                    contents.into_iter().map(|(k, v)| (k.into(), v)).collect();
                 let mut envelopes: Vec<Envelope> = entries
                     .into_iter()
                     .filter_map(|entry| {
                         let bytes = contents.remove(entry.path())?;
-                        let message = MaildirMessage::from((entry.path().clone(), bytes));
-                        Some(Envelope::from(message))
+                        Some(envelope_from_message(&MaildirMessage::from((
+                            entry.path().clone(),
+                            bytes,
+                        ))))
                     })
                     .collect();
                 envelopes.sort_by(|a, b| b.date.cmp(&a.date));
-                MaildirEnvelopeListResult::Ok(paginate(envelopes, self.page, self.page_size))
+                EmailCoroutineState::Complete(Ok(paginate(envelopes, self.page, self.page_size)))
             }
-            (state, _) => {
-                self.state = state;
-                MaildirEnvelopeListResult::Err(MaildirMessagesListError::Invalid(
-                    None,
-                    io_maildir::coroutines::message_list::State::Invalid,
-                ))
+            State::Done => {
+                EmailCoroutineState::Complete(Err(MaildirEnvelopeListError::ResumedAfterDone))
             }
         }
     }
 }
 
-impl From<MaildirMessage> for Envelope {
-    fn from(message: MaildirMessage) -> Self {
-        envelope_from_message(&message, &BTreeMap::new(), None)
-    }
+/// Two-phase state: list entries, then read their bytes for header
+/// parsing.
+enum State {
+    Listing(InnerList),
+    Reading(BTreeSet<MaildirEntry>),
+    Done,
 }
 
-/// Builds an [`Envelope`] from a Maildir message, optionally
-/// enriching its flag set with custom keywords coming from a
-/// dovecot-keywords table (filename `a..z` letters → keywords) and a
-/// configured body header ([`KeywordHeader::XKeywords`] /
-/// [`KeywordHeader::XLabel`]).
-pub(crate) fn envelope_from_message(
-    message: &MaildirMessage,
-    dovecot_table: &BTreeMap<char, String>,
-    header: Option<KeywordHeader>,
-) -> Envelope {
+/// Builds an [`Envelope`] from a Maildir message: filename letters
+/// for flags, RFC 5322 headers via mail-parser.
+fn envelope_from_message(message: &MaildirMessage) -> Envelope {
     let id = message.id().unwrap_or_default().to_string();
-    let mut flags = parse_filename_flags(message.path());
-
-    if !dovecot_table.is_empty() {
-        let md_flags = MaildirFlags::with_dovecot(message.path(), dovecot_table);
-        for f in md_flags.iter() {
-            if let MaildirFlag::Keyword(_) = f {
-                if let Some(flag) = flag_from_maildir(f) {
-                    flags.insert(flag);
-                }
-            }
-        }
-    }
-
-    if let Some(header) = header {
-        for keyword in extract_keywords_header(message.contents(), header) {
-            flags.insert(Flag::from_raw(keyword));
-        }
-    }
-
+    let flags = parse_filename_flags(message.path());
     let size = message.contents().len() as u64;
     let parsed = message.parsed();
 
@@ -227,44 +240,20 @@ pub(crate) fn envelope_from_message(
     }
 }
 
-fn paginate(envelopes: Vec<Envelope>, page: Option<u32>, page_size: Option<u32>) -> Vec<Envelope> {
-    let Some(size) = page_size else {
-        return envelopes;
-    };
-
-    if size == 0 {
-        return Vec::new();
-    }
-
-    let page = page.unwrap_or(1).max(1);
-    let skip = ((page - 1) as usize).saturating_mul(size as usize);
-
-    if skip >= envelopes.len() {
-        return Vec::new();
-    }
-
-    envelopes
-        .into_iter()
-        .skip(skip)
-        .take(size as usize)
-        .collect()
-}
-
+/// Extracts the IANA flag set from a Maildir filename's info section.
+/// Letters outside the standard six are silently dropped.
 fn parse_filename_flags(path: &MaildirPath) -> BTreeSet<Flag> {
     let Some(name) = path.file_name() else {
         return BTreeSet::new();
     };
-
     let Some((_, letters)) = name.rsplit_once(',') else {
         return BTreeSet::new();
     };
-
-    letters
-        .chars()
-        .filter_map(crate::maildir::convert::flag_from_char)
-        .collect()
+    letters.chars().filter_map(flag_from_char).collect()
 }
 
+/// Converts mail-parser's address group into the shared LCD shape.
+/// Empty `email` addresses are dropped.
 fn addresses_from(addrs: &MailParserAddress<'_>) -> Vec<Address> {
     addrs
         .clone()

@@ -248,13 +248,12 @@ fn canonical_raw(iana: IanaFlag) -> &'static str {
 /// Direction of a flag store operation.
 ///
 /// `Set` replaces the message's flag set with the given list; `Add`
-/// and `Remove` patch the existing set. Used internally by
-/// [`EmailClientStd`](crate::client::EmailClientStd) to share the
-/// per-backend store path across `add_flags` / `set_flags` /
-/// `delete_flags`.
+/// and `Remove` patch the existing set. Shared by `add_flags` /
+/// `set_flags` / `delete_flags` and surfaced on the per-backend
+/// flag-store coroutines (e.g.
+/// [`crate::imap::flag_store::ImapFlagStore`]).
 #[derive(Clone, Copy, Debug)]
-#[allow(dead_code)]
-pub(crate) enum FlagOp {
+pub enum FlagOp {
     Add,
     Set,
     Remove,

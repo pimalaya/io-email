@@ -1,133 +1,160 @@
-//! IMAP message move (`SELECT <src>` + `UID MOVE <ids> <dst>`, RFC
-//! 6851), wrapping a private orchestrator.
+//! IMAP message-move coroutine.
+//!
+//! Optional `SELECT <from>` (gated on `auto_select`) followed by
+//! `UID MOVE <ids> <to>` (RFC 6851).
 
+use alloc::string::String;
 use core::mem;
 
-use alloc::vec::Vec;
-
 use io_imap::{
-    context::ImapContext,
-    rfc3501::select::{ImapMailboxSelect, ImapMailboxSelectError, ImapMailboxSelectResult},
+    coroutine::{ImapCoroutine, ImapCoroutineState, ImapYield},
+    rfc3501::select::{ImapMailboxSelect, ImapMailboxSelectError},
     rfc6851::r#move::{
         ImapMessageMove as InnerImapMessageMove, ImapMessageMoveError as InnerImapMessageMoveError,
-        ImapMessageMoveResult as InnerImapMessageMoveResult,
     },
-    types::{mailbox::Mailbox as ImapMailbox, sequence::SequenceSet},
 };
 use log::trace;
 use thiserror::Error;
 
-/// Errors produced while orchestrating SELECT + UID MOVE for IMAP
-/// message move.
+use crate::{
+    coroutine::{EmailBackend, EmailCoroutine, EmailCoroutineArg, EmailCoroutineState, ImapStep},
+    imap::convert::{InvalidMailboxName, InvalidUidSet, parse_mailbox, parse_uids},
+};
+
+/// Errors produced by [`ImapMessageMove`].
 #[derive(Debug, Error)]
 pub enum ImapMessageMoveError {
     #[error(transparent)]
     Select(#[from] ImapMailboxSelectError),
     #[error(transparent)]
     Move(#[from] InnerImapMessageMoveError),
-    #[error("IMAP message move was resumed after completion")]
-    AlreadyDone,
+    #[error("invalid IMAP mailbox `{0}`")]
+    InvalidMailbox(String),
+    #[error("invalid message UID `{0}`")]
+    InvalidUid(String),
+    #[error("empty UID set")]
+    EmptyUidSet,
+    #[error("coroutine was resumed with the wrong EmailCoroutineArg variant")]
+    InvalidArg,
+    #[error("coroutine was resumed after completion")]
+    ResumedAfterDone,
 }
 
-/// Result returned by [`ImapMessageMove::resume`].
-#[derive(Debug)]
-pub enum ImapMessageMoveResult {
-    Ok,
-    WantsRead,
-    WantsWrite(Vec<u8>),
-    Err(ImapMessageMoveError),
+impl From<InvalidMailboxName> for ImapMessageMoveError {
+    fn from(err: InvalidMailboxName) -> Self {
+        Self::InvalidMailbox(err.0)
+    }
 }
 
-enum State {
-    Selecting {
-        select: ImapMailboxSelect,
-        sequence_set: SequenceSet,
-        target: ImapMailbox<'static>,
-        uid: bool,
-    },
-    Moving(InnerImapMessageMove),
-    Done,
+impl From<InvalidUidSet> for ImapMessageMoveError {
+    fn from(err: InvalidUidSet) -> Self {
+        match err {
+            InvalidUidSet::Empty => Self::EmptyUidSet,
+            InvalidUidSet::Invalid(s) => Self::InvalidUid(s),
+        }
+    }
 }
 
-/// I/O-free coroutine wrapping `SELECT <from>` followed by `UID MOVE
-/// <ids> <to>`. UIDs by default; pass `uid = false` to interpret the
-/// sequence-set as message sequence numbers.
+/// I/O-free coroutine moving a UID set across mailboxes.
 pub struct ImapMessageMove {
     state: State,
 }
 
 impl ImapMessageMove {
     pub fn new(
-        context: ImapContext,
-        from: ImapMailbox<'static>,
-        to: ImapMailbox<'static>,
-        sequence_set: SequenceSet,
-        uid: bool,
-    ) -> Self {
-        trace!("prepare IMAP message move");
-        Self {
-            state: State::Selecting {
-                select: ImapMailboxSelect::new(context, from),
-                sequence_set,
-                target: to,
-                uid,
-            },
-        }
+        from: &str,
+        to: &str,
+        ids: &[&str],
+        auto_select: bool,
+    ) -> Result<Self, ImapMessageMoveError> {
+        trace!("prepare IMAP message move (auto_select={auto_select})");
+        let src = parse_mailbox(from)?;
+        let dst = parse_mailbox(to)?;
+        let sequence_set = parse_uids(ids)?;
+        let mv = InnerImapMessageMove::new(sequence_set, dst, true);
+        let state = if auto_select {
+            State::Selecting {
+                select: ImapMailboxSelect::new(src),
+                mv,
+            }
+        } else {
+            State::Moving(mv)
+        };
+        Ok(Self { state })
     }
+}
 
-    pub fn resume(&mut self, mut arg: Option<&[u8]>) -> ImapMessageMoveResult {
+impl EmailCoroutine for ImapMessageMove {
+    type Yield = ImapStep;
+    type Return = Result<(), ImapMessageMoveError>;
+
+    const BACKEND: EmailBackend = EmailBackend::Imap;
+
+    fn resume(
+        &mut self,
+        arg: EmailCoroutineArg<'_>,
+    ) -> EmailCoroutineState<Self::Yield, Self::Return> {
+        #[allow(irrefutable_let_patterns)]
+        let EmailCoroutineArg::Imap {
+            fragmentizer,
+            mut bytes,
+        } = arg
+        else {
+            return EmailCoroutineState::Complete(Err(ImapMessageMoveError::InvalidArg));
+        };
+
         loop {
             match mem::replace(&mut self.state, State::Done) {
-                State::Selecting {
-                    mut select,
-                    sequence_set,
-                    target,
-                    uid,
-                } => match select.resume(arg.take()) {
-                    ImapMailboxSelectResult::WantsRead => {
-                        self.state = State::Selecting {
-                            select,
-                            sequence_set,
-                            target,
-                            uid,
-                        };
-                        return ImapMessageMoveResult::WantsRead;
+                State::Selecting { mut select, mv } => {
+                    match select.resume(fragmentizer, bytes.take()) {
+                        ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
+                            self.state = State::Selecting { select, mv };
+                            return EmailCoroutineState::Yielded(ImapStep::WantsRead);
+                        }
+                        ImapCoroutineState::Yielded(ImapYield::WantsWrite(out)) => {
+                            self.state = State::Selecting { select, mv };
+                            return EmailCoroutineState::Yielded(ImapStep::WantsWrite(out));
+                        }
+                        ImapCoroutineState::Complete(Ok(_)) => {
+                            self.state = State::Moving(mv);
+                        }
+                        ImapCoroutineState::Complete(Err(err)) => {
+                            return EmailCoroutineState::Complete(Err(err.into()));
+                        }
                     }
-                    ImapMailboxSelectResult::WantsWrite(bytes) => {
-                        self.state = State::Selecting {
-                            select,
-                            sequence_set,
-                            target,
-                            uid,
-                        };
-                        return ImapMessageMoveResult::WantsWrite(bytes);
-                    }
-                    ImapMailboxSelectResult::Err { err, .. } => {
-                        return ImapMessageMoveResult::Err(err.into());
-                    }
-                    ImapMailboxSelectResult::Ok { context, .. } => {
-                        let mv = InnerImapMessageMove::new(context, sequence_set, target, uid);
+                }
+                State::Moving(mut mv) => match mv.resume(fragmentizer, bytes.take()) {
+                    ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                         self.state = State::Moving(mv);
+                        return EmailCoroutineState::Yielded(ImapStep::WantsRead);
                     }
-                },
-                State::Moving(mut mv) => match mv.resume(arg.take()) {
-                    InnerImapMessageMoveResult::WantsRead => {
+                    ImapCoroutineState::Yielded(ImapYield::WantsWrite(out)) => {
                         self.state = State::Moving(mv);
-                        return ImapMessageMoveResult::WantsRead;
+                        return EmailCoroutineState::Yielded(ImapStep::WantsWrite(out));
                     }
-                    InnerImapMessageMoveResult::WantsWrite(bytes) => {
-                        self.state = State::Moving(mv);
-                        return ImapMessageMoveResult::WantsWrite(bytes);
+                    ImapCoroutineState::Complete(Ok(_copyuid)) => {
+                        return EmailCoroutineState::Complete(Ok(()));
                     }
-                    InnerImapMessageMoveResult::Err { err, .. } => {
-                        return ImapMessageMoveResult::Err(err.into());
+                    ImapCoroutineState::Complete(Err(err)) => {
+                        return EmailCoroutineState::Complete(Err(err.into()));
                     }
-                    InnerImapMessageMoveResult::Ok { .. } => return ImapMessageMoveResult::Ok,
                 },
                 State::Done => {
-                    return ImapMessageMoveResult::Err(ImapMessageMoveError::AlreadyDone);
+                    return EmailCoroutineState::Complete(Err(
+                        ImapMessageMoveError::ResumedAfterDone,
+                    ));
                 }
             }
         }
     }
+}
+
+#[allow(clippy::large_enum_variant)] // see flag_store.rs for rationale
+enum State {
+    Selecting {
+        select: ImapMailboxSelect,
+        mv: InnerImapMessageMove,
+    },
+    Moving(InnerImapMessageMove),
+    Done,
 }

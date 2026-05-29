@@ -1,162 +1,172 @@
-//! JMAP message copy (`Mailbox/query` + `Email/set`), wrapping a
-//! private orchestrator. Single-account, in-place copy: patches each
-//! email's `mailboxIds` to add the destination.
+//! JMAP message-copy coroutine.
+//!
+//! Two-stage state machine:
+//! 1. `Mailbox/query + Mailbox/get` with a name filter resolves the
+//!    target mailbox name to an id.
+//! 2. `Email/set { update: AddToMailbox(target_id) per id }` adds the
+//!    target mailbox reference to every requested email while leaving
+//!    the existing mailboxIds intact (JMAP's "copy" is conceptually
+//!    "an email referenced from N mailboxes").
+//!
+//! The shared `from` parameter is only used for symmetry with
+//! Maildir / m2dir: JMAP doesn't need it because the existing
+//! mailboxIds carry the source reference automatically.
 
+use alloc::{string::String, vec, vec::Vec};
 use core::mem;
 
-use alloc::{
-    string::{String, ToString},
-    vec::Vec,
-};
-
 use io_jmap::{
+    coroutine::{JmapCoroutine, JmapCoroutineState, JmapYield},
     rfc8620::session::JmapSession,
     rfc8621::{
-        email_set::{JmapEmailSet, JmapEmailSetArgs, JmapEmailSetError, JmapEmailSetResult},
-        mailbox::Mailbox,
-        mailbox_query::{JmapMailboxQuery, JmapMailboxQueryError, JmapMailboxQueryResult},
+        email_set::{JmapEmailSet as InnerSet, JmapEmailSetArgs, JmapEmailSetError as SetErr},
+        mailbox::{MailboxFilter, MailboxProperty},
+        mailbox_query::{JmapMailboxQuery as InnerQuery, JmapMailboxQueryError as QueryErr},
     },
 };
 use log::trace;
 use secrecy::SecretString;
 use thiserror::Error;
 
-/// Errors produced while orchestrating Mailbox lookup + Email/set for
-/// JMAP message copy.
+use crate::{
+    coroutine::{EmailBackend, EmailCoroutine, EmailCoroutineArg, EmailCoroutineState, JmapStep},
+    jmap::convert::find_mailbox_id,
+};
+
+/// Errors produced by [`JmapMessageCopy`].
 #[derive(Debug, Error)]
 pub enum JmapMessageCopyError {
     #[error(transparent)]
-    MailboxQuery(#[from] JmapMailboxQueryError),
+    Query(#[from] QueryErr),
     #[error(transparent)]
-    EmailSet(#[from] JmapEmailSetError),
-    #[error("no JMAP mailbox matched the name {0:?}")]
-    UnknownMailbox(String),
-    #[error("JMAP message copy was resumed after completion")]
-    AlreadyDone,
+    Set(#[from] SetErr),
+    #[error("no JMAP mailbox named `{0}` found")]
+    NotFound(String),
+    #[error("Email/set returned per-id failures: {0:?}")]
+    NotUpdated(Vec<String>),
+    #[error("coroutine was resumed with the wrong EmailCoroutineArg variant")]
+    InvalidArg,
+    #[error("coroutine was resumed after completion")]
+    ResumedAfterDone,
 }
 
-/// Result returned by [`JmapMessageCopy::resume`].
-#[derive(Debug)]
-pub enum JmapMessageCopyResult {
-    Ok,
-    WantsRead,
-    WantsWrite(Vec<u8>),
-    Err(JmapMessageCopyError),
-}
-
-enum State {
-    Resolving {
-        query: JmapMailboxQuery,
-        session: JmapSession,
-        http_auth: SecretString,
-        ids: Vec<String>,
-        to_name: String,
-    },
-    Setting(JmapEmailSet),
-    Done,
-}
-
-/// I/O-free orchestrator: `Mailbox/query` to resolve the destination
-/// name to an id, then `Email/set` to add every email to that mailbox.
+/// I/O-free coroutine adding `to` to the mailboxIds of every id.
 pub struct JmapMessageCopy {
     state: State,
+    target_name: String,
+    ids: Vec<String>,
+    session: JmapSession,
+    http_auth: SecretString,
 }
 
 impl JmapMessageCopy {
     pub fn new(
         session: &JmapSession,
         http_auth: &SecretString,
-        ids: impl IntoIterator<Item = String>,
-        to_name: impl ToString,
+        _from: &str,
+        to: &str,
+        ids: &[&str],
     ) -> Result<Self, JmapMessageCopyError> {
         trace!("prepare JMAP message copy");
-        let query = JmapMailboxQuery::new(session, http_auth, None, None, None, None, None)?;
+        let query = InnerQuery::new(
+            session,
+            http_auth,
+            Some(MailboxFilter {
+                name: Some(to.into()),
+                ..MailboxFilter::default()
+            }),
+            None,
+            None,
+            None,
+            Some(vec![MailboxProperty::Id, MailboxProperty::Name]),
+        )?;
         Ok(Self {
-            state: State::Resolving {
-                query,
-                session: session.clone(),
-                http_auth: http_auth.clone(),
-                ids: ids.into_iter().collect(),
-                to_name: to_name.to_string(),
-            },
+            state: State::Resolving(query),
+            target_name: to.into(),
+            ids: ids.iter().map(|s| (*s).into()).collect(),
+            session: session.clone(),
+            http_auth: http_auth.clone(),
         })
     }
+}
 
-    pub fn resume(&mut self, mut arg: Option<&[u8]>) -> JmapMessageCopyResult {
-        loop {
-            match mem::replace(&mut self.state, State::Done) {
-                State::Resolving {
-                    mut query,
-                    session,
-                    http_auth,
-                    ids,
-                    to_name,
-                } => match query.resume(arg.take()) {
-                    JmapMailboxQueryResult::WantsRead => {
-                        self.state = State::Resolving {
-                            query,
-                            session,
-                            http_auth,
-                            ids,
-                            to_name,
-                        };
-                        return JmapMessageCopyResult::WantsRead;
-                    }
-                    JmapMailboxQueryResult::WantsWrite(bytes) => {
-                        self.state = State::Resolving {
-                            query,
-                            session,
-                            http_auth,
-                            ids,
-                            to_name,
-                        };
-                        return JmapMessageCopyResult::WantsWrite(bytes);
-                    }
-                    JmapMailboxQueryResult::Err(err) => {
-                        return JmapMessageCopyResult::Err(err.into());
-                    }
-                    JmapMailboxQueryResult::Ok { mailboxes, .. } => {
-                        let Some(to_id) = find_mailbox_id(&mailboxes, &to_name) else {
-                            return JmapMessageCopyResult::Err(
-                                JmapMessageCopyError::UnknownMailbox(to_name),
-                            );
-                        };
+impl EmailCoroutine for JmapMessageCopy {
+    type Yield = JmapStep;
+    type Return = Result<(), JmapMessageCopyError>;
 
-                        let mut args = JmapEmailSetArgs::default();
-                        for id in &ids {
-                            args.add_to_mailbox(id.clone(), to_id.clone());
-                        }
+    const BACKEND: EmailBackend = EmailBackend::Jmap;
 
-                        let set = match JmapEmailSet::new(&session, &http_auth, args) {
-                            Ok(s) => s,
-                            Err(err) => return JmapMessageCopyResult::Err(err.into()),
-                        };
-                        self.state = State::Setting(set);
+    fn resume(
+        &mut self,
+        arg: EmailCoroutineArg<'_>,
+    ) -> EmailCoroutineState<Self::Yield, Self::Return> {
+        #[allow(irrefutable_let_patterns)]
+        let EmailCoroutineArg::Jmap { bytes } = arg else {
+            return EmailCoroutineState::Complete(Err(JmapMessageCopyError::InvalidArg));
+        };
+
+        match mem::replace(&mut self.state, State::Done) {
+            State::Resolving(mut query) => match query.resume(bytes) {
+                JmapCoroutineState::Complete(Ok(ok)) => {
+                    let Some(target_id) = find_mailbox_id(&ok.mailboxes, &self.target_name) else {
+                        return EmailCoroutineState::Complete(Err(JmapMessageCopyError::NotFound(
+                            self.target_name.clone(),
+                        )));
+                    };
+                    let mut args = JmapEmailSetArgs::default();
+                    for id in &self.ids {
+                        args.add_to_mailbox(id.clone(), target_id.clone());
                     }
-                },
-                State::Setting(mut set) => match set.resume(arg.take()) {
-                    JmapEmailSetResult::WantsRead => {
-                        self.state = State::Setting(set);
-                        return JmapMessageCopyResult::WantsRead;
-                    }
-                    JmapEmailSetResult::WantsWrite(bytes) => {
-                        self.state = State::Setting(set);
-                        return JmapMessageCopyResult::WantsWrite(bytes);
-                    }
-                    JmapEmailSetResult::Err(err) => return JmapMessageCopyResult::Err(err.into()),
-                    JmapEmailSetResult::Ok { .. } => return JmapMessageCopyResult::Ok,
-                },
-                State::Done => {
-                    return JmapMessageCopyResult::Err(JmapMessageCopyError::AlreadyDone);
+                    let set = match InnerSet::new(&self.session, &self.http_auth, args) {
+                        Ok(set) => set,
+                        Err(err) => return EmailCoroutineState::Complete(Err(err.into())),
+                    };
+                    self.state = State::Patching(set);
+                    self.resume(EmailCoroutineArg::Jmap { bytes: None })
                 }
+                JmapCoroutineState::Yielded(JmapYield::WantsRead) => {
+                    self.state = State::Resolving(query);
+                    EmailCoroutineState::Yielded(JmapStep::WantsRead)
+                }
+                JmapCoroutineState::Yielded(JmapYield::WantsWrite(out)) => {
+                    self.state = State::Resolving(query);
+                    EmailCoroutineState::Yielded(JmapStep::WantsWrite(out))
+                }
+                JmapCoroutineState::Complete(Err(err)) => {
+                    EmailCoroutineState::Complete(Err(err.into()))
+                }
+            },
+            State::Patching(mut set) => match set.resume(bytes) {
+                JmapCoroutineState::Complete(Ok(ok)) => {
+                    if ok.not_updated.is_empty() {
+                        EmailCoroutineState::Complete(Ok(()))
+                    } else {
+                        EmailCoroutineState::Complete(Err(JmapMessageCopyError::NotUpdated(
+                            ok.not_updated.into_keys().collect(),
+                        )))
+                    }
+                }
+                JmapCoroutineState::Yielded(JmapYield::WantsRead) => {
+                    self.state = State::Patching(set);
+                    EmailCoroutineState::Yielded(JmapStep::WantsRead)
+                }
+                JmapCoroutineState::Yielded(JmapYield::WantsWrite(out)) => {
+                    self.state = State::Patching(set);
+                    EmailCoroutineState::Yielded(JmapStep::WantsWrite(out))
+                }
+                JmapCoroutineState::Complete(Err(err)) => {
+                    EmailCoroutineState::Complete(Err(err.into()))
+                }
+            },
+            State::Done => {
+                EmailCoroutineState::Complete(Err(JmapMessageCopyError::ResumedAfterDone))
             }
         }
     }
 }
 
-pub(crate) fn find_mailbox_id(mailboxes: &[Mailbox], name: &str) -> Option<String> {
-    mailboxes
-        .iter()
-        .find(|m| m.name.as_deref() == Some(name))
-        .and_then(|m| m.id.clone())
+enum State {
+    Resolving(InnerQuery),
+    Patching(InnerSet),
+    Done,
 }

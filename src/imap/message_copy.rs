@@ -1,136 +1,163 @@
-//! IMAP message copy (`SELECT <src>` + `UID COPY <ids> <dst>`), wrapping
-//! a private orchestrator.
+//! IMAP message-copy coroutine.
+//!
+//! Optional `SELECT <from>` (gated on `auto_select`) followed by
+//! `UID COPY <ids> <to>` (RFC 3501 §6.4.7).
 
+use alloc::string::String;
 use core::mem;
 
-use alloc::vec::Vec;
-
 use io_imap::{
-    context::ImapContext,
+    coroutine::{ImapCoroutine, ImapCoroutineState, ImapYield},
     rfc3501::{
         copy::{
             ImapMessageCopy as InnerImapMessageCopy,
             ImapMessageCopyError as InnerImapMessageCopyError,
-            ImapMessageCopyResult as InnerImapMessageCopyResult,
         },
-        select::{ImapMailboxSelect, ImapMailboxSelectError, ImapMailboxSelectResult},
+        select::{ImapMailboxSelect, ImapMailboxSelectError},
     },
-    types::{mailbox::Mailbox as ImapMailbox, sequence::SequenceSet},
 };
 use log::trace;
 use thiserror::Error;
 
-/// Errors produced while orchestrating SELECT + UID COPY for IMAP
-/// message copy.
+use crate::{
+    coroutine::{EmailBackend, EmailCoroutine, EmailCoroutineArg, EmailCoroutineState, ImapStep},
+    imap::convert::{InvalidMailboxName, InvalidUidSet, parse_mailbox, parse_uids},
+};
+
+/// Errors produced by [`ImapMessageCopy`].
 #[derive(Debug, Error)]
 pub enum ImapMessageCopyError {
     #[error(transparent)]
     Select(#[from] ImapMailboxSelectError),
     #[error(transparent)]
     Copy(#[from] InnerImapMessageCopyError),
-    #[error("IMAP message copy was resumed after completion")]
-    AlreadyDone,
+    #[error("invalid IMAP mailbox `{0}`")]
+    InvalidMailbox(String),
+    #[error("invalid message UID `{0}`")]
+    InvalidUid(String),
+    #[error("empty UID set")]
+    EmptyUidSet,
+    #[error("coroutine was resumed with the wrong EmailCoroutineArg variant")]
+    InvalidArg,
+    #[error("coroutine was resumed after completion")]
+    ResumedAfterDone,
 }
 
-/// Result returned by [`ImapMessageCopy::resume`].
-#[derive(Debug)]
-pub enum ImapMessageCopyResult {
-    Ok,
-    WantsRead,
-    WantsWrite(Vec<u8>),
-    Err(ImapMessageCopyError),
+impl From<InvalidMailboxName> for ImapMessageCopyError {
+    fn from(err: InvalidMailboxName) -> Self {
+        Self::InvalidMailbox(err.0)
+    }
 }
 
-enum State {
-    Selecting {
-        select: ImapMailboxSelect,
-        sequence_set: SequenceSet,
-        target: ImapMailbox<'static>,
-        uid: bool,
-    },
-    Copying(InnerImapMessageCopy),
-    Done,
+impl From<InvalidUidSet> for ImapMessageCopyError {
+    fn from(err: InvalidUidSet) -> Self {
+        match err {
+            InvalidUidSet::Empty => Self::EmptyUidSet,
+            InvalidUidSet::Invalid(s) => Self::InvalidUid(s),
+        }
+    }
 }
 
-/// I/O-free coroutine wrapping `SELECT <from>` followed by `UID COPY
-/// <ids> <to>`. UIDs by default; pass `uid = false` to interpret the
-/// sequence-set as message sequence numbers.
+/// I/O-free coroutine copying a UID set across mailboxes.
 pub struct ImapMessageCopy {
     state: State,
 }
 
 impl ImapMessageCopy {
     pub fn new(
-        context: ImapContext,
-        from: ImapMailbox<'static>,
-        to: ImapMailbox<'static>,
-        sequence_set: SequenceSet,
-        uid: bool,
-    ) -> Self {
-        trace!("prepare IMAP message copy");
-        Self {
-            state: State::Selecting {
-                select: ImapMailboxSelect::new(context, from),
-                sequence_set,
-                target: to,
-                uid,
-            },
-        }
+        from: &str,
+        to: &str,
+        ids: &[&str],
+        auto_select: bool,
+    ) -> Result<Self, ImapMessageCopyError> {
+        trace!("prepare IMAP message copy (auto_select={auto_select})");
+        let src = parse_mailbox(from)?;
+        let dst = parse_mailbox(to)?;
+        let sequence_set = parse_uids(ids)?;
+        let copy = InnerImapMessageCopy::new(sequence_set, dst, true);
+        let state = if auto_select {
+            State::Selecting {
+                select: ImapMailboxSelect::new(src),
+                copy,
+            }
+        } else {
+            State::Copying(copy)
+        };
+        Ok(Self { state })
     }
+}
 
-    pub fn resume(&mut self, mut arg: Option<&[u8]>) -> ImapMessageCopyResult {
+impl EmailCoroutine for ImapMessageCopy {
+    type Yield = ImapStep;
+    type Return = Result<(), ImapMessageCopyError>;
+
+    const BACKEND: EmailBackend = EmailBackend::Imap;
+
+    fn resume(
+        &mut self,
+        arg: EmailCoroutineArg<'_>,
+    ) -> EmailCoroutineState<Self::Yield, Self::Return> {
+        #[allow(irrefutable_let_patterns)]
+        let EmailCoroutineArg::Imap {
+            fragmentizer,
+            mut bytes,
+        } = arg
+        else {
+            return EmailCoroutineState::Complete(Err(ImapMessageCopyError::InvalidArg));
+        };
+
         loop {
             match mem::replace(&mut self.state, State::Done) {
-                State::Selecting {
-                    mut select,
-                    sequence_set,
-                    target,
-                    uid,
-                } => match select.resume(arg.take()) {
-                    ImapMailboxSelectResult::WantsRead => {
-                        self.state = State::Selecting {
-                            select,
-                            sequence_set,
-                            target,
-                            uid,
-                        };
-                        return ImapMessageCopyResult::WantsRead;
+                State::Selecting { mut select, copy } => {
+                    match select.resume(fragmentizer, bytes.take()) {
+                        ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
+                            self.state = State::Selecting { select, copy };
+                            return EmailCoroutineState::Yielded(ImapStep::WantsRead);
+                        }
+                        ImapCoroutineState::Yielded(ImapYield::WantsWrite(out)) => {
+                            self.state = State::Selecting { select, copy };
+                            return EmailCoroutineState::Yielded(ImapStep::WantsWrite(out));
+                        }
+                        ImapCoroutineState::Complete(Ok(_)) => {
+                            self.state = State::Copying(copy);
+                        }
+                        ImapCoroutineState::Complete(Err(err)) => {
+                            return EmailCoroutineState::Complete(Err(err.into()));
+                        }
                     }
-                    ImapMailboxSelectResult::WantsWrite(bytes) => {
-                        self.state = State::Selecting {
-                            select,
-                            sequence_set,
-                            target,
-                            uid,
-                        };
-                        return ImapMessageCopyResult::WantsWrite(bytes);
-                    }
-                    ImapMailboxSelectResult::Err { err, .. } => {
-                        return ImapMessageCopyResult::Err(err.into());
-                    }
-                    ImapMailboxSelectResult::Ok { context, .. } => {
-                        let copy = InnerImapMessageCopy::new(context, sequence_set, target, uid);
+                }
+                State::Copying(mut copy) => match copy.resume(fragmentizer, bytes.take()) {
+                    ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                         self.state = State::Copying(copy);
+                        return EmailCoroutineState::Yielded(ImapStep::WantsRead);
                     }
-                },
-                State::Copying(mut copy) => match copy.resume(arg.take()) {
-                    InnerImapMessageCopyResult::WantsRead => {
+                    ImapCoroutineState::Yielded(ImapYield::WantsWrite(out)) => {
                         self.state = State::Copying(copy);
-                        return ImapMessageCopyResult::WantsRead;
+                        return EmailCoroutineState::Yielded(ImapStep::WantsWrite(out));
                     }
-                    InnerImapMessageCopyResult::WantsWrite(bytes) => {
-                        self.state = State::Copying(copy);
-                        return ImapMessageCopyResult::WantsWrite(bytes);
+                    ImapCoroutineState::Complete(Ok(_copyuid)) => {
+                        return EmailCoroutineState::Complete(Ok(()));
                     }
-                    InnerImapMessageCopyResult::Err { err, .. } => {
-                        return ImapMessageCopyResult::Err(err.into());
+                    ImapCoroutineState::Complete(Err(err)) => {
+                        return EmailCoroutineState::Complete(Err(err.into()));
                     }
-                    InnerImapMessageCopyResult::Ok { .. } => return ImapMessageCopyResult::Ok,
                 },
                 State::Done => {
-                    return ImapMessageCopyResult::Err(ImapMessageCopyError::AlreadyDone);
+                    return EmailCoroutineState::Complete(Err(
+                        ImapMessageCopyError::ResumedAfterDone,
+                    ));
                 }
             }
         }
     }
+}
+
+#[allow(clippy::large_enum_variant)] // see flag_store.rs for rationale
+enum State {
+    Selecting {
+        select: ImapMailboxSelect,
+        copy: InnerImapMessageCopy,
+    },
+    Copying(InnerImapMessageCopy),
+    Done,
 }

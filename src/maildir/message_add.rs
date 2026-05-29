@@ -1,80 +1,124 @@
-//! Maildir message add, wrapping
-//! [`io_maildir::coroutines::message_store::MaildirMessageStore`].
+//! Maildir message-add coroutine.
+//!
+//! Wraps [`io_maildir::coroutines::message_store::MaildirMessageStore`]:
+//! writes the raw bytes to `tmp/`, then renames into `cur/` with the
+//! info-section letters derived from `flags`. The yielded id is the
+//! Maildir filename minus the `:2,FLAGS` suffix.
+//!
+//! `MaildirMessageStore` itself probes time / pid / hostname to mint
+//! the message identifier (RFC's `time.usec.hostname` convention), so
+//! this coroutine relays those `Wants*` variants through.
 
-use alloc::{collections::BTreeMap, string::String, vec::Vec};
+use alloc::{string::String, vec::Vec};
+use std::path::PathBuf;
 
 use io_maildir::{
+    coroutine::{MaildirCoroutine, MaildirCoroutineState, MaildirReply, MaildirYield},
     coroutines::message_store::{
-        MaildirMessageStore as InnerMaildirMessageStore, MaildirMessageStoreArg as InnerArg,
-        MaildirMessageStoreError, MaildirMessageStoreResult as InnerResult,
+        MaildirMessageStore as InnerStore, MaildirMessageStoreError as InnerErr,
     },
-    flag::MaildirFlags,
     maildir::{Maildir, MaildirSubdir},
-    path::MaildirPath,
 };
 use log::trace;
+use thiserror::Error;
 
-/// Argument fed back to [`MaildirMessageAdd::resume`].
-#[derive(Debug)]
-pub enum MaildirMessageAddArg {
-    Time { secs: u64, nanos: u32 },
-    Pid(u32),
-    Hostname(String),
-    FileCreate,
-    Rename,
+use crate::{
+    coroutine::{
+        EmailBackend, EmailCoroutine, EmailCoroutineArg, EmailCoroutineState, FsBatch, FsStep,
+    },
+    flag::Flag,
+    maildir::convert::{
+        InvalidMailboxName, files_out, flags_to_maildir, pairs_out, resolve_mailbox,
+    },
+};
+
+/// Errors produced by [`MaildirMessageAdd`].
+#[derive(Debug, Error)]
+pub enum MaildirMessageAddError {
+    #[error(transparent)]
+    Store(#[from] InnerErr),
+    #[error(transparent)]
+    InvalidMailbox(#[from] InvalidMailboxName),
+    #[error("coroutine was resumed with the wrong EmailCoroutineArg variant")]
+    InvalidArg,
+    #[error("coroutine was resumed with an FsBatch variant it did not request")]
+    UnexpectedBatch,
 }
 
-/// Result returned by [`MaildirMessageAdd::resume`].
-#[derive(Debug)]
-pub enum MaildirMessageAddResult {
-    Ok { id: String, path: MaildirPath },
-    WantsTime,
-    WantsPid,
-    WantsHostname,
-    WantsFileCreate(BTreeMap<MaildirPath, Vec<u8>>),
-    WantsRename(Vec<(MaildirPath, MaildirPath)>),
-    Err(MaildirMessageStoreError),
-}
-
-/// I/O-free coroutine writing a raw RFC 5322 message into a Maildir.
-/// Follows the standard maildir delivery protocol (write to `tmp`,
-/// then rename).
+/// I/O-free coroutine appending a raw message to a Maildir under `cur/`.
 pub struct MaildirMessageAdd {
-    inner: InnerMaildirMessageStore,
+    inner: InnerStore,
 }
 
 impl MaildirMessageAdd {
-    /// Pass `subdir = None` to default to [`MaildirSubdir::Cur`].
     pub fn new(
-        maildir: Maildir,
-        subdir: Option<MaildirSubdir>,
-        flags: MaildirFlags,
-        contents: Vec<u8>,
-    ) -> Self {
+        root: impl Into<PathBuf>,
+        maildir_plus: bool,
+        mailbox: &str,
+        flags: &[Flag],
+        bytes: Vec<u8>,
+    ) -> Result<Self, MaildirMessageAddError> {
         trace!("prepare Maildir message add");
-        let subdir = subdir.unwrap_or(MaildirSubdir::Cur);
-        Self {
-            inner: InnerMaildirMessageStore::new(maildir, subdir, flags, contents),
-        }
+        let path = resolve_mailbox(&root.into(), maildir_plus, mailbox)?;
+        let maildir = Maildir::from_path(path);
+        let md_flags = flags_to_maildir(flags);
+        Ok(Self {
+            inner: InnerStore::new(maildir, MaildirSubdir::Cur, md_flags, bytes),
+        })
     }
+}
 
-    pub fn resume(&mut self, arg: Option<MaildirMessageAddArg>) -> MaildirMessageAddResult {
-        let inner_arg = arg.map(|arg| match arg {
-            MaildirMessageAddArg::Time { secs, nanos } => InnerArg::Time { secs, nanos },
-            MaildirMessageAddArg::Pid(pid) => InnerArg::Pid(pid),
-            MaildirMessageAddArg::Hostname(h) => InnerArg::Hostname(h),
-            MaildirMessageAddArg::FileCreate => InnerArg::FileCreate,
-            MaildirMessageAddArg::Rename => InnerArg::Rename,
-        });
+impl EmailCoroutine for MaildirMessageAdd {
+    type Yield = FsStep;
+    type Return = Result<String, MaildirMessageAddError>;
+
+    const BACKEND: EmailBackend = EmailBackend::Maildir;
+
+    fn resume(
+        &mut self,
+        arg: EmailCoroutineArg<'_>,
+    ) -> EmailCoroutineState<Self::Yield, Self::Return> {
+        #[allow(irrefutable_let_patterns)]
+        let EmailCoroutineArg::Fs { batch } = arg else {
+            return EmailCoroutineState::Complete(Err(MaildirMessageAddError::InvalidArg));
+        };
+
+        let inner_arg = match batch {
+            None => None,
+            Some(FsBatch::Time { secs, nanos }) => Some(MaildirReply::Time { secs, nanos }),
+            Some(FsBatch::Pid(p)) => Some(MaildirReply::Pid(p)),
+            Some(FsBatch::Hostname(h)) => Some(MaildirReply::Hostname(h)),
+            Some(FsBatch::FileCreate) => Some(MaildirReply::FileCreate),
+            Some(FsBatch::Rename) => Some(MaildirReply::Rename),
+            Some(_) => {
+                return EmailCoroutineState::Complete(Err(MaildirMessageAddError::UnexpectedBatch));
+            }
+        };
 
         match self.inner.resume(inner_arg) {
-            InnerResult::Ok { id, path } => MaildirMessageAddResult::Ok { id, path },
-            InnerResult::WantsTime => MaildirMessageAddResult::WantsTime,
-            InnerResult::WantsPid => MaildirMessageAddResult::WantsPid,
-            InnerResult::WantsHostname => MaildirMessageAddResult::WantsHostname,
-            InnerResult::WantsFileCreate(files) => MaildirMessageAddResult::WantsFileCreate(files),
-            InnerResult::WantsRename(pairs) => MaildirMessageAddResult::WantsRename(pairs),
-            InnerResult::Err(err) => MaildirMessageAddResult::Err(err),
+            MaildirCoroutineState::Complete(Ok(ok)) => EmailCoroutineState::Complete(Ok(ok.id)),
+            MaildirCoroutineState::Yielded(MaildirYield::WantsTime) => {
+                EmailCoroutineState::Yielded(FsStep::WantsTime)
+            }
+            MaildirCoroutineState::Yielded(MaildirYield::WantsPid) => {
+                EmailCoroutineState::Yielded(FsStep::WantsPid)
+            }
+            MaildirCoroutineState::Yielded(MaildirYield::WantsHostname) => {
+                EmailCoroutineState::Yielded(FsStep::WantsHostname)
+            }
+            MaildirCoroutineState::Yielded(MaildirYield::WantsFileCreate(files)) => {
+                EmailCoroutineState::Yielded(FsStep::WantsFileCreate(files_out(files)))
+            }
+            MaildirCoroutineState::Yielded(MaildirYield::WantsRename(pairs)) => {
+                EmailCoroutineState::Yielded(FsStep::WantsRename(pairs_out(pairs)))
+            }
+            MaildirCoroutineState::Complete(Err(err)) => {
+                EmailCoroutineState::Complete(Err(err.into()))
+            }
+            other => {
+                let _ = other;
+                unreachable!("MaildirMessageStore never yields this state");
+            }
         }
     }
 }

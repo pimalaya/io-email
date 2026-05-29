@@ -1,142 +1,180 @@
-//! IMAP message get (`SELECT` + `FETCH BODY.PEEK[]`), wrapping a private
-//! orchestrator. Returns raw RFC 5322 bytes.
+//! IMAP message-get coroutine.
+//!
+//! Optional `SELECT <mailbox>` (gated on `auto_select`) followed by
+//! `UID FETCH <id> (BODY.PEEK[])`. Returns the raw RFC 5322 bytes
+//! without flipping the \Seen flag.
 
-use core::{mem, num::NonZeroU32};
-
-use alloc::vec::Vec;
+use alloc::{string::String, vec, vec::Vec};
+use core::mem;
 
 use io_imap::{
-    context::ImapContext,
+    coroutine::{ImapCoroutine, ImapCoroutineState, ImapYield},
     rfc3501::{
-        fetch::{ImapMessageFetchError, ImapMessageFetchFirst, ImapMessageFetchFirstResult},
-        select::{ImapMailboxSelect, ImapMailboxSelectError, ImapMailboxSelectResult},
+        fetch::{ImapMessageFetch, ImapMessageFetchError},
+        select::{ImapMailboxSelect, ImapMailboxSelectError},
     },
-    types::{
-        fetch::{MacroOrMessageDataItemNames, MessageDataItem, MessageDataItemName},
-        mailbox::Mailbox as ImapMailbox,
-    },
+    types::fetch::{MacroOrMessageDataItemNames, MessageDataItem, MessageDataItemName},
 };
 use log::trace;
 use thiserror::Error;
 
-/// Errors produced while orchestrating SELECT + FETCH for IMAP message
-/// retrieval.
+use crate::{
+    coroutine::{EmailBackend, EmailCoroutine, EmailCoroutineArg, EmailCoroutineState, ImapStep},
+    imap::convert::{InvalidMailboxName, InvalidUidSet, parse_mailbox, parse_uids},
+};
+
+/// Errors produced by [`ImapMessageGet`].
 #[derive(Debug, Error)]
 pub enum ImapMessageGetError {
     #[error(transparent)]
     Select(#[from] ImapMailboxSelectError),
     #[error(transparent)]
     Fetch(#[from] ImapMessageFetchError),
-    #[error("FETCH did not return any body for the requested message")]
-    Empty,
-    #[error("IMAP message get was resumed after completion")]
-    AlreadyDone,
+    #[error("invalid IMAP mailbox `{0}`")]
+    InvalidMailbox(String),
+    #[error("invalid message UID `{0}`")]
+    InvalidUid(String),
+    #[error("empty UID set")]
+    EmptyUidSet,
+    #[error("FETCH returned no body for the requested message")]
+    EmptyBody,
+    #[error("coroutine was resumed with the wrong EmailCoroutineArg variant")]
+    InvalidArg,
+    #[error("coroutine was resumed after completion")]
+    ResumedAfterDone,
 }
 
-/// Result returned by [`ImapMessageGet::resume`].
-#[derive(Debug)]
-pub enum ImapMessageGetResult {
-    Ok(Vec<u8>),
-    WantsRead,
-    WantsWrite(Vec<u8>),
-    Err(ImapMessageGetError),
+impl From<InvalidMailboxName> for ImapMessageGetError {
+    fn from(err: InvalidMailboxName) -> Self {
+        Self::InvalidMailbox(err.0)
+    }
 }
 
-enum State {
-    Selecting {
-        select: ImapMailboxSelect,
-        id: NonZeroU32,
-        uid: bool,
-    },
-    Fetching(ImapMessageFetchFirst),
-    Done,
+impl From<InvalidUidSet> for ImapMessageGetError {
+    fn from(err: InvalidUidSet) -> Self {
+        match err {
+            InvalidUidSet::Empty => Self::EmptyUidSet,
+            InvalidUidSet::Invalid(s) => Self::InvalidUid(s),
+        }
+    }
 }
 
-/// I/O-free coroutine wrapping `SELECT <mailbox>` followed by `FETCH
-/// <id> BODY.PEEK[]`.
+/// I/O-free coroutine fetching one message's raw RFC 5322 bytes.
 pub struct ImapMessageGet {
     state: State,
 }
 
 impl ImapMessageGet {
-    pub fn new(
-        context: ImapContext,
-        mailbox: ImapMailbox<'static>,
-        id: NonZeroU32,
-        uid: bool,
-    ) -> Self {
-        trace!("prepare IMAP message get");
-        Self {
-            state: State::Selecting {
-                select: ImapMailboxSelect::new(context, mailbox),
-                id,
-                uid,
-            },
-        }
+    pub fn new(mailbox: &str, id: &str, auto_select: bool) -> Result<Self, ImapMessageGetError> {
+        trace!("prepare IMAP message get (auto_select={auto_select})");
+        let mbox = parse_mailbox(mailbox)?;
+        let sequence_set = parse_uids(&[id])?;
+        let item_names =
+            MacroOrMessageDataItemNames::MessageDataItemNames(vec![MessageDataItemName::BodyExt {
+                section: None,
+                partial: None,
+                peek: true,
+            }]);
+        let fetch = ImapMessageFetch::new(sequence_set, item_names, true);
+        let state = if auto_select {
+            State::Selecting {
+                select: ImapMailboxSelect::new(mbox),
+                fetch,
+            }
+        } else {
+            State::Fetching(fetch)
+        };
+        Ok(Self { state })
     }
+}
 
-    pub fn resume(&mut self, mut arg: Option<&[u8]>) -> ImapMessageGetResult {
+impl EmailCoroutine for ImapMessageGet {
+    type Yield = ImapStep;
+    type Return = Result<Vec<u8>, ImapMessageGetError>;
+
+    const BACKEND: EmailBackend = EmailBackend::Imap;
+
+    fn resume(
+        &mut self,
+        arg: EmailCoroutineArg<'_>,
+    ) -> EmailCoroutineState<Self::Yield, Self::Return> {
+        #[allow(irrefutable_let_patterns)]
+        let EmailCoroutineArg::Imap {
+            fragmentizer,
+            mut bytes,
+        } = arg
+        else {
+            return EmailCoroutineState::Complete(Err(ImapMessageGetError::InvalidArg));
+        };
+
         loop {
             match mem::replace(&mut self.state, State::Done) {
-                State::Selecting {
-                    mut select,
-                    id,
-                    uid,
-                } => match select.resume(arg.take()) {
-                    ImapMailboxSelectResult::WantsRead => {
-                        self.state = State::Selecting { select, id, uid };
-                        return ImapMessageGetResult::WantsRead;
+                State::Selecting { mut select, fetch } => {
+                    match select.resume(fragmentizer, bytes.take()) {
+                        ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
+                            self.state = State::Selecting { select, fetch };
+                            return EmailCoroutineState::Yielded(ImapStep::WantsRead);
+                        }
+                        ImapCoroutineState::Yielded(ImapYield::WantsWrite(out)) => {
+                            self.state = State::Selecting { select, fetch };
+                            return EmailCoroutineState::Yielded(ImapStep::WantsWrite(out));
+                        }
+                        ImapCoroutineState::Complete(Ok(_)) => {
+                            self.state = State::Fetching(fetch);
+                        }
+                        ImapCoroutineState::Complete(Err(err)) => {
+                            return EmailCoroutineState::Complete(Err(err.into()));
+                        }
                     }
-                    ImapMailboxSelectResult::WantsWrite(bytes) => {
-                        self.state = State::Selecting { select, id, uid };
-                        return ImapMessageGetResult::WantsWrite(bytes);
-                    }
-                    ImapMailboxSelectResult::Err { err, .. } => {
-                        return ImapMessageGetResult::Err(err.into());
-                    }
-                    ImapMailboxSelectResult::Ok { context, .. } => {
-                        let item_names = MacroOrMessageDataItemNames::MessageDataItemNames(vec![
-                            MessageDataItemName::BodyExt {
-                                section: None,
-                                partial: None,
-                                peek: true,
-                            },
-                        ]);
-                        let fetch = ImapMessageFetchFirst::new(context, id, item_names, uid);
+                }
+                State::Fetching(mut fetch) => match fetch.resume(fragmentizer, bytes.take()) {
+                    ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                         self.state = State::Fetching(fetch);
+                        return EmailCoroutineState::Yielded(ImapStep::WantsRead);
                     }
-                },
-                State::Fetching(mut fetch) => match fetch.resume(arg.take()) {
-                    ImapMessageFetchFirstResult::WantsRead => {
+                    ImapCoroutineState::Yielded(ImapYield::WantsWrite(out)) => {
                         self.state = State::Fetching(fetch);
-                        return ImapMessageGetResult::WantsRead;
+                        return EmailCoroutineState::Yielded(ImapStep::WantsWrite(out));
                     }
-                    ImapMessageFetchFirstResult::WantsWrite(bytes) => {
-                        self.state = State::Fetching(fetch);
-                        return ImapMessageGetResult::WantsWrite(bytes);
-                    }
-                    ImapMessageFetchFirstResult::Err { err, .. } => {
-                        return ImapMessageGetResult::Err(err.into());
-                    }
-                    ImapMessageFetchFirstResult::Ok { items, .. } => {
-                        let raw = items.into_inner().into_iter().find_map(|item| match item {
-                            MessageDataItem::BodyExt { data, .. } => {
-                                data.0.map(|d| d.as_ref().to_vec())
+                    ImapCoroutineState::Complete(Ok(data)) => {
+                        let raw = data
+                            .into_values()
+                            .flat_map(|items| items.into_inner().into_iter())
+                            .find_map(|item| match item {
+                                MessageDataItem::BodyExt { data, .. } => {
+                                    data.0.map(|d| d.as_ref().to_vec())
+                                }
+                                _ => None,
+                            });
+                        match raw {
+                            Some(raw) => return EmailCoroutineState::Complete(Ok(raw)),
+                            None => {
+                                return EmailCoroutineState::Complete(Err(
+                                    ImapMessageGetError::EmptyBody,
+                                ));
                             }
-                            _ => None,
-                        });
-
-                        let Some(raw) = raw else {
-                            return ImapMessageGetResult::Err(ImapMessageGetError::Empty);
-                        };
-
-                        return ImapMessageGetResult::Ok(raw);
+                        }
+                    }
+                    ImapCoroutineState::Complete(Err(err)) => {
+                        return EmailCoroutineState::Complete(Err(err.into()));
                     }
                 },
                 State::Done => {
-                    return ImapMessageGetResult::Err(ImapMessageGetError::AlreadyDone);
+                    return EmailCoroutineState::Complete(Err(
+                        ImapMessageGetError::ResumedAfterDone,
+                    ));
                 }
             }
         }
     }
+}
+
+#[allow(clippy::large_enum_variant)] // see flag_store.rs for rationale
+enum State {
+    Selecting {
+        select: ImapMailboxSelect,
+        fetch: ImapMessageFetch,
+    },
+    Fetching(ImapMessageFetch),
+    Done,
 }
