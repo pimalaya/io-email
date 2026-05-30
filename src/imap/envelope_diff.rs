@@ -9,6 +9,7 @@
 use core::num::NonZeroU32;
 
 use alloc::{
+    format,
     string::{String, ToString},
     vec,
     vec::Vec,

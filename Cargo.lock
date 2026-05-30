@@ -675,7 +675,7 @@ dependencies = [
 [[package]]
 name = "io-http"
 version = "0.0.3"
-source = "git+https://github.com/pimalaya/io-http#fa48ce0a72c44144567f4a08d51b2b454de7be9a"
+source = "git+https://github.com/pimalaya/io-http#73b264b85209d86de48afed25957ab582b54c272"
 dependencies = [
  "base64",
  "httparse",
@@ -689,7 +689,7 @@ dependencies = [
 [[package]]
 name = "io-imap"
 version = "0.0.1"
-source = "git+https://github.com/pimalaya/io-imap#7383116d9fdad68d0f32fc893453d21ca90fcb4c"
+source = "git+https://github.com/pimalaya/io-imap#523ce8fd9e09fba5d91c066805e61cd798fab9e2"
 dependencies = [
  "anyhow",
  "base64",
@@ -704,7 +704,7 @@ dependencies = [
 [[package]]
 name = "io-jmap"
 version = "0.0.1"
-source = "git+https://github.com/pimalaya/io-jmap#41ea748567d0412a1226425bcd09afdfa2b59e37"
+source = "git+https://github.com/pimalaya/io-jmap#f34bdbc1ab89613f14679a32ab57f0d46ce31926"
 dependencies = [
  "anyhow",
  "io-http",
@@ -740,7 +740,7 @@ dependencies = [
 [[package]]
 name = "io-smtp"
 version = "0.0.1"
-source = "git+https://github.com/pimalaya/io-smtp#24dea0ecd7f90bcbd90e027095de0c6a8fc670f9"
+source = "git+https://github.com/pimalaya/io-smtp#3b8cf0d806c23339a46a540e159de3d4cd9898f3"
 dependencies = [
  "anyhow",
  "base64",
@@ -1089,7 +1089,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 [[package]]
 name = "pimalaya-stream"
 version = "0.0.1"
-source = "git+https://github.com/pimalaya/stream#55bbb1cbf929effdc131573724017b86450a6ddd"
+source = "git+https://github.com/pimalaya/stream#6449136364c9ef81248e3b4ab6491dd154293481"
 dependencies = [
  "anyhow",
  "log",

@@ -32,9 +32,14 @@ use std::sync::mpsc::Sender;
 
 use thiserror::Error;
 
-use crate::{envelope::Envelope, event::WatchEvent, flag::{Flag, FlagOp}, mailbox::Mailbox};
 #[cfg(feature = "search")]
 use crate::search::query::SearchEmailsQuery;
+use crate::{
+    envelope::{Envelope, EnvelopeDiff},
+    event::WatchEvent,
+    flag::{Flag, FlagOp},
+    mailbox::{Mailbox, MailboxDiff},
+};
 
 #[cfg(feature = "imap")]
 use crate::imap::client::{ImapClientError, ImapClientStd};
@@ -47,15 +52,6 @@ use crate::maildir::client::{MaildirClient, MaildirClientError};
 #[cfg(feature = "smtp")]
 use crate::smtp::client::{SmtpClientError, SmtpClientStd};
 
-#[cfg(all(
-    feature = "jmap",
-    any(
-        feature = "rustls-ring",
-        feature = "rustls-aws",
-        feature = "native-tls"
-    )
-))]
-use secrecy::SecretString;
 #[cfg(all(
     feature = "smtp",
     any(
@@ -73,7 +69,25 @@ use io_smtp::rfc5321::types::ehlo_domain::EhloDomain;
         feature = "native-tls"
     )
 ))]
-use {pimalaya_stream::sasl::Sasl as ImapSasl, pimalaya_stream::tls::Tls, url::Url};
+use pimalaya_stream::sasl::Sasl as ImapSasl;
+#[cfg(all(
+    feature = "jmap",
+    any(
+        feature = "rustls-ring",
+        feature = "rustls-aws",
+        feature = "native-tls"
+    )
+))]
+use secrecy::SecretString;
+#[cfg(all(
+    any(feature = "imap", feature = "jmap", feature = "smtp"),
+    any(
+        feature = "rustls-ring",
+        feature = "rustls-aws",
+        feature = "native-tls"
+    )
+))]
+use {pimalaya_stream::tls::Tls, url::Url};
 
 /// Errors surfaced by [`EmailClientStd`].
 ///
@@ -98,6 +112,8 @@ pub enum EmailClientStdError {
     M2dir(#[from] M2dirClientError),
     #[error("No backend supporting this operation is registered")]
     NoBackendRegistered,
+    #[error("Registered backend does not support this operation")]
+    UnsupportedOperation,
 }
 
 /// Std-blocking multi-protocol email client.
@@ -338,11 +354,7 @@ impl EmailClientStd {
     }
 
     /// Fetches one message's raw RFC 5322 bytes.
-    pub fn get_message(
-        &mut self,
-        mailbox: &str,
-        id: &str,
-    ) -> Result<Vec<u8>, EmailClientStdError> {
+    pub fn get_message(&mut self, mailbox: &str, id: &str) -> Result<Vec<u8>, EmailClientStdError> {
         #[cfg(feature = "maildir")]
         if let Some(c) = &self.maildir {
             return Ok(c.get_message(mailbox, id)?);
@@ -436,11 +448,7 @@ impl EmailClientStd {
     }
 
     /// Deletes one message permanently.
-    pub fn delete_message(
-        &mut self,
-        mailbox: &str,
-        id: &str,
-    ) -> Result<(), EmailClientStdError> {
+    pub fn delete_message(&mut self, mailbox: &str, id: &str) -> Result<(), EmailClientStdError> {
         #[cfg(feature = "maildir")]
         if let Some(c) = &self.maildir {
             return Ok(c.delete_message(mailbox, id)?);
@@ -513,6 +521,54 @@ impl EmailClientStd {
         }
         let _ = (from, to, ids);
         Err(EmailClientStdError::NoBackendRegistered)
+    }
+
+    /// Surfaces a pre-diffed envelope delta against the opaque
+    /// per-backend `state` checkpoint, when the registered backend
+    /// supports it.
+    ///
+    /// `state` is the blob returned by a previous successful call (or
+    /// `None` on first sync); the caller stores the returned checkpoint
+    /// for next time. Returns [`EnvelopeDiff::FullListRequired`] when
+    /// the backend cannot produce an incremental view (capability
+    /// missing, state invalidated, server bumped UIDVALIDITY).
+    ///
+    /// Currently routed to IMAP (QRESYNC / CONDSTORE) and JMAP
+    /// (`Email/changes`); Maildir, m2dir and SMTP fall through to
+    /// [`EmailClientStdError::UnsupportedOperation`].
+    pub fn diff_envelopes(
+        &mut self,
+        mailbox: &str,
+        state: Option<&[u8]>,
+    ) -> Result<EnvelopeDiff, EmailClientStdError> {
+        #[cfg(feature = "jmap")]
+        if let Some(c) = self.jmap.as_mut() {
+            return Ok(c.diff_envelopes(mailbox, state)?);
+        }
+        #[cfg(feature = "imap")]
+        if let Some(c) = self.imap.as_mut() {
+            return Ok(c.diff_envelopes(mailbox, state)?);
+        }
+        let _ = (mailbox, state);
+        Err(EmailClientStdError::UnsupportedOperation)
+    }
+
+    /// Probes whether the mailbox set has changed since `state`. JMAP
+    /// uses `Mailbox/changes` for a constant-cost "anything changed?"
+    /// answer; backends without an account-global mailbox state token
+    /// (IMAP, Maildir, m2dir) fall through to
+    /// [`EmailClientStdError::UnsupportedOperation`] so the caller can
+    /// drop to a normal [`Self::list_mailboxes`].
+    pub fn diff_mailboxes(
+        &mut self,
+        state: Option<&[u8]>,
+    ) -> Result<MailboxDiff, EmailClientStdError> {
+        #[cfg(feature = "jmap")]
+        if let Some(c) = self.jmap.as_mut() {
+            return Ok(c.diff_mailboxes(state)?);
+        }
+        let _ = state;
+        Err(EmailClientStdError::UnsupportedOperation)
     }
 
     /// Watches `mailbox` for envelope-level deltas, forwarding events

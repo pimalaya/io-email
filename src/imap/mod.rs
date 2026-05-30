@@ -1,6 +1,7 @@
 #[cfg(feature = "client")]
 pub mod client;
 pub mod convert;
+pub mod envelope_diff;
 pub mod envelope_list;
 #[cfg(feature = "search")]
 pub mod envelope_search;
@@ -14,6 +15,3 @@ pub mod message_delete;
 pub mod message_get;
 pub mod message_move;
 pub mod watch_mailbox;
-
-// NOTE: envelope_diff (QRESYNC) stays on disk but out of the build
-// until it is ported to the ImapCoroutine shape.

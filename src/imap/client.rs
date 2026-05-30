@@ -11,9 +11,14 @@
 //! protocol-specific paths (`select`, `idle`, `enable`, …) that the
 //! shared API does not cover.
 
-use core::sync::atomic::AtomicBool;
+use core::{num::NonZeroU32, sync::atomic::AtomicBool};
 
-use alloc::{string::String, sync::Arc, vec::Vec};
+use alloc::{
+    string::{String, ToString},
+    sync::Arc,
+    vec,
+    vec::Vec,
+};
 
 use std::{
     io::{self, ErrorKind, Read, Write},
@@ -23,7 +28,12 @@ use std::{
 use io_imap::{
     client::{ImapClientStd as InnerImapClientStd, ImapClientStdError as InnerImapClientStdError},
     coroutine::*,
-    types::response::Capability,
+    types::{
+        fetch::{MacroOrMessageDataItemNames, MessageDataItem, MessageDataItemName},
+        mailbox::Mailbox as ImapMailbox,
+        response::Capability,
+        sequence::SequenceSet,
+    },
 };
 #[cfg(any(
     feature = "rustls-ring",
@@ -40,10 +50,15 @@ use thiserror::Error;
 use url::Url;
 
 use crate::{
-    envelope::Envelope,
+    envelope::{Envelope, EnvelopeDiff, FlagUpdate},
     event::WatchEvent,
     flag::{Flag, FlagOp},
     imap::{
+        convert::parse_mailbox,
+        envelope_diff::{
+            ImapState, envelope_from_items, flag_update_from_items, new_message_item_names,
+            new_message_window,
+        },
         envelope_list::{ImapEnvelopeList, ImapEnvelopeListError},
         flag_store::{ImapFlagStore, ImapFlagStoreError},
         mailbox_create::{ImapMailboxCreate, ImapMailboxCreateError},
@@ -331,6 +346,152 @@ impl ImapClientStd {
                 }
             }
         }
+    }
+
+    /// Returns the QRESYNC-driven envelope delta for `mailbox`.
+    ///
+    /// Decodes `state` into a checkpoint, opens `SELECT (QRESYNC …)`
+    /// with `(uid_validity, highest_mod_seq)`, then fetches new UIDs
+    /// above the cached high-water mark. Surfaces
+    /// [`EnvelopeDiff::FullListRequired`] when QRESYNC is missing from
+    /// [`Self::capabilities`], when UIDVALIDITY bumped, or when no
+    /// usable checkpoint was supplied; otherwise returns
+    /// [`EnvelopeDiff::Incremental`] with the new state, the flag
+    /// updates, the new envelopes and the vanished UIDs.
+    pub fn diff_envelopes(
+        &mut self,
+        mailbox: &str,
+        state: Option<&[u8]>,
+    ) -> Result<EnvelopeDiff, ImapClientError> {
+        let mbox = parse_mailbox(mailbox).map_err(ImapEnvelopeListError::from)?;
+
+        if !self.capabilities.contains(&Capability::QResync) {
+            return Ok(EnvelopeDiff::FullListRequired { new_state: None });
+        }
+
+        let cached = state.and_then(ImapState::decode);
+
+        let Some(cached) = cached else {
+            return self.diff_baseline(mbox);
+        };
+
+        let Some(uid_validity_nz) = NonZeroU32::new(cached.uid_validity) else {
+            return self.diff_baseline(mbox);
+        };
+
+        let capabilities = self.capabilities.clone();
+        let select_data = match self.inner.select_qresync(
+            mbox.clone(),
+            uid_validity_nz,
+            cached.highest_mod_seq,
+            &capabilities,
+        ) {
+            Ok(data) => data,
+            Err(_) => return self.diff_baseline(mbox),
+        };
+
+        let server_uid_validity = select_data
+            .uid_validity
+            .map(NonZeroU32::get)
+            .unwrap_or(cached.uid_validity);
+        if server_uid_validity != cached.uid_validity {
+            return self.diff_baseline(mbox);
+        }
+
+        let flag_updates: Vec<FlagUpdate> = select_data
+            .changed
+            .iter()
+            .filter_map(|fetch| flag_update_from_items(fetch.items.as_ref()))
+            .collect();
+
+        let vanished_ids: Vec<String> = select_data
+            .vanished_earlier
+            .iter()
+            .map(|uid| uid.get().to_string())
+            .collect();
+
+        let mut new_envelopes: Vec<Envelope> = Vec::new();
+        if let Some(window) = new_message_window(cached.highest_uid) {
+            if let Ok(sequence_set) = SequenceSet::try_from(window.as_str()) {
+                let data = self
+                    .inner
+                    .fetch(sequence_set, new_message_item_names(), true)?;
+                new_envelopes = data
+                    .into_iter()
+                    .map(|(_, items)| envelope_from_items(items.into_inner()))
+                    .collect();
+            }
+        }
+
+        let highest_uid = new_envelopes
+            .iter()
+            .filter_map(|e| e.id.parse::<u32>().ok())
+            .max()
+            .unwrap_or(cached.highest_uid);
+
+        let new_highest_mod_seq = select_data
+            .highest_mod_seq
+            .unwrap_or(cached.highest_mod_seq);
+
+        let new_state = ImapState {
+            uid_validity: server_uid_validity,
+            highest_mod_seq: new_highest_mod_seq,
+            highest_uid,
+        }
+        .encode();
+
+        Ok(EnvelopeDiff::Incremental {
+            new_state,
+            flag_updates,
+            new_envelopes,
+            vanished_ids,
+        })
+    }
+
+    /// Captures a fresh IMAP checkpoint via a plain SELECT plus a
+    /// `UID FETCH *` to read the highest UID. Used on first sync, when
+    /// the stored state is unusable, or when UIDVALIDITY bumped.
+    fn diff_baseline(
+        &mut self,
+        mbox: ImapMailbox<'static>,
+    ) -> Result<EnvelopeDiff, ImapClientError> {
+        let select = self.inner.select(mbox)?;
+        let Some(uid_validity) = select.uid_validity.map(NonZeroU32::get) else {
+            return Ok(EnvelopeDiff::FullListRequired { new_state: None });
+        };
+
+        let exists = select.exists.unwrap_or(0);
+        let mut highest_uid: u32 = 0;
+        if exists > 0 {
+            let sequence_set: SequenceSet = "*"
+                .try_into()
+                .expect("`*` is a valid sequence set spelling");
+            let item_names =
+                MacroOrMessageDataItemNames::MessageDataItemNames(vec![MessageDataItemName::Uid]);
+            let data = self.inner.fetch(sequence_set, item_names, false)?;
+            highest_uid = data
+                .into_values()
+                .flat_map(|items| items.into_inner().into_iter())
+                .filter_map(|item| match item {
+                    MessageDataItem::Uid(u) => Some(u.get()),
+                    _ => None,
+                })
+                .max()
+                .unwrap_or(0);
+        }
+
+        let highest_mod_seq = select.highest_mod_seq.unwrap_or(0);
+
+        let new_state = ImapState {
+            uid_validity,
+            highest_mod_seq,
+            highest_uid,
+        }
+        .encode();
+
+        Ok(EnvelopeDiff::FullListRequired {
+            new_state: Some(new_state),
+        })
     }
 }
 

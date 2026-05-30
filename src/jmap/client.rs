@@ -26,6 +26,8 @@ use std::{
 use io_jmap::{
     client::{JmapClientStd as InnerJmapClientStd, JmapClientStdError as InnerJmapClientStdError},
     coroutine::*,
+    rfc8620::{changes::JmapChangesError, error::JmapMethodError},
+    rfc8621::mailbox_changes::JmapMailboxChangesError,
 };
 #[cfg(any(
     feature = "rustls-ring",
@@ -38,10 +40,12 @@ use thiserror::Error;
 use url::Url;
 
 use crate::{
-    envelope::Envelope,
+    envelope::{Envelope, EnvelopeDiff, FlagUpdate},
     event::WatchEvent,
     flag::{Flag, FlagOp},
     jmap::{
+        convert::{envelope_from, envelope_properties},
+        envelope_diff,
         envelope_list::{JmapEnvelopeList, JmapEnvelopeListError},
         flag_store::{JmapFlagStore, JmapFlagStoreError},
         mailbox_create::{JmapMailboxCreate, JmapMailboxCreateError},
@@ -55,7 +59,7 @@ use crate::{
         message_send::{JmapMessageSend, JmapMessageSendError},
         watch_mailbox::{JmapWatchMailbox, JmapWatchMailboxError, JmapWatchMailboxYield},
     },
-    mailbox::Mailbox,
+    mailbox::{Mailbox, MailboxDiff},
 };
 #[cfg(feature = "search")]
 use crate::{
@@ -395,6 +399,131 @@ impl JmapClientStd {
                 }
             }
         }
+    }
+
+    /// Returns the `Email/changes`-driven envelope delta against the
+    /// opaque per-backend `state` checkpoint.
+    ///
+    /// Decodes `state` as the cached `Email/state` token, then walks
+    /// `Email/changes` rounds until `hasMoreChanges` clears. Created
+    /// ids are turned into new envelopes via `Email/get`; updated ids
+    /// surface as [`FlagUpdate`] entries. The `mailbox` argument is
+    /// part of the shared signature: JMAP `Email/changes` is global
+    /// per account and ignores it. Falls back to
+    /// [`EnvelopeDiff::FullListRequired`] when the cached state is
+    /// unusable or the server returns `cannotCalculateChanges`.
+    pub fn diff_envelopes(
+        &mut self,
+        _mailbox: &str,
+        state: Option<&[u8]>,
+    ) -> Result<EnvelopeDiff, JmapClientError> {
+        let Some(since_state) = state.and_then(envelope_diff::decode) else {
+            return self.diff_baseline();
+        };
+
+        let mut created_ids: Vec<String> = Vec::new();
+        let mut updated_ids: Vec<String> = Vec::new();
+        let mut destroyed_ids: Vec<String> = Vec::new();
+        let mut cursor = since_state;
+
+        loop {
+            let changes = match self.inner.email_changes(cursor.clone(), None) {
+                Ok(c) => c,
+                Err(err) if envelope_diff::is_cannot_calculate_changes(&err) => {
+                    return self.diff_baseline();
+                }
+                Err(err) => return Err(err.into()),
+            };
+
+            created_ids.extend(changes.created);
+            updated_ids.extend(changes.updated);
+            destroyed_ids.extend(changes.destroyed);
+
+            cursor = changes.new_state;
+            if !changes.has_more_changes {
+                break;
+            }
+        }
+
+        let properties = envelope_properties();
+
+        let new_envelopes = if created_ids.is_empty() {
+            Vec::new()
+        } else {
+            let output =
+                self.inner
+                    .email_get(created_ids, Some(properties.clone()), false, false, 0)?;
+            output.emails.into_iter().map(envelope_from).collect()
+        };
+
+        let flag_updates = if updated_ids.is_empty() {
+            Vec::new()
+        } else {
+            let output = self
+                .inner
+                .email_get(updated_ids, Some(properties), false, false, 0)?;
+            output
+                .emails
+                .into_iter()
+                .map(envelope_from)
+                .map(|env| FlagUpdate {
+                    id: env.id,
+                    flags: env.flags,
+                })
+                .collect()
+        };
+
+        Ok(EnvelopeDiff::Incremental {
+            new_state: envelope_diff::encode(&cursor),
+            flag_updates,
+            new_envelopes,
+            vanished_ids: destroyed_ids,
+        })
+    }
+
+    /// Returns the `Mailbox/changes`-driven mailbox-set delta against
+    /// the opaque per-backend `state` checkpoint. A single round trip:
+    /// any non-empty bucket (or the server bumping the state) maps to
+    /// [`MailboxDiff::Changed`]; an idle bucket maps to
+    /// [`MailboxDiff::Unchanged`]. On `cannotCalculateChanges` the
+    /// caller is told to re-list via `Changed { new_state: None }`.
+    pub fn diff_mailboxes(&mut self, state: Option<&[u8]>) -> Result<MailboxDiff, JmapClientError> {
+        let Some(since_state) = state.and_then(envelope_diff::decode) else {
+            let output = self.inner.mailbox_get(Some(Vec::new()), None)?;
+            return Ok(MailboxDiff::Changed {
+                new_state: Some(envelope_diff::encode(&output.new_state)),
+            });
+        };
+
+        match self.inner.mailbox_changes(since_state, None) {
+            Ok(changes)
+                if !changes.has_more_changes
+                    && changes.created.is_empty()
+                    && changes.updated.is_empty()
+                    && changes.destroyed.is_empty() =>
+            {
+                Ok(MailboxDiff::Unchanged {
+                    new_state: envelope_diff::encode(&changes.new_state),
+                })
+            }
+            Ok(changes) => Ok(MailboxDiff::Changed {
+                new_state: Some(envelope_diff::encode(&changes.new_state)),
+            }),
+            Err(InnerJmapClientStdError::MailboxChanges(JmapMailboxChangesError::Changes(
+                JmapChangesError::Method(JmapMethodError::CannotCalculateChanges { .. }),
+            ))) => Ok(MailboxDiff::Changed { new_state: None }),
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    /// Captures a fresh `Email/state` checkpoint via an empty
+    /// `Email/get`. Used on first sync, when the cached state is
+    /// unusable, or when the server returns `cannotCalculateChanges`.
+    fn diff_baseline(&mut self) -> Result<EnvelopeDiff, JmapClientError> {
+        let output = self.inner.email_get(Vec::new(), None, false, false, 0)?;
+        Ok(EnvelopeDiff::FullListRequired {
+            new_state: Some(envelope_diff::encode(&output.new_state)),
+        })
     }
 
     fn session_or_err(&self) -> Result<&io_jmap::rfc8620::session::JmapSession, JmapClientError> {

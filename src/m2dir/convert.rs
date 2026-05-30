@@ -70,7 +70,7 @@ pub(crate) fn flags_to_m2dir(flags: &[Flag]) -> M2dirFlags {
 /// Folds an entry + meta flags + parsed message into a shared
 /// [`Envelope`]. `has_attachment` is left `None`; the caller can
 /// overwrite it after a full body parse.
-pub(crate) fn envelope_from(
+pub fn envelope_from(
     entry: &M2dirEntry,
     meta: &M2dirFlags,
     parsed: &ParsedMessage<'_>,
