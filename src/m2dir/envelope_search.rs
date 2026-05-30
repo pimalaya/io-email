@@ -12,17 +12,13 @@
 //!
 //! [`M2dirMessageList`]: io_m2dir::coroutines::message_list::M2dirMessageList
 
-use alloc::{
-    collections::{BTreeMap, BTreeSet},
-    string::String,
-    vec::Vec,
-};
+use alloc::{collections::BTreeSet, string::String, vec::Vec};
 use core::{cmp::Ordering, mem};
 use std::path::PathBuf;
 
 use chrono::{DateTime, FixedOffset, NaiveDate};
 use io_m2dir::{
-    coroutine::{M2dirArg, M2dirCoroutine, M2dirCoroutineState, M2dirYield},
+    coroutine::*,
     coroutines::message_list::{M2dirMessageList as InnerList, M2dirMessageListError as InnerErr},
     entry::M2dirEntry,
     flag::M2dirFlags,
@@ -35,14 +31,8 @@ use thiserror::Error;
 
 use crate::{
     address::Address,
-    coroutine::{
-        EmailBackend, EmailCoroutine, EmailCoroutineArg, EmailCoroutineState, FsBatch, FsStep,
-    },
     envelope::Envelope,
-    m2dir::convert::{
-        InvalidMailboxName, dirread_in, envelope_from, paginate, paths_out, probes_in,
-        resolve_mailbox,
-    },
+    m2dir::convert::{InvalidMailboxName, envelope_from, paginate, resolve_mailbox},
     search::{
         filter::query::SearchEmailsFilterQuery,
         query::SearchEmailsQuery,
@@ -57,10 +47,8 @@ pub enum M2dirEnvelopeSearchError {
     List(#[from] InnerErr),
     #[error(transparent)]
     InvalidMailbox(#[from] InvalidMailboxName),
-    #[error("coroutine was resumed with the wrong EmailCoroutineArg variant")]
-    InvalidArg,
-    #[error("coroutine was resumed with an FsBatch variant it did not request")]
-    UnexpectedBatch,
+    #[error("coroutine was resumed with an M2dirArg variant it did not request")]
+    UnexpectedArg,
     #[error("coroutine was resumed after completion")]
     ResumedAfterDone,
     #[error("failed to parse m2dir message at {0:?}")]
@@ -102,127 +90,6 @@ impl M2dirEnvelopeSearch {
             page_size,
             with_attachment,
         })
-    }
-}
-
-impl EmailCoroutine for M2dirEnvelopeSearch {
-    type Yield = FsStep;
-    type Return = Result<Vec<Envelope>, M2dirEnvelopeSearchError>;
-
-    const BACKEND: EmailBackend = EmailBackend::M2dir;
-
-    fn resume(
-        &mut self,
-        arg: EmailCoroutineArg<'_>,
-    ) -> EmailCoroutineState<Self::Yield, Self::Return> {
-        #[allow(irrefutable_let_patterns)]
-        let EmailCoroutineArg::Fs { batch } = arg else {
-            return EmailCoroutineState::Complete(Err(M2dirEnvelopeSearchError::InvalidArg));
-        };
-
-        match mem::replace(&mut self.state, State::Done) {
-            State::Listing(mut inner) => {
-                let inner_arg = match batch {
-                    None => None,
-                    Some(FsBatch::DirRead(entries)) => Some(M2dirArg::DirRead(dirread_in(entries))),
-                    Some(FsBatch::FileExists(probes)) => {
-                        Some(M2dirArg::FileExists(probes_in(probes)))
-                    }
-                    Some(_) => {
-                        return EmailCoroutineState::Complete(Err(
-                            M2dirEnvelopeSearchError::UnexpectedBatch,
-                        ));
-                    }
-                };
-                match inner.resume(inner_arg) {
-                    M2dirCoroutineState::Yielded(M2dirYield::WantsDirRead(p)) => {
-                        self.state = State::Listing(inner);
-                        EmailCoroutineState::Yielded(FsStep::WantsDirRead(paths_out(p)))
-                    }
-                    M2dirCoroutineState::Yielded(M2dirYield::WantsFileExists(p)) => {
-                        self.state = State::Listing(inner);
-                        EmailCoroutineState::Yielded(FsStep::WantsFileExists(paths_out(p)))
-                    }
-                    M2dirCoroutineState::Complete(Ok(entries)) => {
-                        if entries.is_empty() {
-                            return EmailCoroutineState::Complete(Ok(Vec::new()));
-                        }
-                        let mut paths: BTreeSet<PathBuf> = BTreeSet::new();
-                        for entry in &entries {
-                            paths.insert(PathBuf::from(entry.path().clone()));
-                            paths.insert(PathBuf::from(self.m2dir.flags_path(entry.id())));
-                        }
-                        self.state = State::Reading(entries);
-                        EmailCoroutineState::Yielded(FsStep::WantsFileRead(paths))
-                    }
-                    M2dirCoroutineState::Complete(Err(err)) => {
-                        EmailCoroutineState::Complete(Err(err.into()))
-                    }
-                    other => {
-                        let _ = other;
-                        unreachable!("M2dirMessageList never yields this state");
-                    }
-                }
-            }
-            State::Reading(entries) => {
-                let Some(FsBatch::FileRead(contents)) = batch else {
-                    self.state = State::Reading(entries);
-                    return EmailCoroutineState::Complete(Err(
-                        M2dirEnvelopeSearchError::UnexpectedBatch,
-                    ));
-                };
-                let mut contents: BTreeMap<M2dirPath, Vec<u8>> =
-                    contents.into_iter().map(|(k, v)| (k.into(), v)).collect();
-                let parser = MessageParser::default();
-
-                let mut hits: Vec<Envelope> = Vec::with_capacity(entries.len());
-                for entry in entries {
-                    let Some(body) = contents.remove(entry.path()) else {
-                        continue;
-                    };
-                    let flags_bytes = contents
-                        .remove(&self.m2dir.flags_path(entry.id()))
-                        .unwrap_or_default();
-                    let flags = parse_meta_flags(&flags_bytes);
-
-                    let parsed = if self.with_attachment {
-                        parser.parse(&body)
-                    } else {
-                        parser.parse_headers(&body)
-                    };
-                    let Some(parsed) = parsed else {
-                        return EmailCoroutineState::Complete(Err(
-                            M2dirEnvelopeSearchError::Parse(entry.path().clone()),
-                        ));
-                    };
-
-                    let mut envelope = envelope_from(&entry, &flags, &parsed);
-                    if self.with_attachment {
-                        envelope.has_attachment = Some(parsed.attachment_count() > 0);
-                    }
-
-                    let keep = match self.filter.as_ref() {
-                        Some(f) => matches_filter(&envelope, &body, f),
-                        None => true,
-                    };
-                    if keep {
-                        hits.push(envelope);
-                    }
-                }
-
-                match self.sort.as_deref() {
-                    Some(sort) if !sort.is_empty() => {
-                        hits.sort_by(|a, b| compare_with(a, b, sort));
-                    }
-                    _ => hits.sort_by(|a, b| b.date.cmp(&a.date)),
-                }
-
-                EmailCoroutineState::Complete(Ok(paginate(hits, self.page, self.page_size)))
-            }
-            State::Done => {
-                EmailCoroutineState::Complete(Err(M2dirEnvelopeSearchError::ResumedAfterDone))
-            }
-        }
     }
 }
 
@@ -350,4 +217,91 @@ fn first_addr_key(addrs: &[Address]) -> Option<String> {
             .map(str::to_lowercase)
             .unwrap_or_else(|| a.email.to_lowercase())
     })
+}
+
+impl M2dirCoroutine for M2dirEnvelopeSearch {
+    type Yield = M2dirYield;
+    type Return = Result<Vec<Envelope>, M2dirEnvelopeSearchError>;
+
+    fn resume(&mut self, arg: Option<M2dirArg>) -> M2dirCoroutineState<Self::Yield, Self::Return> {
+        match mem::replace(&mut self.state, State::Done) {
+            State::Listing(mut inner) => match inner.resume(arg) {
+                M2dirCoroutineState::Yielded(y) => {
+                    self.state = State::Listing(inner);
+                    M2dirCoroutineState::Yielded(y)
+                }
+                M2dirCoroutineState::Complete(Ok(entries)) => {
+                    if entries.is_empty() {
+                        return M2dirCoroutineState::Complete(Ok(Vec::new()));
+                    }
+                    let mut paths: BTreeSet<M2dirPath> = BTreeSet::new();
+                    for entry in &entries {
+                        paths.insert(entry.path().clone());
+                        paths.insert(self.m2dir.flags_path(entry.id()));
+                    }
+                    self.state = State::Reading(entries);
+                    M2dirCoroutineState::Yielded(M2dirYield::WantsFileRead(paths))
+                }
+                M2dirCoroutineState::Complete(Err(err)) => {
+                    M2dirCoroutineState::Complete(Err(err.into()))
+                }
+            },
+            State::Reading(entries) => {
+                let Some(M2dirArg::FileRead(mut contents)) = arg else {
+                    self.state = State::Reading(entries);
+                    return M2dirCoroutineState::Complete(Err(
+                        M2dirEnvelopeSearchError::UnexpectedArg,
+                    ));
+                };
+                let parser = MessageParser::default();
+                let mut hits: Vec<Envelope> = Vec::with_capacity(entries.len());
+
+                for entry in entries {
+                    let Some(body) = contents.remove(entry.path()) else {
+                        continue;
+                    };
+                    let flags_bytes = contents
+                        .remove(&self.m2dir.flags_path(entry.id()))
+                        .unwrap_or_default();
+                    let flags = parse_meta_flags(&flags_bytes);
+
+                    let parsed = if self.with_attachment {
+                        parser.parse(&body)
+                    } else {
+                        parser.parse_headers(&body)
+                    };
+                    let Some(parsed) = parsed else {
+                        return M2dirCoroutineState::Complete(Err(
+                            M2dirEnvelopeSearchError::Parse(entry.path().clone()),
+                        ));
+                    };
+
+                    let mut envelope = envelope_from(&entry, &flags, &parsed);
+                    if self.with_attachment {
+                        envelope.has_attachment = Some(parsed.attachment_count() > 0);
+                    }
+
+                    let keep = match self.filter.as_ref() {
+                        Some(f) => matches_filter(&envelope, &body, f),
+                        None => true,
+                    };
+                    if keep {
+                        hits.push(envelope);
+                    }
+                }
+
+                match self.sort.as_deref() {
+                    Some(sort) if !sort.is_empty() => {
+                        hits.sort_by(|a, b| compare_with(a, b, sort));
+                    }
+                    _ => hits.sort_by(|a, b| b.date.cmp(&a.date)),
+                }
+
+                M2dirCoroutineState::Complete(Ok(paginate(hits, self.page, self.page_size)))
+            }
+            State::Done => {
+                M2dirCoroutineState::Complete(Err(M2dirEnvelopeSearchError::ResumedAfterDone))
+            }
+        }
+    }
 }

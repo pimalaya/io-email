@@ -16,11 +16,10 @@
 //! (root path metadata, subdirectory layout) is dropped on purpose to
 //! stay LCD.
 
-use alloc::{collections::BTreeSet, string::ToString, vec::Vec};
-use std::path::PathBuf;
+use alloc::{string::ToString, vec::Vec};
 
 use io_maildir::{
-    coroutine::{MaildirCoroutine, MaildirCoroutineState, MaildirReply, MaildirYield},
+    coroutine::*,
     coroutines::maildir_list::{MaildirList as InnerMaildirList, MaildirListError},
     maildir::Maildir,
     path::MaildirPath,
@@ -28,22 +27,13 @@ use io_maildir::{
 use log::trace;
 use thiserror::Error;
 
-use crate::{
-    coroutine::{
-        EmailBackend, EmailCoroutine, EmailCoroutineArg, EmailCoroutineState, FsBatch, FsStep,
-    },
-    mailbox::Mailbox,
-};
+use crate::mailbox::Mailbox;
 
 /// Errors produced by [`MaildirMailboxList`].
 #[derive(Debug, Error)]
 pub enum MaildirMailboxListError {
     #[error(transparent)]
     List(#[from] MaildirListError),
-    #[error("coroutine was resumed with the wrong EmailCoroutineArg variant")]
-    InvalidArg,
-    #[error("coroutine was resumed with an FsBatch variant it did not request")]
-    UnexpectedBatch,
 }
 
 /// I/O-free coroutine listing every Maildir under `root`.
@@ -69,73 +59,26 @@ impl MaildirMailboxList {
     }
 }
 
-impl EmailCoroutine for MaildirMailboxList {
-    type Yield = FsStep;
+impl MaildirCoroutine for MaildirMailboxList {
+    type Yield = MaildirYield;
     type Return = Result<Vec<Mailbox>, MaildirMailboxListError>;
 
-    const BACKEND: EmailBackend = EmailBackend::Maildir;
-
-    // NOTE: when Maildir is the only enabled backend, EmailCoroutineArg
-    // has a single variant so the destructure below is irrefutable
-    // and the `else` arm is dead. It comes alive (and the lint goes
-    // quiet on its own) as soon as a second backend rejoins.
     fn resume(
         &mut self,
-        arg: EmailCoroutineArg<'_>,
-    ) -> EmailCoroutineState<Self::Yield, Self::Return> {
-        #[allow(irrefutable_let_patterns)]
-        let EmailCoroutineArg::Fs { batch } = arg else {
-            return EmailCoroutineState::Complete(Err(MaildirMailboxListError::InvalidArg));
-        };
-
-        let inner_arg = match batch {
-            None => None,
-            Some(FsBatch::DirRead(entries)) => Some(MaildirReply::DirRead(
-                entries
-                    .into_iter()
-                    .map(|(k, v)| (k.into(), v.into_iter().map(MaildirPath::from).collect()))
-                    .collect(),
-            )),
-            Some(FsBatch::DirExists(probes)) => Some(MaildirReply::DirExists(
-                probes.into_iter().map(|(k, v)| (k.into(), v)).collect(),
-            )),
-            // MaildirList only consumes DirRead / DirExists batches.
-            Some(_) => {
-                return EmailCoroutineState::Complete(Err(
-                    MaildirMailboxListError::UnexpectedBatch,
-                ));
-            }
-        };
-
-        match self.inner.resume(inner_arg) {
+        arg: Option<MaildirReply>,
+    ) -> MaildirCoroutineState<Self::Yield, Self::Return> {
+        match self.inner.resume(arg) {
+            MaildirCoroutineState::Yielded(y) => MaildirCoroutineState::Yielded(y),
             MaildirCoroutineState::Complete(Ok(maildirs)) => {
                 let mut mailboxes: Vec<Mailbox> = maildirs.into_iter().map(mailbox_from).collect();
                 mailboxes.sort_by(|a, b| a.name.cmp(&b.name));
-                EmailCoroutineState::Complete(Ok(mailboxes))
-            }
-            MaildirCoroutineState::Yielded(MaildirYield::WantsDirRead(paths)) => {
-                EmailCoroutineState::Yielded(FsStep::WantsDirRead(to_pathbuf_set(paths)))
-            }
-            MaildirCoroutineState::Yielded(MaildirYield::WantsDirExists(paths)) => {
-                EmailCoroutineState::Yielded(FsStep::WantsDirExists(to_pathbuf_set(paths)))
+                MaildirCoroutineState::Complete(Ok(mailboxes))
             }
             MaildirCoroutineState::Complete(Err(err)) => {
-                EmailCoroutineState::Complete(Err(err.into()))
-            }
-            // MaildirList only yields DirRead / DirExists / Done / Err;
-            // all the other Wants* variants belong to write-side
-            // coroutines that haven't been ported yet.
-            other => {
-                let _ = other;
-                unreachable!("MaildirList only yields DirRead / DirExists / Done / Err");
+                MaildirCoroutineState::Complete(Err(err.into()))
             }
         }
     }
-}
-
-/// Bulk-converts a `BTreeSet<MaildirPath>` to a `BTreeSet<PathBuf>`.
-fn to_pathbuf_set(paths: BTreeSet<MaildirPath>) -> BTreeSet<PathBuf> {
-    paths.into_iter().map(PathBuf::from).collect()
 }
 
 /// Converts one [`Maildir`] into the shared [`Mailbox`] shape.

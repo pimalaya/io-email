@@ -31,7 +31,6 @@ use thiserror::Error;
 use url::Url;
 
 use crate::{
-    coroutine::{EmailBackend, EmailCoroutine, EmailCoroutineArg, EmailCoroutineState, JmapStep},
     flag::Flag,
     jmap::convert::{find_mailbox_id, keyword_from},
 };
@@ -53,8 +52,6 @@ pub enum JmapMessageAddError {
     NotImported,
     #[error("JMAP blob upload reached unexpected redirection")]
     UnsupportedRedirect,
-    #[error("coroutine was resumed with the wrong EmailCoroutineArg variant")]
-    InvalidArg,
     #[error("coroutine was resumed after completion")]
     ResumedAfterDone,
 }
@@ -91,33 +88,36 @@ impl JmapMessageAdd {
     }
 }
 
-impl EmailCoroutine for JmapMessageAdd {
-    type Yield = JmapStep;
+enum State {
+    Uploading(JmapBlobUpload),
+    Resolving {
+        query: InnerQuery,
+        blob_id: String,
+    },
+    Importing {
+        import: InnerImport,
+        client_id: String,
+    },
+    Done,
+}
+
+impl JmapCoroutine for JmapMessageAdd {
+    type Yield = JmapYield;
     type Return = Result<String, JmapMessageAddError>;
 
-    const BACKEND: EmailBackend = EmailBackend::Jmap;
-
-    fn resume(
-        &mut self,
-        arg: EmailCoroutineArg<'_>,
-    ) -> EmailCoroutineState<Self::Yield, Self::Return> {
-        #[allow(irrefutable_let_patterns)]
-        let EmailCoroutineArg::Jmap { bytes } = arg else {
-            return EmailCoroutineState::Complete(Err(JmapMessageAddError::InvalidArg));
-        };
-
+    fn resume(&mut self, bytes: Option<&[u8]>) -> JmapCoroutineState<Self::Yield, Self::Return> {
         match mem::replace(&mut self.state, State::Done) {
             State::Uploading(mut upload) => match upload.resume(bytes) {
                 JmapCoroutineState::Yielded(JmapRedirectYield::WantsRead) => {
                     self.state = State::Uploading(upload);
-                    EmailCoroutineState::Yielded(JmapStep::WantsRead)
+                    JmapCoroutineState::Yielded(JmapYield::WantsRead)
                 }
                 JmapCoroutineState::Yielded(JmapRedirectYield::WantsWrite(out)) => {
                     self.state = State::Uploading(upload);
-                    EmailCoroutineState::Yielded(JmapStep::WantsWrite(out))
+                    JmapCoroutineState::Yielded(JmapYield::WantsWrite(out))
                 }
                 JmapCoroutineState::Yielded(JmapRedirectYield::WantsRedirect { .. }) => {
-                    EmailCoroutineState::Complete(Err(JmapMessageAddError::UnsupportedRedirect))
+                    JmapCoroutineState::Complete(Err(JmapMessageAddError::UnsupportedRedirect))
                 }
                 JmapCoroutineState::Complete(Ok(JmapBlobUploadOutput { blob_id, .. })) => {
                     let query = match InnerQuery::new(
@@ -133,19 +133,19 @@ impl EmailCoroutine for JmapMessageAdd {
                         Some(vec![MailboxProperty::Id, MailboxProperty::Name]),
                     ) {
                         Ok(q) => q,
-                        Err(err) => return EmailCoroutineState::Complete(Err(err.into())),
+                        Err(err) => return JmapCoroutineState::Complete(Err(err.into())),
                     };
                     self.state = State::Resolving { query, blob_id };
-                    self.resume(EmailCoroutineArg::Jmap { bytes: None })
+                    JmapCoroutine::resume(self, None)
                 }
                 JmapCoroutineState::Complete(Err(err)) => {
-                    EmailCoroutineState::Complete(Err(err.into()))
+                    JmapCoroutineState::Complete(Err(err.into()))
                 }
             },
             State::Resolving { mut query, blob_id } => match query.resume(bytes) {
                 JmapCoroutineState::Complete(Ok(ok)) => {
                     let Some(id) = find_mailbox_id(&ok.mailboxes, &self.mailbox_name) else {
-                        return EmailCoroutineState::Complete(Err(JmapMessageAddError::NotFound(
+                        return JmapCoroutineState::Complete(Err(JmapMessageAddError::NotFound(
                             self.mailbox_name.clone(),
                         )));
                     };
@@ -168,21 +168,17 @@ impl EmailCoroutine for JmapMessageAdd {
                     );
                     let import = match InnerImport::new(&self.session, &self.http_auth, imports) {
                         Ok(i) => i,
-                        Err(err) => return EmailCoroutineState::Complete(Err(err.into())),
+                        Err(err) => return JmapCoroutineState::Complete(Err(err.into())),
                     };
                     self.state = State::Importing { import, client_id };
-                    self.resume(EmailCoroutineArg::Jmap { bytes: None })
+                    JmapCoroutine::resume(self, None)
                 }
-                JmapCoroutineState::Yielded(JmapYield::WantsRead) => {
+                JmapCoroutineState::Yielded(y) => {
                     self.state = State::Resolving { query, blob_id };
-                    EmailCoroutineState::Yielded(JmapStep::WantsRead)
-                }
-                JmapCoroutineState::Yielded(JmapYield::WantsWrite(out)) => {
-                    self.state = State::Resolving { query, blob_id };
-                    EmailCoroutineState::Yielded(JmapStep::WantsWrite(out))
+                    JmapCoroutineState::Yielded(y)
                 }
                 JmapCoroutineState::Complete(Err(err)) => {
-                    EmailCoroutineState::Complete(Err(err.into()))
+                    JmapCoroutineState::Complete(Err(err.into()))
                 }
             },
             State::Importing {
@@ -191,42 +187,21 @@ impl EmailCoroutine for JmapMessageAdd {
             } => match import.resume(bytes) {
                 JmapCoroutineState::Complete(Ok(ok)) => {
                     let Some(email) = ok.created.get(&client_id) else {
-                        return EmailCoroutineState::Complete(Err(
-                            JmapMessageAddError::NotImported,
-                        ));
+                        return JmapCoroutineState::Complete(Err(JmapMessageAddError::NotImported));
                     };
-                    EmailCoroutineState::Complete(Ok(email.id.clone().unwrap_or_default()))
+                    JmapCoroutineState::Complete(Ok(email.id.clone().unwrap_or_default()))
                 }
-                JmapCoroutineState::Yielded(JmapYield::WantsRead) => {
+                JmapCoroutineState::Yielded(y) => {
                     self.state = State::Importing { import, client_id };
-                    EmailCoroutineState::Yielded(JmapStep::WantsRead)
-                }
-                JmapCoroutineState::Yielded(JmapYield::WantsWrite(out)) => {
-                    self.state = State::Importing { import, client_id };
-                    EmailCoroutineState::Yielded(JmapStep::WantsWrite(out))
+                    JmapCoroutineState::Yielded(y)
                 }
                 JmapCoroutineState::Complete(Err(err)) => {
-                    EmailCoroutineState::Complete(Err(err.into()))
+                    JmapCoroutineState::Complete(Err(err.into()))
                 }
             },
-            State::Done => {
-                EmailCoroutineState::Complete(Err(JmapMessageAddError::ResumedAfterDone))
-            }
+            State::Done => JmapCoroutineState::Complete(Err(JmapMessageAddError::ResumedAfterDone)),
         }
     }
-}
-
-enum State {
-    Uploading(JmapBlobUpload),
-    Resolving {
-        query: InnerQuery,
-        blob_id: String,
-    },
-    Importing {
-        import: InnerImport,
-        client_id: String,
-    },
-    Done,
 }
 
 /// Resolves the RFC 8620 upload URL template against the live

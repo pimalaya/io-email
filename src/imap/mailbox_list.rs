@@ -17,6 +17,7 @@ use alloc::{
 use core::mem;
 
 use io_imap::{
+    codec::fragmentizer::Fragmentizer,
     coroutine::{ImapCoroutine, ImapCoroutineState, ImapYield},
     rfc3501::{
         list::{
@@ -35,10 +36,7 @@ use io_imap::{
 use log::trace;
 use thiserror::Error;
 
-use crate::{
-    coroutine::{EmailBackend, EmailCoroutine, EmailCoroutineArg, EmailCoroutineState, ImapStep},
-    mailbox::Mailbox,
-};
+use crate::mailbox::Mailbox;
 
 /// Errors produced by [`ImapMailboxList`].
 #[derive(Debug, Error)]
@@ -51,8 +49,6 @@ pub enum ImapMailboxListError {
     InvalidMailbox(String),
     #[error("coroutine was resumed after completion")]
     ResumedAfterDone,
-    #[error("coroutine was resumed with the wrong EmailCoroutineArg variant")]
-    InvalidArg,
 }
 
 /// I/O-free coroutine listing every IMAP mailbox visible to the
@@ -79,94 +75,6 @@ impl ImapMailboxList {
             state: State::Listing(InnerImapMailboxList::new(reference, pattern)),
             with_counts,
             mailboxes: Vec::new(),
-        }
-    }
-}
-
-impl EmailCoroutine for ImapMailboxList {
-    const BACKEND: EmailBackend = EmailBackend::Imap;
-
-    type Yield = ImapStep;
-    type Return = Result<Vec<Mailbox>, ImapMailboxListError>;
-
-    // NOTE: when IMAP is the only enabled backend, EmailCoroutineArg
-    // has a single variant so the destructure below is irrefutable
-    // and the `else` arm is dead. It comes alive (and the lint goes
-    // quiet on its own) as soon as a second backend rejoins.
-    fn resume(
-        &mut self,
-        arg: EmailCoroutineArg<'_>,
-    ) -> EmailCoroutineState<Self::Yield, Self::Return> {
-        #[allow(irrefutable_let_patterns)]
-        let EmailCoroutineArg::Imap {
-            fragmentizer,
-            mut bytes,
-        } = arg
-        else {
-            return EmailCoroutineState::Complete(Err(ImapMailboxListError::InvalidArg));
-        };
-
-        loop {
-            match mem::replace(&mut self.state, State::Done) {
-                State::Listing(mut list) => match list.resume(fragmentizer, bytes.take()) {
-                    ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
-                        self.state = State::Listing(list);
-                        return EmailCoroutineState::Yielded(ImapStep::WantsRead);
-                    }
-                    ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
-                        self.state = State::Listing(list);
-                        return EmailCoroutineState::Yielded(ImapStep::WantsWrite(bytes));
-                    }
-                    ImapCoroutineState::Complete(Ok(rows)) => {
-                        self.mailboxes = rows.into_iter().map(mailbox_from).collect();
-                        if !self.with_counts || self.mailboxes.is_empty() {
-                            return EmailCoroutineState::Complete(Ok(mem::take(
-                                &mut self.mailboxes,
-                            )));
-                        }
-                        match start_status(&self.mailboxes[0], 0) {
-                            Ok(next) => self.state = next,
-                            Err(err) => return EmailCoroutineState::Complete(Err(err)),
-                        }
-                    }
-                    ImapCoroutineState::Complete(Err(err)) => {
-                        return EmailCoroutineState::Complete(Err(err.into()));
-                    }
-                },
-                State::StatusOne { mut status, cursor } => {
-                    match status.resume(fragmentizer, bytes.take()) {
-                        ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
-                            self.state = State::StatusOne { status, cursor };
-                            return EmailCoroutineState::Yielded(ImapStep::WantsRead);
-                        }
-                        ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
-                            self.state = State::StatusOne { status, cursor };
-                            return EmailCoroutineState::Yielded(ImapStep::WantsWrite(bytes));
-                        }
-                        ImapCoroutineState::Complete(Ok(items)) => {
-                            apply_status(&mut self.mailboxes[cursor], items);
-                            let next_cursor = cursor + 1;
-                            if next_cursor >= self.mailboxes.len() {
-                                return EmailCoroutineState::Complete(Ok(mem::take(
-                                    &mut self.mailboxes,
-                                )));
-                            }
-                            match start_status(&self.mailboxes[next_cursor], next_cursor) {
-                                Ok(next) => self.state = next,
-                                Err(err) => return EmailCoroutineState::Complete(Err(err)),
-                            }
-                        }
-                        ImapCoroutineState::Complete(Err(err)) => {
-                            return EmailCoroutineState::Complete(Err(err.into()));
-                        }
-                    }
-                }
-                State::Done => {
-                    return EmailCoroutineState::Complete(Err(
-                        ImapMailboxListError::ResumedAfterDone,
-                    ));
-                }
-            }
         }
     }
 }
@@ -231,6 +139,72 @@ fn apply_status(mailbox: &mut Mailbox, items: Vec<StatusDataItem>) {
             StatusDataItem::Messages(n) => mailbox.total = Some(u64::from(n)),
             StatusDataItem::Unseen(n) => mailbox.unread = Some(u64::from(n)),
             _ => {}
+        }
+    }
+}
+
+impl ImapCoroutine for ImapMailboxList {
+    type Yield = ImapYield;
+    type Return = Result<Vec<Mailbox>, ImapMailboxListError>;
+
+    fn resume(
+        &mut self,
+        fragmentizer: &mut Fragmentizer,
+        mut bytes: Option<&[u8]>,
+    ) -> ImapCoroutineState<Self::Yield, Self::Return> {
+        loop {
+            match mem::replace(&mut self.state, State::Done) {
+                State::Listing(mut list) => match list.resume(fragmentizer, bytes.take()) {
+                    ImapCoroutineState::Yielded(yielded) => {
+                        self.state = State::Listing(list);
+                        return ImapCoroutineState::Yielded(yielded);
+                    }
+                    ImapCoroutineState::Complete(Ok(rows)) => {
+                        self.mailboxes = rows.into_iter().map(mailbox_from).collect();
+                        if !self.with_counts || self.mailboxes.is_empty() {
+                            return ImapCoroutineState::Complete(Ok(mem::take(
+                                &mut self.mailboxes,
+                            )));
+                        }
+                        match start_status(&self.mailboxes[0], 0) {
+                            Ok(next) => self.state = next,
+                            Err(err) => return ImapCoroutineState::Complete(Err(err)),
+                        }
+                    }
+                    ImapCoroutineState::Complete(Err(err)) => {
+                        return ImapCoroutineState::Complete(Err(err.into()));
+                    }
+                },
+                State::StatusOne { mut status, cursor } => {
+                    match status.resume(fragmentizer, bytes.take()) {
+                        ImapCoroutineState::Yielded(yielded) => {
+                            self.state = State::StatusOne { status, cursor };
+                            return ImapCoroutineState::Yielded(yielded);
+                        }
+                        ImapCoroutineState::Complete(Ok(items)) => {
+                            apply_status(&mut self.mailboxes[cursor], items);
+                            let next_cursor = cursor + 1;
+                            if next_cursor >= self.mailboxes.len() {
+                                return ImapCoroutineState::Complete(Ok(mem::take(
+                                    &mut self.mailboxes,
+                                )));
+                            }
+                            match start_status(&self.mailboxes[next_cursor], next_cursor) {
+                                Ok(next) => self.state = next,
+                                Err(err) => return ImapCoroutineState::Complete(Err(err)),
+                            }
+                        }
+                        ImapCoroutineState::Complete(Err(err)) => {
+                            return ImapCoroutineState::Complete(Err(err.into()));
+                        }
+                    }
+                }
+                State::Done => {
+                    return ImapCoroutineState::Complete(Err(
+                        ImapMailboxListError::ResumedAfterDone,
+                    ));
+                }
+            }
         }
     }
 }

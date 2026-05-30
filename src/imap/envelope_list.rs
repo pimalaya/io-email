@@ -20,6 +20,7 @@ use core::{mem, str::from_utf8};
 
 use chrono::{DateTime, FixedOffset};
 use io_imap::{
+    codec::fragmentizer::Fragmentizer,
     coroutine::{ImapCoroutine, ImapCoroutineState, ImapYield},
     rfc3501::{
         fetch::{ImapMessageFetch, ImapMessageFetchError},
@@ -38,7 +39,6 @@ use thiserror::Error;
 
 use crate::{
     address::Address,
-    coroutine::{EmailBackend, EmailCoroutine, EmailCoroutineArg, EmailCoroutineState, ImapStep},
     envelope::{Envelope, normalize_message_id},
     flag::Flag,
     imap::convert::{InvalidMailboxName, parse_mailbox},
@@ -55,8 +55,6 @@ pub enum ImapEnvelopeListError {
     InvalidMailbox(String),
     #[error("computed sequence-set window {0:?} is invalid")]
     InvalidWindow(String),
-    #[error("coroutine was resumed with the wrong EmailCoroutineArg variant")]
-    InvalidArg,
     #[error("coroutine was resumed after completion")]
     ResumedAfterDone,
 }
@@ -92,105 +90,6 @@ impl ImapEnvelopeList {
                 item_names: build_item_names(with_attachment),
             },
         })
-    }
-}
-
-impl EmailCoroutine for ImapEnvelopeList {
-    type Yield = ImapStep;
-    type Return = Result<Vec<Envelope>, ImapEnvelopeListError>;
-
-    const BACKEND: EmailBackend = EmailBackend::Imap;
-
-    fn resume(
-        &mut self,
-        arg: EmailCoroutineArg<'_>,
-    ) -> EmailCoroutineState<Self::Yield, Self::Return> {
-        #[allow(irrefutable_let_patterns)]
-        let EmailCoroutineArg::Imap {
-            fragmentizer,
-            mut bytes,
-        } = arg
-        else {
-            return EmailCoroutineState::Complete(Err(ImapEnvelopeListError::InvalidArg));
-        };
-
-        loop {
-            match mem::replace(&mut self.state, State::Done) {
-                State::Selecting {
-                    mut select,
-                    page,
-                    page_size,
-                    item_names,
-                } => match select.resume(fragmentizer, bytes.take()) {
-                    ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
-                        self.state = State::Selecting {
-                            select,
-                            page,
-                            page_size,
-                            item_names,
-                        };
-                        return EmailCoroutineState::Yielded(ImapStep::WantsRead);
-                    }
-                    ImapCoroutineState::Yielded(ImapYield::WantsWrite(out)) => {
-                        self.state = State::Selecting {
-                            select,
-                            page,
-                            page_size,
-                            item_names,
-                        };
-                        return EmailCoroutineState::Yielded(ImapStep::WantsWrite(out));
-                    }
-                    ImapCoroutineState::Complete(Ok(data)) => {
-                        let exists = data.exists.unwrap_or(0);
-                        let Some(window) = compute_window(exists, page, page_size) else {
-                            return EmailCoroutineState::Complete(Ok(Vec::new()));
-                        };
-                        let sequence_set = match window.as_str().try_into() {
-                            Ok(set) => set,
-                            Err(_) => {
-                                return EmailCoroutineState::Complete(Err(
-                                    ImapEnvelopeListError::InvalidWindow(window),
-                                ));
-                            }
-                        };
-                        self.state =
-                            State::Fetching(ImapMessageFetch::new(sequence_set, item_names, false));
-                    }
-                    ImapCoroutineState::Complete(Err(err)) => {
-                        return EmailCoroutineState::Complete(Err(err.into()));
-                    }
-                },
-                State::Fetching(mut fetch) => match fetch.resume(fragmentizer, bytes.take()) {
-                    ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
-                        self.state = State::Fetching(fetch);
-                        return EmailCoroutineState::Yielded(ImapStep::WantsRead);
-                    }
-                    ImapCoroutineState::Yielded(ImapYield::WantsWrite(out)) => {
-                        self.state = State::Fetching(fetch);
-                        return EmailCoroutineState::Yielded(ImapStep::WantsWrite(out));
-                    }
-                    ImapCoroutineState::Complete(Ok(data)) => {
-                        // BTreeMap iterates ascending by sequence
-                        // number (oldest first); reverse so the
-                        // freshest comes first.
-                        let envelopes = data
-                            .into_iter()
-                            .rev()
-                            .map(|(seq, items)| envelope_from(seq.get(), items.into_inner()))
-                            .collect();
-                        return EmailCoroutineState::Complete(Ok(envelopes));
-                    }
-                    ImapCoroutineState::Complete(Err(err)) => {
-                        return EmailCoroutineState::Complete(Err(err.into()));
-                    }
-                },
-                State::Done => {
-                    return EmailCoroutineState::Complete(Err(
-                        ImapEnvelopeListError::ResumedAfterDone,
-                    ));
-                }
-            }
-        }
     }
 }
 
@@ -404,6 +303,79 @@ fn decode_mime_bytes(bytes: &[u8]) -> String {
         Err(err) => {
             trace!("cannot decode RFC 2047 bytes: {err}");
             bytes_to_string(bytes)
+        }
+    }
+}
+
+impl ImapCoroutine for ImapEnvelopeList {
+    type Yield = ImapYield;
+    type Return = Result<Vec<Envelope>, ImapEnvelopeListError>;
+
+    fn resume(
+        &mut self,
+        fragmentizer: &mut Fragmentizer,
+        mut bytes: Option<&[u8]>,
+    ) -> ImapCoroutineState<Self::Yield, Self::Return> {
+        loop {
+            match mem::replace(&mut self.state, State::Done) {
+                State::Selecting {
+                    mut select,
+                    page,
+                    page_size,
+                    item_names,
+                } => match select.resume(fragmentizer, bytes.take()) {
+                    ImapCoroutineState::Yielded(yielded) => {
+                        self.state = State::Selecting {
+                            select,
+                            page,
+                            page_size,
+                            item_names,
+                        };
+                        return ImapCoroutineState::Yielded(yielded);
+                    }
+                    ImapCoroutineState::Complete(Ok(data)) => {
+                        let exists = data.exists.unwrap_or(0);
+                        let Some(window) = compute_window(exists, page, page_size) else {
+                            return ImapCoroutineState::Complete(Ok(Vec::new()));
+                        };
+                        let sequence_set = match window.as_str().try_into() {
+                            Ok(set) => set,
+                            Err(_) => {
+                                return ImapCoroutineState::Complete(Err(
+                                    ImapEnvelopeListError::InvalidWindow(window),
+                                ));
+                            }
+                        };
+                        self.state =
+                            State::Fetching(ImapMessageFetch::new(sequence_set, item_names, false));
+                    }
+                    ImapCoroutineState::Complete(Err(err)) => {
+                        return ImapCoroutineState::Complete(Err(err.into()));
+                    }
+                },
+                State::Fetching(mut fetch) => match fetch.resume(fragmentizer, bytes.take()) {
+                    ImapCoroutineState::Yielded(yielded) => {
+                        self.state = State::Fetching(fetch);
+                        return ImapCoroutineState::Yielded(yielded);
+                    }
+                    ImapCoroutineState::Complete(Ok(data)) => {
+                        let envelopes = data
+                            .into_iter()
+                            .rev()
+                            .map(|(seq, items)| envelope_from(seq.get(), items.into_inner()))
+                            .collect();
+                        return ImapCoroutineState::Complete(Ok(envelopes));
+                    }
+                    ImapCoroutineState::Complete(Err(err)) => {
+                        return ImapCoroutineState::Complete(Err(err.into()));
+                    }
+                },
+                State::Done => {
+                    return ImapCoroutineState::Complete(Err(
+                        ImapEnvelopeListError::ResumedAfterDone,
+                    ));
+                }
+            }
         }
     }
 }

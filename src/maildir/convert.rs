@@ -1,19 +1,14 @@
 //! Shared helpers for the Maildir coroutines: flag conversions,
-//! mailbox-name → on-disk-path resolution, and path-type conversions
-//! between the shared [`PathBuf`] surface and io-maildir's
-//! [`MaildirPath`].
+//! mailbox-name to on-disk-path resolution, and `paginate` shared with
+//! the m2dir backend.
 
 use alloc::{
-    collections::{BTreeMap, BTreeSet},
     string::{String, ToString},
     vec::Vec,
 };
 use std::path::{Path, PathBuf};
 
-use io_maildir::{
-    flag::{MaildirFlag, MaildirFlags},
-    path::MaildirPath,
-};
+use io_maildir::flag::{MaildirFlag, MaildirFlags};
 use thiserror::Error;
 
 use crate::flag::{Flag, IanaFlag};
@@ -92,45 +87,6 @@ pub(crate) fn flag_from_char(c: char) -> Option<Flag> {
         'P' => Some(Flag::from_iana(IanaFlag::Forwarded)),
         _ => None,
     }
-}
-
-/// Translates a Maildir-path set out to the shared [`PathBuf`] surface.
-pub(crate) fn paths_out(paths: BTreeSet<MaildirPath>) -> BTreeSet<PathBuf> {
-    paths.into_iter().map(PathBuf::from).collect()
-}
-
-/// Translates a rename / copy pair list out to the shared surface.
-pub(crate) fn pairs_out(pairs: Vec<(MaildirPath, MaildirPath)>) -> Vec<(PathBuf, PathBuf)> {
-    pairs
-        .into_iter()
-        .map(|(from, to)| (from.into(), to.into()))
-        .collect()
-}
-
-/// Translates a file-create map out to the shared surface.
-pub(crate) fn files_out(files: BTreeMap<MaildirPath, Vec<u8>>) -> BTreeMap<PathBuf, Vec<u8>> {
-    files.into_iter().map(|(k, v)| (k.into(), v)).collect()
-}
-
-/// Translates a shared bool-keyed map back to a Maildir-path-keyed
-/// map (FileExists / DirExists replies).
-pub(crate) fn probes_in(probes: BTreeMap<PathBuf, bool>) -> BTreeMap<MaildirPath, bool> {
-    probes.into_iter().map(|(k, v)| (k.into(), v)).collect()
-}
-
-/// Translates a shared DirRead reply back to Maildir-path types.
-pub(crate) fn dirread_in(
-    entries: BTreeMap<PathBuf, BTreeSet<PathBuf>>,
-) -> BTreeMap<MaildirPath, BTreeSet<MaildirPath>> {
-    entries
-        .into_iter()
-        .map(|(k, v)| (k.into(), v.into_iter().map(MaildirPath::from).collect()))
-        .collect()
-}
-
-/// Translates a shared FileRead reply back to Maildir-path types.
-pub(crate) fn fileread_in(files: BTreeMap<PathBuf, Vec<u8>>) -> BTreeMap<MaildirPath, Vec<u8>> {
-    files.into_iter().map(|(k, v)| (k.into(), v)).collect()
 }
 
 /// 1-indexed pagination on an in-memory list. `page_size = None`

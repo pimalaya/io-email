@@ -31,7 +31,6 @@ use secrecy::SecretString;
 use thiserror::Error;
 
 use crate::{
-    coroutine::{EmailBackend, EmailCoroutine, EmailCoroutineArg, EmailCoroutineState, JmapStep},
     envelope::Envelope,
     jmap::convert::{compute_position_limit, envelope_from, envelope_properties, find_mailbox_id},
 };
@@ -45,8 +44,6 @@ pub enum JmapEnvelopeListError {
     EmailQuery(#[from] QueryErr),
     #[error("no JMAP mailbox named `{0}` found")]
     NotFound(String),
-    #[error("coroutine was resumed with the wrong EmailCoroutineArg variant")]
-    InvalidArg,
     #[error("coroutine was resumed after completion")]
     ResumedAfterDone,
 }
@@ -93,28 +90,24 @@ impl JmapEnvelopeList {
     }
 }
 
-impl EmailCoroutine for JmapEnvelopeList {
-    type Yield = JmapStep;
+enum State {
+    Resolving(InnerMailboxQuery),
+    Listing(InnerQuery),
+    Done,
+}
+
+impl JmapCoroutine for JmapEnvelopeList {
+    type Yield = JmapYield;
     type Return = Result<Vec<Envelope>, JmapEnvelopeListError>;
 
-    const BACKEND: EmailBackend = EmailBackend::Jmap;
-
-    fn resume(
-        &mut self,
-        arg: EmailCoroutineArg<'_>,
-    ) -> EmailCoroutineState<Self::Yield, Self::Return> {
-        #[allow(irrefutable_let_patterns)]
-        let EmailCoroutineArg::Jmap { bytes } = arg else {
-            return EmailCoroutineState::Complete(Err(JmapEnvelopeListError::InvalidArg));
-        };
-
+    fn resume(&mut self, bytes: Option<&[u8]>) -> JmapCoroutineState<Self::Yield, Self::Return> {
         match mem::replace(&mut self.state, State::Done) {
             State::Resolving(mut query) => match query.resume(bytes) {
                 JmapCoroutineState::Complete(Ok(ok)) => {
                     let Some(id) = find_mailbox_id(&ok.mailboxes, &self.name) else {
-                        return EmailCoroutineState::Complete(Err(
-                            JmapEnvelopeListError::NotFound(self.name.clone()),
-                        ));
+                        return JmapCoroutineState::Complete(Err(JmapEnvelopeListError::NotFound(
+                            self.name.clone(),
+                        )));
                     };
                     let (position, limit) = compute_position_limit(self.page, self.page_size);
                     let filter = EmailFilter {
@@ -131,49 +124,35 @@ impl EmailCoroutine for JmapEnvelopeList {
                         Some(envelope_properties()),
                     ) {
                         Ok(q) => q,
-                        Err(err) => return EmailCoroutineState::Complete(Err(err.into())),
+                        Err(err) => return JmapCoroutineState::Complete(Err(err.into())),
                     };
                     self.state = State::Listing(inner);
-                    self.resume(EmailCoroutineArg::Jmap { bytes: None })
+                    JmapCoroutine::resume(self, None)
                 }
-                JmapCoroutineState::Yielded(JmapYield::WantsRead) => {
+                JmapCoroutineState::Yielded(y) => {
                     self.state = State::Resolving(query);
-                    EmailCoroutineState::Yielded(JmapStep::WantsRead)
-                }
-                JmapCoroutineState::Yielded(JmapYield::WantsWrite(out)) => {
-                    self.state = State::Resolving(query);
-                    EmailCoroutineState::Yielded(JmapStep::WantsWrite(out))
+                    JmapCoroutineState::Yielded(y)
                 }
                 JmapCoroutineState::Complete(Err(err)) => {
-                    EmailCoroutineState::Complete(Err(err.into()))
+                    JmapCoroutineState::Complete(Err(err.into()))
                 }
             },
             State::Listing(mut query) => match query.resume(bytes) {
                 JmapCoroutineState::Complete(Ok(ok)) => {
                     let envelopes = ok.emails.into_iter().map(envelope_from).collect();
-                    EmailCoroutineState::Complete(Ok(envelopes))
+                    JmapCoroutineState::Complete(Ok(envelopes))
                 }
-                JmapCoroutineState::Yielded(JmapYield::WantsRead) => {
+                JmapCoroutineState::Yielded(y) => {
                     self.state = State::Listing(query);
-                    EmailCoroutineState::Yielded(JmapStep::WantsRead)
-                }
-                JmapCoroutineState::Yielded(JmapYield::WantsWrite(out)) => {
-                    self.state = State::Listing(query);
-                    EmailCoroutineState::Yielded(JmapStep::WantsWrite(out))
+                    JmapCoroutineState::Yielded(y)
                 }
                 JmapCoroutineState::Complete(Err(err)) => {
-                    EmailCoroutineState::Complete(Err(err.into()))
+                    JmapCoroutineState::Complete(Err(err.into()))
                 }
             },
             State::Done => {
-                EmailCoroutineState::Complete(Err(JmapEnvelopeListError::ResumedAfterDone))
+                JmapCoroutineState::Complete(Err(JmapEnvelopeListError::ResumedAfterDone))
             }
         }
     }
-}
-
-enum State {
-    Resolving(InnerMailboxQuery),
-    Listing(InnerQuery),
-    Done,
 }

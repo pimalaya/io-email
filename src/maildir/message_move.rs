@@ -7,7 +7,7 @@ use alloc::{collections::VecDeque, string::String};
 use std::path::PathBuf;
 
 use io_maildir::{
-    coroutine::{MaildirCoroutine, MaildirCoroutineState, MaildirReply, MaildirYield},
+    coroutine::*,
     coroutines::message_move::{
         MaildirMessageMove as InnerMove, MaildirMessageMoveError as InnerErr,
     },
@@ -16,14 +16,7 @@ use io_maildir::{
 use log::trace;
 use thiserror::Error;
 
-use crate::{
-    coroutine::{
-        EmailBackend, EmailCoroutine, EmailCoroutineArg, EmailCoroutineState, FsBatch, FsStep,
-    },
-    maildir::convert::{
-        InvalidMailboxName, dirread_in, pairs_out, paths_out, probes_in, resolve_mailbox,
-    },
-};
+use crate::maildir::convert::{InvalidMailboxName, resolve_mailbox};
 
 /// Errors produced by [`MaildirMessageMove`].
 #[derive(Debug, Error)]
@@ -32,10 +25,6 @@ pub enum MaildirMessageMoveError {
     Move(#[from] InnerErr),
     #[error(transparent)]
     InvalidMailbox(#[from] InvalidMailboxName),
-    #[error("coroutine was resumed with the wrong EmailCoroutineArg variant")]
-    InvalidArg,
-    #[error("coroutine was resumed with an FsBatch variant it did not request")]
-    UnexpectedBatch,
 }
 
 /// I/O-free coroutine moving every id from `from` to `to`.
@@ -67,26 +56,19 @@ impl MaildirMessageMove {
     }
 }
 
-impl EmailCoroutine for MaildirMessageMove {
-    type Yield = FsStep;
+impl MaildirCoroutine for MaildirMessageMove {
+    type Yield = MaildirYield;
     type Return = Result<(), MaildirMessageMoveError>;
-
-    const BACKEND: EmailBackend = EmailBackend::Maildir;
 
     fn resume(
         &mut self,
-        arg: EmailCoroutineArg<'_>,
-    ) -> EmailCoroutineState<Self::Yield, Self::Return> {
-        #[allow(irrefutable_let_patterns)]
-        let EmailCoroutineArg::Fs { batch } = arg else {
-            return EmailCoroutineState::Complete(Err(MaildirMessageMoveError::InvalidArg));
-        };
-
-        let mut batch = batch;
+        arg: Option<MaildirReply>,
+    ) -> MaildirCoroutineState<Self::Yield, Self::Return> {
+        let mut arg = arg;
         loop {
             if self.current.is_none() {
                 let Some(id) = self.pending.pop_front() else {
-                    return EmailCoroutineState::Complete(Ok(()));
+                    return MaildirCoroutineState::Complete(Ok(()));
                 };
                 self.current = Some(InnerMove::new(
                     id,
@@ -95,39 +77,15 @@ impl EmailCoroutine for MaildirMessageMove {
                     None,
                 ));
             }
+
             let inner = self.current.as_mut().unwrap();
-            let inner_arg = match batch.take() {
-                None => None,
-                Some(FsBatch::FileExists(probes)) => {
-                    Some(MaildirReply::FileExists(probes_in(probes)))
-                }
-                Some(FsBatch::DirRead(entries)) => Some(MaildirReply::DirRead(dirread_in(entries))),
-                Some(FsBatch::Rename) => Some(MaildirReply::Rename),
-                Some(_) => {
-                    return EmailCoroutineState::Complete(Err(
-                        MaildirMessageMoveError::UnexpectedBatch,
-                    ));
-                }
-            };
-            match inner.resume(inner_arg) {
+            match inner.resume(arg.take()) {
                 MaildirCoroutineState::Complete(Ok(())) => {
                     self.current = None;
                 }
-                MaildirCoroutineState::Yielded(MaildirYield::WantsFileExists(paths)) => {
-                    return EmailCoroutineState::Yielded(FsStep::WantsFileExists(paths_out(paths)));
-                }
-                MaildirCoroutineState::Yielded(MaildirYield::WantsDirRead(paths)) => {
-                    return EmailCoroutineState::Yielded(FsStep::WantsDirRead(paths_out(paths)));
-                }
-                MaildirCoroutineState::Yielded(MaildirYield::WantsRename(pairs)) => {
-                    return EmailCoroutineState::Yielded(FsStep::WantsRename(pairs_out(pairs)));
-                }
+                MaildirCoroutineState::Yielded(y) => return MaildirCoroutineState::Yielded(y),
                 MaildirCoroutineState::Complete(Err(err)) => {
-                    return EmailCoroutineState::Complete(Err(err.into()));
-                }
-                other => {
-                    let _ = other;
-                    unreachable!("MaildirMessageMove never yields this state");
+                    return MaildirCoroutineState::Complete(Err(err.into()));
                 }
             }
         }

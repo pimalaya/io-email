@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 
 use io_maildir::{
-    coroutine::{MaildirCoroutine, MaildirCoroutineState, MaildirReply, MaildirYield},
+    coroutine::*,
     coroutines::maildir_create::{
         MaildirCreate as InnerMaildirCreate, MaildirCreateError as InnerMaildirCreateError,
     },
@@ -17,12 +17,7 @@ use io_maildir::{
 use log::trace;
 use thiserror::Error;
 
-use crate::{
-    coroutine::{
-        EmailBackend, EmailCoroutine, EmailCoroutineArg, EmailCoroutineState, FsBatch, FsStep,
-    },
-    maildir::convert::{InvalidMailboxName, resolve_mailbox},
-};
+use crate::maildir::convert::{InvalidMailboxName, resolve_mailbox};
 
 /// Errors produced by [`MaildirMailboxCreate`].
 #[derive(Debug, Error)]
@@ -31,10 +26,6 @@ pub enum MaildirMailboxCreateError {
     Create(#[from] InnerMaildirCreateError),
     #[error(transparent)]
     InvalidMailbox(#[from] InvalidMailboxName),
-    #[error("coroutine was resumed with the wrong EmailCoroutineArg variant")]
-    InvalidArg,
-    #[error("coroutine was resumed with an FsBatch variant it did not request")]
-    UnexpectedBatch,
 }
 
 /// I/O-free coroutine creating a Maildir mailbox under the configured
@@ -58,44 +49,18 @@ impl MaildirMailboxCreate {
     }
 }
 
-impl EmailCoroutine for MaildirMailboxCreate {
-    type Yield = FsStep;
+impl MaildirCoroutine for MaildirMailboxCreate {
+    type Yield = MaildirYield;
     type Return = Result<(), MaildirMailboxCreateError>;
-
-    const BACKEND: EmailBackend = EmailBackend::Maildir;
 
     fn resume(
         &mut self,
-        arg: EmailCoroutineArg<'_>,
-    ) -> EmailCoroutineState<Self::Yield, Self::Return> {
-        #[allow(irrefutable_let_patterns)]
-        let EmailCoroutineArg::Fs { batch } = arg else {
-            return EmailCoroutineState::Complete(Err(MaildirMailboxCreateError::InvalidArg));
-        };
-
-        let inner_arg = match batch {
-            None => None,
-            Some(FsBatch::DirCreate) => Some(MaildirReply::DirCreate),
-            Some(_) => {
-                return EmailCoroutineState::Complete(Err(
-                    MaildirMailboxCreateError::UnexpectedBatch,
-                ));
-            }
-        };
-
-        match self.inner.resume(inner_arg) {
-            MaildirCoroutineState::Complete(Ok(())) => EmailCoroutineState::Complete(Ok(())),
-            MaildirCoroutineState::Yielded(MaildirYield::WantsDirCreate(paths)) => {
-                EmailCoroutineState::Yielded(FsStep::WantsDirCreate(
-                    paths.into_iter().map(PathBuf::from).collect(),
-                ))
-            }
-            MaildirCoroutineState::Complete(Err(err)) => {
-                EmailCoroutineState::Complete(Err(err.into()))
-            }
-            other => {
-                let _ = other;
-                unreachable!("MaildirCreate only yields DirCreate / Done / Err");
+        arg: Option<MaildirReply>,
+    ) -> MaildirCoroutineState<Self::Yield, Self::Return> {
+        match self.inner.resume(arg) {
+            MaildirCoroutineState::Yielded(y) => MaildirCoroutineState::Yielded(y),
+            MaildirCoroutineState::Complete(r) => {
+                MaildirCoroutineState::Complete(r.map_err(Into::into))
             }
         }
     }

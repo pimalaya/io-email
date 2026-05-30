@@ -9,6 +9,7 @@ use alloc::{string::String, vec};
 use core::mem;
 
 use io_imap::{
+    codec::fragmentizer::Fragmentizer,
     coroutine::{ImapCoroutine, ImapCoroutineState, ImapYield},
     rfc3501::{
         expunge::{ImapMailboxExpunge, ImapMailboxExpungeError},
@@ -21,7 +22,6 @@ use log::trace;
 use thiserror::Error;
 
 use crate::{
-    coroutine::{EmailBackend, EmailCoroutine, EmailCoroutineArg, EmailCoroutineState, ImapStep},
     flag::{Flag, IanaFlag},
     imap::convert::{InvalidMailboxName, InvalidUidSet, flag_from, parse_mailbox, parse_uids},
 };
@@ -41,8 +41,6 @@ pub enum ImapMessageDeleteError {
     InvalidUid(String),
     #[error("empty UID set")]
     EmptyUidSet,
-    #[error("coroutine was resumed with the wrong EmailCoroutineArg variant")]
-    InvalidArg,
     #[error("coroutine was resumed after completion")]
     ResumedAfterDone,
 }
@@ -86,87 +84,6 @@ impl ImapMessageDelete {
     }
 }
 
-impl EmailCoroutine for ImapMessageDelete {
-    type Yield = ImapStep;
-    type Return = Result<(), ImapMessageDeleteError>;
-
-    const BACKEND: EmailBackend = EmailBackend::Imap;
-
-    fn resume(
-        &mut self,
-        arg: EmailCoroutineArg<'_>,
-    ) -> EmailCoroutineState<Self::Yield, Self::Return> {
-        #[allow(irrefutable_let_patterns)]
-        let EmailCoroutineArg::Imap {
-            fragmentizer,
-            mut bytes,
-        } = arg
-        else {
-            return EmailCoroutineState::Complete(Err(ImapMessageDeleteError::InvalidArg));
-        };
-
-        loop {
-            match mem::replace(&mut self.state, State::Done) {
-                State::Selecting { mut select, store } => {
-                    match select.resume(fragmentizer, bytes.take()) {
-                        ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
-                            self.state = State::Selecting { select, store };
-                            return EmailCoroutineState::Yielded(ImapStep::WantsRead);
-                        }
-                        ImapCoroutineState::Yielded(ImapYield::WantsWrite(out)) => {
-                            self.state = State::Selecting { select, store };
-                            return EmailCoroutineState::Yielded(ImapStep::WantsWrite(out));
-                        }
-                        ImapCoroutineState::Complete(Ok(_)) => {
-                            self.state = State::Storing(store);
-                        }
-                        ImapCoroutineState::Complete(Err(err)) => {
-                            return EmailCoroutineState::Complete(Err(err.into()));
-                        }
-                    }
-                }
-                State::Storing(mut store) => match store.resume(fragmentizer, bytes.take()) {
-                    ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
-                        self.state = State::Storing(store);
-                        return EmailCoroutineState::Yielded(ImapStep::WantsRead);
-                    }
-                    ImapCoroutineState::Yielded(ImapYield::WantsWrite(out)) => {
-                        self.state = State::Storing(store);
-                        return EmailCoroutineState::Yielded(ImapStep::WantsWrite(out));
-                    }
-                    ImapCoroutineState::Complete(Ok(_)) => {
-                        self.state = State::Expunging(ImapMailboxExpunge::new());
-                    }
-                    ImapCoroutineState::Complete(Err(err)) => {
-                        return EmailCoroutineState::Complete(Err(err.into()));
-                    }
-                },
-                State::Expunging(mut expunge) => match expunge.resume(fragmentizer, bytes.take()) {
-                    ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
-                        self.state = State::Expunging(expunge);
-                        return EmailCoroutineState::Yielded(ImapStep::WantsRead);
-                    }
-                    ImapCoroutineState::Yielded(ImapYield::WantsWrite(out)) => {
-                        self.state = State::Expunging(expunge);
-                        return EmailCoroutineState::Yielded(ImapStep::WantsWrite(out));
-                    }
-                    ImapCoroutineState::Complete(Ok(_expunged)) => {
-                        return EmailCoroutineState::Complete(Ok(()));
-                    }
-                    ImapCoroutineState::Complete(Err(err)) => {
-                        return EmailCoroutineState::Complete(Err(err.into()));
-                    }
-                },
-                State::Done => {
-                    return EmailCoroutineState::Complete(Err(
-                        ImapMessageDeleteError::ResumedAfterDone,
-                    ));
-                }
-            }
-        }
-    }
-}
-
 #[allow(clippy::large_enum_variant)] // see flag_store.rs for rationale
 enum State {
     Selecting {
@@ -176,4 +93,63 @@ enum State {
     Storing(ImapMessageStore),
     Expunging(ImapMailboxExpunge),
     Done,
+}
+
+impl ImapCoroutine for ImapMessageDelete {
+    type Yield = ImapYield;
+    type Return = Result<(), ImapMessageDeleteError>;
+
+    fn resume(
+        &mut self,
+        fragmentizer: &mut Fragmentizer,
+        mut bytes: Option<&[u8]>,
+    ) -> ImapCoroutineState<Self::Yield, Self::Return> {
+        loop {
+            match mem::replace(&mut self.state, State::Done) {
+                State::Selecting { mut select, store } => {
+                    match select.resume(fragmentizer, bytes.take()) {
+                        ImapCoroutineState::Yielded(yielded) => {
+                            self.state = State::Selecting { select, store };
+                            return ImapCoroutineState::Yielded(yielded);
+                        }
+                        ImapCoroutineState::Complete(Ok(_)) => {
+                            self.state = State::Storing(store);
+                        }
+                        ImapCoroutineState::Complete(Err(err)) => {
+                            return ImapCoroutineState::Complete(Err(err.into()));
+                        }
+                    }
+                }
+                State::Storing(mut store) => match store.resume(fragmentizer, bytes.take()) {
+                    ImapCoroutineState::Yielded(yielded) => {
+                        self.state = State::Storing(store);
+                        return ImapCoroutineState::Yielded(yielded);
+                    }
+                    ImapCoroutineState::Complete(Ok(_)) => {
+                        self.state = State::Expunging(ImapMailboxExpunge::new());
+                    }
+                    ImapCoroutineState::Complete(Err(err)) => {
+                        return ImapCoroutineState::Complete(Err(err.into()));
+                    }
+                },
+                State::Expunging(mut expunge) => match expunge.resume(fragmentizer, bytes.take()) {
+                    ImapCoroutineState::Yielded(yielded) => {
+                        self.state = State::Expunging(expunge);
+                        return ImapCoroutineState::Yielded(yielded);
+                    }
+                    ImapCoroutineState::Complete(Ok(_expunged)) => {
+                        return ImapCoroutineState::Complete(Ok(()));
+                    }
+                    ImapCoroutineState::Complete(Err(err)) => {
+                        return ImapCoroutineState::Complete(Err(err.into()));
+                    }
+                },
+                State::Done => {
+                    return ImapCoroutineState::Complete(Err(
+                        ImapMessageDeleteError::ResumedAfterDone,
+                    ));
+                }
+            }
+        }
+    }
 }

@@ -16,7 +16,6 @@ pub mod address;
     feature = "smtp"
 ))]
 pub mod client;
-pub mod coroutine;
 pub mod envelope;
 pub mod event;
 pub mod flag;

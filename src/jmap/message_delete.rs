@@ -15,10 +15,6 @@ use log::trace;
 use secrecy::SecretString;
 use thiserror::Error;
 
-use crate::coroutine::{
-    EmailBackend, EmailCoroutine, EmailCoroutineArg, EmailCoroutineState, JmapStep,
-};
-
 /// Errors produced by [`JmapMessageDelete`].
 #[derive(Debug, Error)]
 pub enum JmapMessageDeleteError {
@@ -26,8 +22,6 @@ pub enum JmapMessageDeleteError {
     Set(#[from] InnerErr),
     #[error("Email/set did not destroy `{0}`")]
     NotDestroyed(String),
-    #[error("coroutine was resumed with the wrong EmailCoroutineArg variant")]
-    InvalidArg,
 }
 
 /// I/O-free coroutine destroying a single JMAP email by id.
@@ -57,40 +51,23 @@ impl JmapMessageDelete {
     }
 }
 
-impl EmailCoroutine for JmapMessageDelete {
-    type Yield = JmapStep;
+impl JmapCoroutine for JmapMessageDelete {
+    type Yield = JmapYield;
     type Return = Result<(), JmapMessageDeleteError>;
 
-    const BACKEND: EmailBackend = EmailBackend::Jmap;
-
-    fn resume(
-        &mut self,
-        arg: EmailCoroutineArg<'_>,
-    ) -> EmailCoroutineState<Self::Yield, Self::Return> {
-        #[allow(irrefutable_let_patterns)]
-        let EmailCoroutineArg::Jmap { bytes } = arg else {
-            return EmailCoroutineState::Complete(Err(JmapMessageDeleteError::InvalidArg));
-        };
-
+    fn resume(&mut self, bytes: Option<&[u8]>) -> JmapCoroutineState<Self::Yield, Self::Return> {
         match self.inner.resume(bytes) {
+            JmapCoroutineState::Yielded(y) => JmapCoroutineState::Yielded(y),
             JmapCoroutineState::Complete(Ok(ok)) => {
                 if ok.destroyed.iter().any(|d| d == &self.id) {
-                    EmailCoroutineState::Complete(Ok(()))
+                    JmapCoroutineState::Complete(Ok(()))
                 } else {
-                    EmailCoroutineState::Complete(Err(JmapMessageDeleteError::NotDestroyed(
+                    JmapCoroutineState::Complete(Err(JmapMessageDeleteError::NotDestroyed(
                         self.id.clone(),
                     )))
                 }
             }
-            JmapCoroutineState::Yielded(JmapYield::WantsRead) => {
-                EmailCoroutineState::Yielded(JmapStep::WantsRead)
-            }
-            JmapCoroutineState::Yielded(JmapYield::WantsWrite(out)) => {
-                EmailCoroutineState::Yielded(JmapStep::WantsWrite(out))
-            }
-            JmapCoroutineState::Complete(Err(err)) => {
-                EmailCoroutineState::Complete(Err(err.into()))
-            }
+            JmapCoroutineState::Complete(Err(err)) => JmapCoroutineState::Complete(Err(err.into())),
         }
     }
 }

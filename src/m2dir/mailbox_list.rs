@@ -15,11 +15,11 @@
 //! (marker path, `.meta` directory layout) is dropped on purpose to
 //! stay LCD.
 
-use alloc::{collections::BTreeSet, string::ToString, vec::Vec};
+use alloc::{string::ToString, vec::Vec};
 use std::path::PathBuf;
 
 use io_m2dir::{
-    coroutine::{M2dirArg, M2dirCoroutine, M2dirCoroutineState, M2dirYield},
+    coroutine::*,
     coroutines::mailbox_list::{
         M2dirMailboxList as InnerM2dirMailboxList,
         M2dirMailboxListError as InnerM2dirMailboxListError,
@@ -31,22 +31,13 @@ use io_m2dir::{
 use log::trace;
 use thiserror::Error;
 
-use crate::{
-    coroutine::{
-        EmailBackend, EmailCoroutine, EmailCoroutineArg, EmailCoroutineState, FsBatch, FsStep,
-    },
-    mailbox::Mailbox,
-};
+use crate::mailbox::Mailbox;
 
 /// Errors produced by [`M2dirMailboxList`].
 #[derive(Debug, Error)]
 pub enum M2dirMailboxListError {
     #[error(transparent)]
     List(#[from] InnerM2dirMailboxListError),
-    #[error("coroutine was resumed with the wrong EmailCoroutineArg variant")]
-    InvalidArg,
-    #[error("coroutine was resumed with an FsBatch variant it did not request")]
-    UnexpectedBatch,
 }
 
 /// I/O-free coroutine listing every m2dir under an m2store root.
@@ -69,70 +60,10 @@ impl M2dirMailboxList {
     }
 }
 
-impl EmailCoroutine for M2dirMailboxList {
-    type Yield = FsStep;
-    type Return = Result<Vec<Mailbox>, M2dirMailboxListError>;
-
-    const BACKEND: EmailBackend = EmailBackend::M2dir;
-
-    fn resume(
-        &mut self,
-        arg: EmailCoroutineArg<'_>,
-    ) -> EmailCoroutineState<Self::Yield, Self::Return> {
-        #[allow(irrefutable_let_patterns)]
-        let EmailCoroutineArg::Fs { batch } = arg else {
-            return EmailCoroutineState::Complete(Err(M2dirMailboxListError::InvalidArg));
-        };
-
-        let inner_arg = match batch {
-            None => None,
-            Some(FsBatch::DirRead(entries)) => Some(M2dirArg::DirRead(
-                entries
-                    .into_iter()
-                    .map(|(k, v)| (k.into(), v.into_iter().map(M2dirPath::from).collect()))
-                    .collect(),
-            )),
-            Some(FsBatch::FileExists(probes)) => Some(M2dirArg::FileExists(
-                probes.into_iter().map(|(k, v)| (k.into(), v)).collect(),
-            )),
-            // M2dirMailboxList only consumes DirRead / FileExists batches.
-            Some(_) => {
-                return EmailCoroutineState::Complete(Err(M2dirMailboxListError::UnexpectedBatch));
-            }
-        };
-
-        match self.inner.resume(inner_arg) {
-            M2dirCoroutineState::Complete(Ok(m2dirs)) => {
-                let mut mailboxes: Vec<Mailbox> = m2dirs.into_iter().map(mailbox_from).collect();
-                mailboxes.sort_by(|a, b| a.name.cmp(&b.name));
-                EmailCoroutineState::Complete(Ok(mailboxes))
-            }
-            M2dirCoroutineState::Yielded(M2dirYield::WantsDirRead(paths)) => {
-                EmailCoroutineState::Yielded(FsStep::WantsDirRead(to_pathbuf_set(paths)))
-            }
-            M2dirCoroutineState::Yielded(M2dirYield::WantsFileExists(paths)) => {
-                EmailCoroutineState::Yielded(FsStep::WantsFileExists(to_pathbuf_set(paths)))
-            }
-            M2dirCoroutineState::Complete(Err(err)) => {
-                EmailCoroutineState::Complete(Err(err.into()))
-            }
-            other => {
-                let _ = other;
-                unreachable!("M2dirMailboxList only yields DirRead / FileExists / Done / Err");
-            }
-        }
-    }
-}
-
-/// Bulk-converts a `BTreeSet<M2dirPath>` to a `BTreeSet<PathBuf>`.
-fn to_pathbuf_set(paths: BTreeSet<M2dirPath>) -> BTreeSet<PathBuf> {
-    paths.into_iter().map(PathBuf::from).collect()
-}
-
 /// Converts one [`M2dir`] into the shared [`Mailbox`] shape.
 ///
 /// `id` is the on-disk path so downstream ops can locate the m2dir;
-/// `name` is the last path segment. Counts default to `None` —
+/// `name` is the last path segment. Counts default to `None`;
 /// populating them needs the follow-up walk described in the module
 /// doc.
 fn mailbox_from(m2dir: M2dir) -> Mailbox {
@@ -144,5 +75,24 @@ fn mailbox_from(m2dir: M2dir) -> Mailbox {
         name,
         total: None,
         unread: None,
+    }
+}
+
+impl M2dirCoroutine for M2dirMailboxList {
+    type Yield = M2dirYield;
+    type Return = Result<Vec<Mailbox>, M2dirMailboxListError>;
+
+    fn resume(&mut self, arg: Option<M2dirArg>) -> M2dirCoroutineState<Self::Yield, Self::Return> {
+        match self.inner.resume(arg) {
+            M2dirCoroutineState::Yielded(y) => M2dirCoroutineState::Yielded(y),
+            M2dirCoroutineState::Complete(Ok(m2dirs)) => {
+                let mut mailboxes: Vec<Mailbox> = m2dirs.into_iter().map(mailbox_from).collect();
+                mailboxes.sort_by(|a, b| a.name.cmp(&b.name));
+                M2dirCoroutineState::Complete(Ok(mailboxes))
+            }
+            M2dirCoroutineState::Complete(Err(err)) => {
+                M2dirCoroutineState::Complete(Err(err.into()))
+            }
+        }
     }
 }

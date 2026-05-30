@@ -17,19 +17,23 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
-default = []
-client = ["pimalaya-stream/std"]
+default = ["client"]
+client = ["pimalaya-stream/std", "io-imap?/client", "io-jmap?/client", "io-smtp?/client"]
 imap = ["dep:io-imap", "dep:mail-parser", "dep:rfc2047-decoder", "dep:uuid"]
 jmap = ["dep:io-jmap", "dep:io-http", "dep:secrecy", "dep:url"]
 smtp = ["client", "dep:io-smtp", "dep:mail-parser"]
-maildir = ["client", "dep:io-maildir", "io-maildir?/client", "io-maildir?/parser", "dep:mail-parser"]
+maildir = ["client", "dep:io-maildir", "io-maildir?/client", "io-maildir?/parser", "dep:mail-parser", "dep:gethostname"]
 m2dir = ["client", "dep:io-m2dir", "io-m2dir?/client", "dep:mail-parser"]
 search = ["dep:chumsky"]
 serde = ["dep:serde", "chrono/serde", "mail-parser?/serde"]
+rustls-ring = ["client", "pimalaya-stream/rustls-ring", "io-imap?/rustls-ring", "io-jmap?/rustls-ring", "io-smtp?/rustls-ring", "dep:url"]
+rustls-aws = ["client", "pimalaya-stream/rustls-aws", "io-imap?/rustls-aws", "io-jmap?/rustls-aws", "io-smtp?/rustls-aws", "dep:url"]
+native-tls = ["client", "pimalaya-stream/native-tls", "io-imap?/native-tls", "io-jmap?/native-tls", "io-smtp?/native-tls", "dep:url"]
 
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["alloc"] }
 chumsky = { version = "0.13", default-features = false, optional = true }
+gethostname = { version = "1", optional = true }
 io-http = { version = "0.0.3", default-features = false, optional = true }
 io-imap = { version = "0.0.1", default-features = false, optional = true }
 io-jmap = { version = "0.0.1", default-features = false, optional = true }

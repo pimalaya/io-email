@@ -4,7 +4,7 @@
 //! the IDLE + QRESYNC dance, maintains its own UID→flag shadow, and
 //! emits pre-diffed deltas. This module translates each delta into
 //! the shared [`WatchEvent`] surface and threads everything through
-//! the [`crate::coroutine::EmailCoroutine`] trait so the I/O steps
+//! the [`io_imap::coroutine::ImapCoroutine`] trait so the I/O steps
 //! and the domain events ride on the same Yield axis.
 //!
 //! Cooperative shutdown: the caller owns the
@@ -22,6 +22,7 @@ use alloc::{
 use core::sync::atomic::AtomicBool;
 
 use io_imap::{
+    codec::fragmentizer::Fragmentizer,
     coroutine::{ImapCoroutine, ImapCoroutineState},
     types::{flag::Flag as ImapFlag, response::Capability},
     watch::{
@@ -33,7 +34,6 @@ use log::trace;
 use thiserror::Error;
 
 use crate::{
-    coroutine::{EmailBackend, EmailCoroutine, EmailCoroutineArg, EmailCoroutineState},
     event::WatchEvent,
     flag::Flag,
     imap::{
@@ -49,8 +49,6 @@ pub enum ImapWatchMailboxError {
     Watch(#[from] InnerErr),
     #[error("invalid IMAP mailbox `{0}`")]
     InvalidMailbox(String),
-    #[error("coroutine was resumed with the wrong EmailCoroutineArg variant")]
-    InvalidArg,
 }
 
 impl From<InvalidMailboxName> for ImapWatchMailboxError {
@@ -65,8 +63,8 @@ impl From<InvalidMailboxName> for ImapWatchMailboxError {
 /// caller (callback / channel / async stream — driver's choice).
 #[derive(Debug)]
 pub enum ImapWatchMailboxYield {
-    /// Socket: read more bytes and feed them back via
-    /// [`EmailCoroutineArg::Imap::bytes`] on the next resume.
+    /// Socket: read more bytes and feed them back via the `bytes`
+    /// argument on the next resume.
     WantsRead,
     /// Socket: write these bytes; the next resume typically takes
     /// `bytes: None`.
@@ -103,46 +101,6 @@ impl ImapWatchMailbox {
             inner: InnerWatch::new(capabilities, mbox, shutdown)?,
             mailbox: mailbox.into(),
         })
-    }
-}
-
-impl EmailCoroutine for ImapWatchMailbox {
-    type Yield = ImapWatchMailboxYield;
-    type Return = Result<(), ImapWatchMailboxError>;
-
-    const BACKEND: EmailBackend = EmailBackend::Imap;
-
-    fn resume(
-        &mut self,
-        arg: EmailCoroutineArg<'_>,
-    ) -> EmailCoroutineState<Self::Yield, Self::Return> {
-        #[allow(irrefutable_let_patterns)]
-        let EmailCoroutineArg::Imap {
-            fragmentizer,
-            bytes,
-        } = arg
-        else {
-            return EmailCoroutineState::Complete(Err(ImapWatchMailboxError::InvalidArg));
-        };
-
-        match self.inner.resume(fragmentizer, bytes) {
-            ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsRead) => {
-                EmailCoroutineState::Yielded(ImapWatchMailboxYield::WantsRead)
-            }
-            ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsWrite(out)) => {
-                EmailCoroutineState::Yielded(ImapWatchMailboxYield::WantsWrite(out))
-            }
-            ImapCoroutineState::Yielded(ImapMailboxWatchYield::Event(evt)) => {
-                EmailCoroutineState::Yielded(ImapWatchMailboxYield::Event(translate_event(
-                    &self.mailbox,
-                    evt,
-                )))
-            }
-            ImapCoroutineState::Complete(Ok(())) => EmailCoroutineState::Complete(Ok(())),
-            ImapCoroutineState::Complete(Err(err)) => {
-                EmailCoroutineState::Complete(Err(err.into()))
-            }
-        }
     }
 }
 
@@ -185,4 +143,32 @@ fn translate_event(mailbox: &str, evt: ImapMailboxWatchEvent) -> WatchEvent {
 /// uses.
 fn flag_from_imap(flag: ImapFlag<'_>) -> Flag {
     Flag::from_raw(flag.to_string())
+}
+
+impl ImapCoroutine for ImapWatchMailbox {
+    type Yield = ImapWatchMailboxYield;
+    type Return = Result<(), ImapWatchMailboxError>;
+
+    fn resume(
+        &mut self,
+        fragmentizer: &mut Fragmentizer,
+        bytes: Option<&[u8]>,
+    ) -> ImapCoroutineState<Self::Yield, Self::Return> {
+        match self.inner.resume(fragmentizer, bytes) {
+            ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsRead) => {
+                ImapCoroutineState::Yielded(ImapWatchMailboxYield::WantsRead)
+            }
+            ImapCoroutineState::Yielded(ImapMailboxWatchYield::WantsWrite(out)) => {
+                ImapCoroutineState::Yielded(ImapWatchMailboxYield::WantsWrite(out))
+            }
+            ImapCoroutineState::Yielded(ImapMailboxWatchYield::Event(evt)) => {
+                ImapCoroutineState::Yielded(ImapWatchMailboxYield::Event(translate_event(
+                    &self.mailbox,
+                    evt,
+                )))
+            }
+            ImapCoroutineState::Complete(Ok(())) => ImapCoroutineState::Complete(Ok(())),
+            ImapCoroutineState::Complete(Err(err)) => ImapCoroutineState::Complete(Err(err.into())),
+        }
+    }
 }

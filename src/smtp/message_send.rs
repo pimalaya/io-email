@@ -31,10 +31,6 @@ use log::trace;
 use mail_parser::{Address as MailParserAddress, MessageParser};
 use thiserror::Error;
 
-use crate::coroutine::{
-    EmailBackend, EmailCoroutine, EmailCoroutineArg, EmailCoroutineState, SmtpStep,
-};
-
 /// Errors produced by [`SmtpMessageSend`].
 #[derive(Debug, Error)]
 pub enum SmtpMessageSendError {
@@ -48,8 +44,6 @@ pub enum SmtpMessageSendError {
     MissingForwardPaths,
     #[error("invalid email address `{0}` in envelope")]
     InvalidAddress(String),
-    #[error("coroutine was resumed with the wrong EmailCoroutineArg variant")]
-    InvalidArg,
 }
 
 /// I/O-free coroutine running the RFC 5321 mail transaction over an
@@ -105,36 +99,6 @@ impl SmtpMessageSend {
     }
 }
 
-impl EmailCoroutine for SmtpMessageSend {
-    type Yield = SmtpStep;
-    type Return = Result<(), SmtpMessageSendError>;
-
-    const BACKEND: EmailBackend = EmailBackend::Smtp;
-
-    fn resume(
-        &mut self,
-        arg: EmailCoroutineArg<'_>,
-    ) -> EmailCoroutineState<Self::Yield, Self::Return> {
-        #[allow(irrefutable_let_patterns)]
-        let EmailCoroutineArg::Smtp { bytes } = arg else {
-            return EmailCoroutineState::Complete(Err(SmtpMessageSendError::InvalidArg));
-        };
-
-        match self.inner.resume(bytes) {
-            SmtpCoroutineState::Complete(Ok(())) => EmailCoroutineState::Complete(Ok(())),
-            SmtpCoroutineState::Yielded(SmtpYield::WantsRead) => {
-                EmailCoroutineState::Yielded(SmtpStep::WantsRead)
-            }
-            SmtpCoroutineState::Yielded(SmtpYield::WantsWrite(out)) => {
-                EmailCoroutineState::Yielded(SmtpStep::WantsWrite(out))
-            }
-            SmtpCoroutineState::Complete(Err(err)) => {
-                EmailCoroutineState::Complete(Err(err.into()))
-            }
-        }
-    }
-}
-
 /// Flattens a mail-parser address group into a list of bare
 /// `local-part@domain` strings.
 fn addresses(addrs: &MailParserAddress<'_>) -> Vec<String> {
@@ -153,6 +117,18 @@ fn addresses(addrs: &MailParserAddress<'_>) -> Vec<String> {
 /// empty. Used to pick the lone `From:` envelope sender.
 fn first_address(addrs: &MailParserAddress<'_>) -> Option<String> {
     addresses(addrs).into_iter().next()
+}
+
+impl SmtpCoroutine for SmtpMessageSend {
+    type Yield = SmtpYield;
+    type Return = Result<(), SmtpMessageSendError>;
+
+    fn resume(&mut self, bytes: Option<&[u8]>) -> SmtpCoroutineState<Self::Yield, Self::Return> {
+        match self.inner.resume(bytes) {
+            SmtpCoroutineState::Yielded(y) => SmtpCoroutineState::Yielded(y),
+            SmtpCoroutineState::Complete(r) => SmtpCoroutineState::Complete(r.map_err(Into::into)),
+        }
+    }
 }
 
 /// Parses `local-part@domain` into a static-lifetime [`SmtpMailbox`].

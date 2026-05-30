@@ -3,6 +3,7 @@
 use alloc::string::String;
 
 use io_imap::{
+    codec::fragmentizer::Fragmentizer,
     coroutine::{ImapCoroutine, ImapCoroutineState, ImapYield},
     rfc3501::create::{
         ImapMailboxCreate as InnerImapMailboxCreate,
@@ -12,10 +13,7 @@ use io_imap::{
 use log::trace;
 use thiserror::Error;
 
-use crate::{
-    coroutine::{EmailBackend, EmailCoroutine, EmailCoroutineArg, EmailCoroutineState, ImapStep},
-    imap::convert::{InvalidMailboxName, parse_mailbox},
-};
+use crate::imap::convert::{InvalidMailboxName, parse_mailbox};
 
 /// Errors produced by [`ImapMailboxCreate`].
 #[derive(Debug, Error)]
@@ -24,8 +22,6 @@ pub enum ImapMailboxCreateError {
     Create(#[from] InnerImapMailboxCreateError),
     #[error("invalid IMAP mailbox `{0}`")]
     InvalidMailbox(String),
-    #[error("coroutine was resumed with the wrong EmailCoroutineArg variant")]
-    InvalidArg,
 }
 
 impl From<InvalidMailboxName> for ImapMailboxCreateError {
@@ -49,36 +45,18 @@ impl ImapMailboxCreate {
     }
 }
 
-impl EmailCoroutine for ImapMailboxCreate {
-    type Yield = ImapStep;
+impl ImapCoroutine for ImapMailboxCreate {
+    type Yield = ImapYield;
     type Return = Result<(), ImapMailboxCreateError>;
-
-    const BACKEND: EmailBackend = EmailBackend::Imap;
 
     fn resume(
         &mut self,
-        arg: EmailCoroutineArg<'_>,
-    ) -> EmailCoroutineState<Self::Yield, Self::Return> {
-        #[allow(irrefutable_let_patterns)]
-        let EmailCoroutineArg::Imap {
-            fragmentizer,
-            bytes,
-        } = arg
-        else {
-            return EmailCoroutineState::Complete(Err(ImapMailboxCreateError::InvalidArg));
-        };
-
+        fragmentizer: &mut Fragmentizer,
+        bytes: Option<&[u8]>,
+    ) -> ImapCoroutineState<Self::Yield, Self::Return> {
         match self.inner.resume(fragmentizer, bytes) {
-            ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
-                EmailCoroutineState::Yielded(ImapStep::WantsRead)
-            }
-            ImapCoroutineState::Yielded(ImapYield::WantsWrite(out)) => {
-                EmailCoroutineState::Yielded(ImapStep::WantsWrite(out))
-            }
-            ImapCoroutineState::Complete(Ok(())) => EmailCoroutineState::Complete(Ok(())),
-            ImapCoroutineState::Complete(Err(err)) => {
-                EmailCoroutineState::Complete(Err(err.into()))
-            }
+            ImapCoroutineState::Yielded(y) => ImapCoroutineState::Yielded(y),
+            ImapCoroutineState::Complete(r) => ImapCoroutineState::Complete(r.map_err(Into::into)),
         }
     }
 }

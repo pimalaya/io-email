@@ -28,10 +28,7 @@ use log::trace;
 use secrecy::SecretString;
 use thiserror::Error;
 
-use crate::{
-    coroutine::{EmailBackend, EmailCoroutine, EmailCoroutineArg, EmailCoroutineState, JmapStep},
-    jmap::convert::find_mailbox_id,
-};
+use crate::jmap::convert::find_mailbox_id;
 
 /// Errors produced by [`JmapMessageCopy`].
 #[derive(Debug, Error)]
@@ -44,8 +41,6 @@ pub enum JmapMessageCopyError {
     NotFound(String),
     #[error("Email/set returned per-id failures: {0:?}")]
     NotUpdated(Vec<String>),
-    #[error("coroutine was resumed with the wrong EmailCoroutineArg variant")]
-    InvalidArg,
     #[error("coroutine was resumed after completion")]
     ResumedAfterDone,
 }
@@ -90,26 +85,22 @@ impl JmapMessageCopy {
     }
 }
 
-impl EmailCoroutine for JmapMessageCopy {
-    type Yield = JmapStep;
+enum State {
+    Resolving(InnerQuery),
+    Patching(InnerSet),
+    Done,
+}
+
+impl JmapCoroutine for JmapMessageCopy {
+    type Yield = JmapYield;
     type Return = Result<(), JmapMessageCopyError>;
 
-    const BACKEND: EmailBackend = EmailBackend::Jmap;
-
-    fn resume(
-        &mut self,
-        arg: EmailCoroutineArg<'_>,
-    ) -> EmailCoroutineState<Self::Yield, Self::Return> {
-        #[allow(irrefutable_let_patterns)]
-        let EmailCoroutineArg::Jmap { bytes } = arg else {
-            return EmailCoroutineState::Complete(Err(JmapMessageCopyError::InvalidArg));
-        };
-
+    fn resume(&mut self, bytes: Option<&[u8]>) -> JmapCoroutineState<Self::Yield, Self::Return> {
         match mem::replace(&mut self.state, State::Done) {
             State::Resolving(mut query) => match query.resume(bytes) {
                 JmapCoroutineState::Complete(Ok(ok)) => {
                     let Some(target_id) = find_mailbox_id(&ok.mailboxes, &self.target_name) else {
-                        return EmailCoroutineState::Complete(Err(JmapMessageCopyError::NotFound(
+                        return JmapCoroutineState::Complete(Err(JmapMessageCopyError::NotFound(
                             self.target_name.clone(),
                         )));
                     };
@@ -119,54 +110,40 @@ impl EmailCoroutine for JmapMessageCopy {
                     }
                     let set = match InnerSet::new(&self.session, &self.http_auth, args) {
                         Ok(set) => set,
-                        Err(err) => return EmailCoroutineState::Complete(Err(err.into())),
+                        Err(err) => return JmapCoroutineState::Complete(Err(err.into())),
                     };
                     self.state = State::Patching(set);
-                    self.resume(EmailCoroutineArg::Jmap { bytes: None })
+                    JmapCoroutine::resume(self, None)
                 }
-                JmapCoroutineState::Yielded(JmapYield::WantsRead) => {
+                JmapCoroutineState::Yielded(y) => {
                     self.state = State::Resolving(query);
-                    EmailCoroutineState::Yielded(JmapStep::WantsRead)
-                }
-                JmapCoroutineState::Yielded(JmapYield::WantsWrite(out)) => {
-                    self.state = State::Resolving(query);
-                    EmailCoroutineState::Yielded(JmapStep::WantsWrite(out))
+                    JmapCoroutineState::Yielded(y)
                 }
                 JmapCoroutineState::Complete(Err(err)) => {
-                    EmailCoroutineState::Complete(Err(err.into()))
+                    JmapCoroutineState::Complete(Err(err.into()))
                 }
             },
             State::Patching(mut set) => match set.resume(bytes) {
                 JmapCoroutineState::Complete(Ok(ok)) => {
                     if ok.not_updated.is_empty() {
-                        EmailCoroutineState::Complete(Ok(()))
+                        JmapCoroutineState::Complete(Ok(()))
                     } else {
-                        EmailCoroutineState::Complete(Err(JmapMessageCopyError::NotUpdated(
+                        JmapCoroutineState::Complete(Err(JmapMessageCopyError::NotUpdated(
                             ok.not_updated.into_keys().collect(),
                         )))
                     }
                 }
-                JmapCoroutineState::Yielded(JmapYield::WantsRead) => {
+                JmapCoroutineState::Yielded(y) => {
                     self.state = State::Patching(set);
-                    EmailCoroutineState::Yielded(JmapStep::WantsRead)
-                }
-                JmapCoroutineState::Yielded(JmapYield::WantsWrite(out)) => {
-                    self.state = State::Patching(set);
-                    EmailCoroutineState::Yielded(JmapStep::WantsWrite(out))
+                    JmapCoroutineState::Yielded(y)
                 }
                 JmapCoroutineState::Complete(Err(err)) => {
-                    EmailCoroutineState::Complete(Err(err.into()))
+                    JmapCoroutineState::Complete(Err(err.into()))
                 }
             },
             State::Done => {
-                EmailCoroutineState::Complete(Err(JmapMessageCopyError::ResumedAfterDone))
+                JmapCoroutineState::Complete(Err(JmapMessageCopyError::ResumedAfterDone))
             }
         }
     }
-}
-
-enum State {
-    Resolving(InnerQuery),
-    Patching(InnerSet),
-    Done,
 }

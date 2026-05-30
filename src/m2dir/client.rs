@@ -1,232 +1,454 @@
-//! m2dir backend implementations of the [`EmailClientStd`] private
-//! dispatch methods.
+//! Std-blocking m2dir client.
+//!
+//! Wraps an inner [`InnerM2dirClient`] and pumps any standard-shape
+//! [`M2dirCoroutine`] (Yield = [`M2dirYield`]) against the local
+//! filesystem via [`std::fs`].
 
 use alloc::{
-    collections::BTreeSet,
-    string::{String, ToString},
+    collections::{BTreeMap, BTreeSet},
+    string::String,
     vec::Vec,
 };
-
-use io_m2dir::{entry::M2dirFullEntry, flag::M2dirFlags as M2Flags};
-use mail_parser::MessageParser;
-
-use crate::{
-    client::{EmailClientStd, EmailClientStdError},
-    envelope::Envelope,
-    flag::{Flag, FlagOp},
-    m2dir::convert::{envelope_from, flag_to_meta_line, mailbox_from, open_m2dir, paginate},
-    mailbox::Mailbox,
+use std::{
+    collections::hash_map::RandomState,
+    fs,
+    hash::{BuildHasher, Hasher},
+    io,
+    path::{Path, PathBuf},
+    process,
 };
 
-impl EmailClientStd {
-    /// Registers the m2dir backend. See [`Self::with_imap`] for the
-    /// ordering rule.
-    pub fn with_m2dir(mut self, client: io_m2dir::client::M2dirClient) -> Self {
-        self.m2dir = Some(client);
+use io_m2dir::{client::M2dirClient as InnerM2dirClient, coroutine::*, path::M2dirPath};
+use log::trace;
+use thiserror::Error;
 
-        if !self.order.contains(&crate::client::BackendKind::M2dir) {
-            self.order.push(crate::client::BackendKind::M2dir);
+use crate::{
+    envelope::Envelope,
+    flag::{Flag, FlagOp},
+    m2dir::{
+        envelope_list::{M2dirEnvelopeList, M2dirEnvelopeListError},
+        flag_store::{M2dirFlagStore, M2dirFlagStoreError},
+        mailbox_create::{M2dirMailboxCreate, M2dirMailboxCreateError},
+        mailbox_delete::{M2dirMailboxDelete, M2dirMailboxDeleteError},
+        mailbox_list::{M2dirMailboxList, M2dirMailboxListError},
+        message_add::{M2dirMessageAdd, M2dirMessageAddError},
+        message_copy::{M2dirMessageCopy, M2dirMessageCopyError},
+        message_delete::{M2dirMessageDelete, M2dirMessageDeleteError},
+        message_get::{M2dirMessageGet, M2dirMessageGetError},
+        message_move::{M2dirMessageMove, M2dirMessageMoveError},
+    },
+    mailbox::Mailbox,
+};
+#[cfg(feature = "search")]
+use crate::{
+    m2dir::envelope_search::{M2dirEnvelopeSearch, M2dirEnvelopeSearchError},
+    search::query::SearchEmailsQuery,
+};
+
+/// Errors surfaced by [`M2dirClient`] while running a coroutine.
+///
+/// One variant per shared-API m2dir coroutine.
+#[derive(Debug, Error)]
+pub enum M2dirClientError {
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    #[error(transparent)]
+    MailboxList(#[from] M2dirMailboxListError),
+    #[error(transparent)]
+    EnvelopeList(#[from] M2dirEnvelopeListError),
+    #[cfg(feature = "search")]
+    #[error(transparent)]
+    EnvelopeSearch(#[from] M2dirEnvelopeSearchError),
+    #[error(transparent)]
+    FlagStore(#[from] M2dirFlagStoreError),
+    #[error(transparent)]
+    MailboxCreate(#[from] M2dirMailboxCreateError),
+    #[error(transparent)]
+    MailboxDelete(#[from] M2dirMailboxDeleteError),
+    #[error(transparent)]
+    MessageAdd(#[from] M2dirMessageAddError),
+    #[error(transparent)]
+    MessageCopy(#[from] M2dirMessageCopyError),
+    #[error(transparent)]
+    MessageDelete(#[from] M2dirMessageDeleteError),
+    #[error(transparent)]
+    MessageGet(#[from] M2dirMessageGetError),
+    #[error(transparent)]
+    MessageMove(#[from] M2dirMessageMoveError),
+    #[error(transparent)]
+    Inner(#[from] io_m2dir::client::M2dirClientError),
+}
+
+/// Light m2dir client wrapping a filesystem root.
+///
+/// The shared root lives on [`Self::inner`]; m2dir has no extra
+/// per-session knobs (no auto_select, no capability list).
+pub struct M2dirClient {
+    pub inner: InnerM2dirClient,
+}
+
+impl M2dirClient {
+    /// Wraps a fresh inner client rooted at `root`. No filesystem
+    /// check is performed at construction time.
+    pub fn new(root: impl Into<M2dirPath>) -> Self {
+        Self {
+            inner: InnerM2dirClient::new(root),
         }
-
-        self
     }
 
-    /// Borrows the underlying m2dir client when registered. The
-    /// shared dispatcher has no diff equivalent for filesystem-backed
-    /// stores: callers needing change detection (sync) build their
-    /// own manifest format on top of this and stay protocol-agnostic
-    /// for the IMAP / JMAP arms.
-    pub fn as_m2dir(&self) -> Option<&io_m2dir::client::M2dirClient> {
-        self.m2dir.as_ref()
+    /// Pumps any standard-shape m2dir coroutine
+    /// (`Yield = M2dirYield`, `Return = Result<T, E>`) against the
+    /// local filesystem until it terminates.
+    ///
+    /// Duplicates the body of [`InnerM2dirClient::run`] so error
+    /// variants route through [`M2dirClientError`] directly.
+    pub fn run<C, T, E>(&self, mut coroutine: C) -> Result<T, M2dirClientError>
+    where
+        C: M2dirCoroutine<Yield = M2dirYield, Return = Result<T, E>>,
+        M2dirClientError: From<E>,
+    {
+        let mut arg: Option<M2dirArg> = None;
+
+        loop {
+            match coroutine.resume(arg.take()) {
+                M2dirCoroutineState::Complete(Ok(out)) => return Ok(out),
+                M2dirCoroutineState::Complete(Err(err)) => return Err(err.into()),
+                M2dirCoroutineState::Yielded(M2dirYield::WantsPid) => {
+                    arg = Some(M2dirArg::Pid(process::id()));
+                }
+                M2dirCoroutineState::Yielded(M2dirYield::WantsRandom { len }) => {
+                    arg = Some(M2dirArg::Random(random_bytes(len)));
+                }
+                M2dirCoroutineState::Yielded(M2dirYield::WantsFileExists(paths)) => {
+                    arg = Some(M2dirArg::FileExists(file_exists(paths)));
+                }
+                M2dirCoroutineState::Yielded(M2dirYield::WantsDirRead(paths)) => {
+                    arg = Some(M2dirArg::DirRead(read_dirs(paths)?));
+                }
+                M2dirCoroutineState::Yielded(M2dirYield::WantsDirCreate(paths)) => {
+                    create_dirs(paths)?;
+                    arg = Some(M2dirArg::DirCreate);
+                }
+                M2dirCoroutineState::Yielded(M2dirYield::WantsDirRemove(paths)) => {
+                    remove_dirs(paths)?;
+                    arg = Some(M2dirArg::DirRemove);
+                }
+                M2dirCoroutineState::Yielded(M2dirYield::WantsFileRead(paths)) => {
+                    arg = Some(M2dirArg::FileRead(read_files_tolerant(paths)?));
+                }
+                M2dirCoroutineState::Yielded(M2dirYield::WantsFileCreate(files)) => {
+                    write_files(files)?;
+                    arg = Some(M2dirArg::FileCreate);
+                }
+                M2dirCoroutineState::Yielded(M2dirYield::WantsFileRemove(paths)) => {
+                    remove_files_tolerant(paths)?;
+                    arg = Some(M2dirArg::FileRemove);
+                }
+                M2dirCoroutineState::Yielded(M2dirYield::WantsRename(pairs)) => {
+                    rename_paths(pairs)?;
+                    arg = Some(M2dirArg::Rename);
+                }
+            }
+        }
     }
 
-    /// Mutable variant of [`Self::as_m2dir`].
-    pub fn as_m2dir_mut(&mut self) -> Option<&mut io_m2dir::client::M2dirClient> {
-        self.m2dir.as_mut()
+    /// Lists every m2dir under the store root. `with_counts` is
+    /// accepted for symmetry with the other backends; surfacing
+    /// totals/unread needs a follow-up walk and is currently a no-op.
+    pub fn list_mailboxes(&self, with_counts: bool) -> Result<Vec<Mailbox>, M2dirClientError> {
+        self.run(M2dirMailboxList::new(
+            PathBuf::from(self.inner.root().as_str()),
+            with_counts,
+        ))
     }
 
-    pub(crate) fn m2dir_list_mailboxes(&mut self) -> Result<Vec<Mailbox>, EmailClientStdError> {
-        let client = self.m2dir.as_mut().expect("m2dir slot registered");
-        let m2dirs = client.list_mailboxes()?;
-        let mut mailboxes: Vec<_> = m2dirs.iter().map(mailbox_from).collect();
-        mailboxes.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(mailboxes)
-    }
-
-    pub(crate) fn m2dir_list_envelopes_par(
-        &mut self,
+    /// Lists envelopes from `mailbox`. `page = None` and
+    /// `page_size = None` fetch the whole mailbox; envelopes are
+    /// sorted by date descending.
+    pub fn list_envelopes(
+        &self,
         mailbox: &str,
         page: Option<u32>,
         page_size: Option<u32>,
         with_attachment: bool,
-    ) -> Result<Vec<Envelope>, EmailClientStdError> {
-        let client = self.m2dir.as_mut().expect("m2dir slot registered");
-
-        let m2dir = open_m2dir(client, mailbox)?;
-        let entries = client.list_entries(m2dir.clone())?;
-        let loaded = client.read_entries_par(&m2dir, &entries)?;
-        let envelopes = build_envelopes(&loaded, with_attachment)?;
-        Ok(paginate(envelopes, page, page_size))
+    ) -> Result<Vec<Envelope>, M2dirClientError> {
+        self.run(M2dirEnvelopeList::new(
+            PathBuf::from(self.inner.root().as_str()),
+            mailbox,
+            page,
+            page_size,
+            with_attachment,
+        )?)
     }
 
-    pub(crate) fn m2dir_store_flags(
-        &mut self,
+    /// Searches envelopes in `mailbox` against the shared query.
+    /// Filtering and sorting happen client-side after a full scan.
+    #[cfg(feature = "search")]
+    pub fn search_envelopes(
+        &self,
+        mailbox: &str,
+        query: Option<&SearchEmailsQuery>,
+        page: Option<u32>,
+        page_size: Option<u32>,
+        with_attachment: bool,
+    ) -> Result<Vec<Envelope>, M2dirClientError> {
+        self.run(M2dirEnvelopeSearch::new(
+            PathBuf::from(self.inner.root().as_str()),
+            mailbox,
+            query,
+            page,
+            page_size,
+            with_attachment,
+        )?)
+    }
+
+    /// Adds, sets, or removes `flags` on every id by rewriting each
+    /// `.meta/<id>.flags` sidecar.
+    pub fn store_flags(
+        &self,
         mailbox: &str,
         ids: &[&str],
         flags: &[Flag],
         op: FlagOp,
-    ) -> Result<(), EmailClientStdError> {
-        let client = self.m2dir.as_mut().expect("m2dir slot registered");
-
-        let m2dir = open_m2dir(client, mailbox)?;
-        let meta_flags: M2Flags = flags.iter().map(flag_to_meta_line).collect();
-
-        for id in ids {
-            match op {
-                FlagOp::Add => {
-                    client.add_flags(&m2dir, *id, meta_flags.clone())?;
-                }
-                FlagOp::Set => {
-                    client.set_flags(&m2dir, *id, meta_flags.clone())?;
-                }
-                FlagOp::Remove => {
-                    client.remove_flags(&m2dir, *id, meta_flags.clone())?;
-                }
-            }
-        }
-
-        Ok(())
+    ) -> Result<(), M2dirClientError> {
+        self.run(M2dirFlagStore::new(
+            PathBuf::from(self.inner.root().as_str()),
+            mailbox,
+            ids,
+            flags,
+            op,
+        )?)
     }
 
-    pub(crate) fn m2dir_get_message(
-        &mut self,
-        mailbox: &str,
-        id: &str,
-    ) -> Result<Vec<u8>, EmailClientStdError> {
-        let client = self.m2dir.as_mut().expect("m2dir slot registered");
-        let m2dir = open_m2dir(client, mailbox)?;
-        let (_, bytes) = client.get(m2dir, id)?;
-        Ok(bytes)
+    /// Reads one message's raw bytes by id, validating the checksum
+    /// embedded in its filename.
+    pub fn get_message(&self, mailbox: &str, id: &str) -> Result<Vec<u8>, M2dirClientError> {
+        self.run(M2dirMessageGet::new(
+            PathBuf::from(self.inner.root().as_str()),
+            mailbox,
+            id,
+        )?)
     }
 
-    pub(crate) fn m2dir_add_message(
-        &mut self,
+    /// Appends `raw` to `mailbox`, then persists `flags` as the
+    /// `.meta/<id>.flags` sidecar when non-empty. Returns the minted
+    /// entry id.
+    pub fn add_message(
+        &self,
         mailbox: &str,
         flags: &[Flag],
         raw: Vec<u8>,
-    ) -> Result<String, EmailClientStdError> {
-        let client = self.m2dir.as_mut().expect("m2dir slot registered");
-
-        let m2dir = open_m2dir(client, mailbox)?;
-        let entry = client.store(m2dir.clone(), raw)?;
-        let id = entry.id().to_string();
-
-        if !flags.is_empty() {
-            let meta_flags: M2Flags = flags.iter().map(flag_to_meta_line).collect();
-            client.set_flags(&m2dir, &id, meta_flags)?;
-        }
-
-        Ok(id)
+    ) -> Result<String, M2dirClientError> {
+        self.run(M2dirMessageAdd::new(
+            PathBuf::from(self.inner.root().as_str()),
+            mailbox,
+            flags,
+            raw,
+        )?)
     }
 
-    pub(crate) fn m2dir_create_mailbox(&mut self, name: &str) -> Result<(), EmailClientStdError> {
-        let client = self.m2dir.as_mut().expect("m2dir slot registered");
-        let _ = client.create_mailbox(name)?;
-        Ok(())
+    /// Creates `name` as a new m2dir mailbox: the folder, the
+    /// `.m2dir` marker and the `.meta` sub-directory.
+    pub fn create_mailbox(&self, name: &str) -> Result<(), M2dirClientError> {
+        self.run(M2dirMailboxCreate::new(
+            PathBuf::from(self.inner.root().as_str()),
+            name,
+        )?)
     }
 
-    pub(crate) fn m2dir_delete_mailbox(&mut self, name: &str) -> Result<(), EmailClientStdError> {
-        let client = self.m2dir.as_mut().expect("m2dir slot registered");
-        let m2dir = open_m2dir(client, name)?;
-        client.delete_mailbox(m2dir.path().clone())?;
-        Ok(())
+    /// Recursively removes the m2dir at `name`.
+    pub fn delete_mailbox(&self, name: &str) -> Result<(), M2dirClientError> {
+        self.run(M2dirMailboxDelete::new(
+            PathBuf::from(self.inner.root().as_str()),
+            name,
+        )?)
     }
 
-    pub(crate) fn m2dir_delete_message(
-        &mut self,
-        mailbox: &str,
-        id: &str,
-    ) -> Result<(), EmailClientStdError> {
-        let client = self.m2dir.as_mut().expect("m2dir slot registered");
-        let m2dir = open_m2dir(client, mailbox)?;
-        client.delete_message(m2dir, id)?;
-        Ok(())
+    /// Removes the entry `id` and every matching `.meta/<id>*` file.
+    pub fn delete_message(&self, mailbox: &str, id: &str) -> Result<(), M2dirClientError> {
+        self.run(M2dirMessageDelete::new(
+            PathBuf::from(self.inner.root().as_str()),
+            mailbox,
+            id,
+        )?)
     }
 
-    pub(crate) fn m2dir_copy_messages(
-        &mut self,
+    /// Copies every id from `from` to `to`. Flag sidecars are not
+    /// propagated; callers add flags explicitly after the copy when
+    /// needed.
+    pub fn copy_messages(
+        &self,
         from: &str,
         to: &str,
         ids: &[&str],
-    ) -> Result<(), EmailClientStdError> {
-        let client = self.m2dir.as_mut().expect("m2dir slot registered");
-
-        let src = open_m2dir(client, from)?;
-        let dst = open_m2dir(client, to)?;
-
-        for id in ids {
-            let (_, bytes) = client.get(src.clone(), *id)?;
-            let flags = client.read_flags(&src, *id)?;
-            let entry = client.store(dst.clone(), bytes)?;
-            if !flags.is_empty() {
-                client.set_flags(&dst, entry.id(), flags)?;
-            }
-        }
-
-        Ok(())
+    ) -> Result<(), M2dirClientError> {
+        self.run(M2dirMessageCopy::new(
+            PathBuf::from(self.inner.root().as_str()),
+            from,
+            to,
+            ids,
+        )?)
     }
 
-    pub(crate) fn m2dir_move_messages(
-        &mut self,
+    /// Moves every id from `from` to `to`. Flag sidecars are not
+    /// propagated; callers add flags explicitly after the move when
+    /// needed.
+    pub fn move_messages(
+        &self,
         from: &str,
         to: &str,
         ids: &[&str],
-    ) -> Result<(), EmailClientStdError> {
-        let client = self.m2dir.as_mut().expect("m2dir slot registered");
-
-        let src = open_m2dir(client, from)?;
-        let dst = open_m2dir(client, to)?;
-
-        for id in ids {
-            let (_, bytes) = client.get(src.clone(), *id)?;
-            let flags = client.read_flags(&src, *id)?;
-            let entry = client.store(dst.clone(), bytes)?;
-            if !flags.is_empty() {
-                client.set_flags(&dst, entry.id(), flags)?;
-            }
-            client.delete_message(src.clone(), *id)?;
-        }
-
-        Ok(())
+    ) -> Result<(), M2dirClientError> {
+        self.run(M2dirMessageMove::new(
+            PathBuf::from(self.inner.root().as_str()),
+            from,
+            to,
+            ids,
+        )?)
     }
 }
 
-fn build_envelopes(
-    loaded: &BTreeSet<M2dirFullEntry>,
-    with_attachment: bool,
-) -> Result<Vec<Envelope>, EmailClientStdError> {
-    let parser = MessageParser::default();
-    let mut envelopes: Vec<Envelope> = Vec::with_capacity(loaded.len());
+// ---- Filesystem helpers (duplicated from io_m2dir::client) ----
 
-    for full in loaded {
-        // Header-only parse when attachment detection is not
-        // requested: skips body decoding (quoted-printable, base64,
-        // MIME tree walk) entirely. Subject / from / to / date come
-        // from headers; `size` is the raw byte length.
-        let parsed = if with_attachment {
-            parser.parse(full.contents())
-        } else {
-            parser.parse_headers(full.contents())
-        }
-        .ok_or(EmailClientStdError::OperationFailed("parse m2dir message"))?;
+fn create_dirs(paths: BTreeSet<M2dirPath>) -> Result<(), io::Error> {
+    for path in paths {
+        trace!("create_dir_all {path}");
+        fs::create_dir_all(path.as_str())?;
+    }
+    Ok(())
+}
 
-        let mut envelope = envelope_from(full.entry(), full.flags(), &parsed);
-        if with_attachment {
-            envelope.has_attachment = Some(parsed.attachment_count() > 0);
+fn remove_dirs(paths: BTreeSet<M2dirPath>) -> Result<(), io::Error> {
+    for path in paths {
+        trace!("remove_dir_all {path}");
+        fs::remove_dir_all(path.as_str())?;
+    }
+    Ok(())
+}
+
+fn write_files(files: BTreeMap<M2dirPath, Vec<u8>>) -> Result<(), io::Error> {
+    for (path, contents) in files {
+        trace!("write {path} ({} bytes)", contents.len());
+
+        if let Some(parent) = Path::new(path.as_str()).parent() {
+            fs::create_dir_all(parent)?;
         }
-        envelopes.push(envelope);
+        fs::write(path.as_str(), &contents)?;
+    }
+    Ok(())
+}
+
+fn remove_files_tolerant(paths: BTreeSet<M2dirPath>) -> Result<(), io::Error> {
+    for path in paths {
+        trace!("remove_file (tolerant) {path}");
+        match fs::remove_file(path.as_str()) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
+fn read_dirs(
+    paths: BTreeSet<M2dirPath>,
+) -> Result<BTreeMap<M2dirPath, BTreeSet<M2dirPath>>, io::Error> {
+    let mut entries = BTreeMap::new();
+
+    for path in paths {
+        trace!("read_dir {path}");
+
+        let mut names = BTreeSet::new();
+        match fs::read_dir(path.as_str()) {
+            Ok(iter) => {
+                for entry in iter {
+                    let entry = entry?;
+                    names.insert(normalize_path(entry.path()));
+                }
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) if err.kind() == io::ErrorKind::NotADirectory => {}
+            Err(err) => return Err(err),
+        }
+
+        entries.insert(path, names);
     }
 
-    envelopes.sort_by(|a, b| b.date.cmp(&a.date));
-    Ok(envelopes)
+    Ok(entries)
+}
+
+fn read_files_tolerant(
+    paths: BTreeSet<M2dirPath>,
+) -> Result<BTreeMap<M2dirPath, Vec<u8>>, io::Error> {
+    let mut contents = BTreeMap::new();
+
+    for path in paths {
+        trace!("read_file (tolerant) {path}");
+        match fs::read(path.as_str()) {
+            Ok(bytes) => {
+                contents.insert(path, bytes);
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                contents.insert(path, Vec::new());
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    Ok(contents)
+}
+
+fn rename_paths(pairs: Vec<(M2dirPath, M2dirPath)>) -> Result<(), io::Error> {
+    for (from, to) in pairs {
+        trace!("rename {from} -> {to}");
+        fs::rename(from.as_str(), to.as_str())?;
+    }
+    Ok(())
+}
+
+fn file_exists(paths: BTreeSet<M2dirPath>) -> BTreeMap<M2dirPath, bool> {
+    let mut out = BTreeMap::new();
+    for path in paths {
+        let exists = fs::metadata(path.as_str())
+            .map(|m| m.is_file())
+            .unwrap_or(false);
+        trace!("file_exists {path}: {exists}");
+        out.insert(path, exists);
+    }
+    out
+}
+
+fn normalize_path(path: PathBuf) -> M2dirPath {
+    let s = path.to_string_lossy().into_owned();
+    #[cfg(windows)]
+    let s = s.replace('\\', "/");
+    M2dirPath::new(s)
+}
+
+/// Generates `len` pseudo-random bytes seeded from [`RandomState`],
+/// iterated via xorshift64*. Mirrors io-m2dir's own helper.
+fn random_bytes(len: usize) -> Vec<u8> {
+    let mut state = RandomState::new().build_hasher().finish();
+    if state == 0 {
+        state = 0xdeadbeef;
+    }
+
+    let mut out = Vec::with_capacity(len);
+    let mut buf = 0u64;
+    let mut i = 8;
+
+    while out.len() < len {
+        if i == 8 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            buf = state;
+            i = 0;
+        }
+        out.push(buf as u8);
+        buf >>= 8;
+        i += 1;
+    }
+
+    out
 }

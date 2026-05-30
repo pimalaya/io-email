@@ -25,18 +25,13 @@ use log::trace;
 use secrecy::SecretString;
 use thiserror::Error;
 
-use crate::{
-    coroutine::{EmailBackend, EmailCoroutine, EmailCoroutineArg, EmailCoroutineState, JmapStep},
-    mailbox::Mailbox,
-};
+use crate::mailbox::Mailbox;
 
 /// Errors produced by [`JmapMailboxList`].
 #[derive(Debug, Error)]
 pub enum JmapMailboxListError {
     #[error(transparent)]
     Query(#[from] JmapMailboxQueryError),
-    #[error("coroutine was resumed with the wrong EmailCoroutineArg variant")]
-    InvalidArg,
 }
 
 /// I/O-free coroutine listing every JMAP mailbox visible to the
@@ -82,43 +77,6 @@ impl JmapMailboxList {
     }
 }
 
-impl EmailCoroutine for JmapMailboxList {
-    const BACKEND: EmailBackend = EmailBackend::Jmap;
-
-    type Yield = JmapStep;
-    type Return = Result<Vec<Mailbox>, JmapMailboxListError>;
-
-    // NOTE: when JMAP is the only enabled backend, EmailCoroutineArg
-    // has a single variant so the destructure below is irrefutable
-    // and the `else` arm is dead. It comes alive (and the lint goes
-    // quiet on its own) as soon as a second backend rejoins.
-    fn resume(
-        &mut self,
-        arg: EmailCoroutineArg<'_>,
-    ) -> EmailCoroutineState<Self::Yield, Self::Return> {
-        #[allow(irrefutable_let_patterns)]
-        let EmailCoroutineArg::Jmap { bytes } = arg else {
-            return EmailCoroutineState::Complete(Err(JmapMailboxListError::InvalidArg));
-        };
-
-        match self.inner.resume(bytes) {
-            JmapCoroutineState::Complete(Ok(JmapMailboxQueryOutput { mailboxes, .. })) => {
-                let mailboxes = mailboxes.into_iter().map(mailbox_from).collect();
-                EmailCoroutineState::Complete(Ok(mailboxes))
-            }
-            JmapCoroutineState::Yielded(JmapYield::WantsRead) => {
-                EmailCoroutineState::Yielded(JmapStep::WantsRead)
-            }
-            JmapCoroutineState::Yielded(JmapYield::WantsWrite(bytes)) => {
-                EmailCoroutineState::Yielded(JmapStep::WantsWrite(bytes))
-            }
-            JmapCoroutineState::Complete(Err(err)) => {
-                EmailCoroutineState::Complete(Err(err.into()))
-            }
-        }
-    }
-}
-
 /// Converts one JMAP `Mailbox` object into the shared [`Mailbox`]
 /// shape.
 ///
@@ -133,5 +91,21 @@ fn mailbox_from(mailbox: JmapMailbox) -> Mailbox {
         name: mailbox.name.unwrap_or_default(),
         total: Some(u64::from(mailbox.total_emails)),
         unread: Some(u64::from(mailbox.unread_emails)),
+    }
+}
+
+impl JmapCoroutine for JmapMailboxList {
+    type Yield = JmapYield;
+    type Return = Result<Vec<Mailbox>, JmapMailboxListError>;
+
+    fn resume(&mut self, bytes: Option<&[u8]>) -> JmapCoroutineState<Self::Yield, Self::Return> {
+        match self.inner.resume(bytes) {
+            JmapCoroutineState::Yielded(y) => JmapCoroutineState::Yielded(y),
+            JmapCoroutineState::Complete(Ok(JmapMailboxQueryOutput { mailboxes, .. })) => {
+                let mailboxes = mailboxes.into_iter().map(mailbox_from).collect();
+                JmapCoroutineState::Complete(Ok(mailboxes))
+            }
+            JmapCoroutineState::Complete(Err(err)) => JmapCoroutineState::Complete(Err(err.into())),
+        }
     }
 }

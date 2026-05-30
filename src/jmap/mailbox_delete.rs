@@ -27,10 +27,7 @@ use log::trace;
 use secrecy::SecretString;
 use thiserror::Error;
 
-use crate::{
-    coroutine::{EmailBackend, EmailCoroutine, EmailCoroutineArg, EmailCoroutineState, JmapStep},
-    jmap::convert::find_mailbox_id,
-};
+use crate::jmap::convert::find_mailbox_id;
 
 /// Errors produced by [`JmapMailboxDelete`].
 #[derive(Debug, Error)]
@@ -43,8 +40,6 @@ pub enum JmapMailboxDeleteError {
     NotFound(String),
     #[error("Mailbox/set did not destroy `{0}`")]
     NotDestroyed(String),
-    #[error("coroutine was resumed with the wrong EmailCoroutineArg variant")]
-    InvalidArg,
     #[error("coroutine was resumed after completion")]
     ResumedAfterDone,
 }
@@ -85,26 +80,22 @@ impl JmapMailboxDelete {
     }
 }
 
-impl EmailCoroutine for JmapMailboxDelete {
-    type Yield = JmapStep;
+enum State {
+    Resolving(InnerQuery),
+    Destroying { set: InnerSet, id: String },
+    Done,
+}
+
+impl JmapCoroutine for JmapMailboxDelete {
+    type Yield = JmapYield;
     type Return = Result<(), JmapMailboxDeleteError>;
 
-    const BACKEND: EmailBackend = EmailBackend::Jmap;
-
-    fn resume(
-        &mut self,
-        arg: EmailCoroutineArg<'_>,
-    ) -> EmailCoroutineState<Self::Yield, Self::Return> {
-        #[allow(irrefutable_let_patterns)]
-        let EmailCoroutineArg::Jmap { bytes } = arg else {
-            return EmailCoroutineState::Complete(Err(JmapMailboxDeleteError::InvalidArg));
-        };
-
+    fn resume(&mut self, bytes: Option<&[u8]>) -> JmapCoroutineState<Self::Yield, Self::Return> {
         match mem::replace(&mut self.state, State::Done) {
             State::Resolving(mut query) => match query.resume(bytes) {
                 JmapCoroutineState::Complete(Ok(ok)) => {
                     let Some(id) = find_mailbox_id(&ok.mailboxes, &self.name) else {
-                        return EmailCoroutineState::Complete(Err(
+                        return JmapCoroutineState::Complete(Err(
                             JmapMailboxDeleteError::NotFound(self.name.clone()),
                         ));
                     };
@@ -115,52 +106,38 @@ impl EmailCoroutine for JmapMailboxDelete {
                     };
                     let set = match InnerSet::new(&self.session, &self.http_auth, args) {
                         Ok(set) => set,
-                        Err(err) => return EmailCoroutineState::Complete(Err(err.into())),
+                        Err(err) => return JmapCoroutineState::Complete(Err(err.into())),
                     };
                     self.state = State::Destroying { set, id };
-                    self.resume(EmailCoroutineArg::Jmap { bytes: None })
+                    JmapCoroutine::resume(self, None)
                 }
-                JmapCoroutineState::Yielded(JmapYield::WantsRead) => {
+                JmapCoroutineState::Yielded(y) => {
                     self.state = State::Resolving(query);
-                    EmailCoroutineState::Yielded(JmapStep::WantsRead)
-                }
-                JmapCoroutineState::Yielded(JmapYield::WantsWrite(out)) => {
-                    self.state = State::Resolving(query);
-                    EmailCoroutineState::Yielded(JmapStep::WantsWrite(out))
+                    JmapCoroutineState::Yielded(y)
                 }
                 JmapCoroutineState::Complete(Err(err)) => {
-                    EmailCoroutineState::Complete(Err(err.into()))
+                    JmapCoroutineState::Complete(Err(err.into()))
                 }
             },
             State::Destroying { mut set, id } => match set.resume(bytes) {
                 JmapCoroutineState::Complete(Ok(ok)) => {
                     if ok.destroyed.iter().any(|d| d == &id) {
-                        EmailCoroutineState::Complete(Ok(()))
+                        JmapCoroutineState::Complete(Ok(()))
                     } else {
-                        EmailCoroutineState::Complete(Err(JmapMailboxDeleteError::NotDestroyed(id)))
+                        JmapCoroutineState::Complete(Err(JmapMailboxDeleteError::NotDestroyed(id)))
                     }
                 }
-                JmapCoroutineState::Yielded(JmapYield::WantsRead) => {
+                JmapCoroutineState::Yielded(y) => {
                     self.state = State::Destroying { set, id };
-                    EmailCoroutineState::Yielded(JmapStep::WantsRead)
-                }
-                JmapCoroutineState::Yielded(JmapYield::WantsWrite(out)) => {
-                    self.state = State::Destroying { set, id };
-                    EmailCoroutineState::Yielded(JmapStep::WantsWrite(out))
+                    JmapCoroutineState::Yielded(y)
                 }
                 JmapCoroutineState::Complete(Err(err)) => {
-                    EmailCoroutineState::Complete(Err(err.into()))
+                    JmapCoroutineState::Complete(Err(err.into()))
                 }
             },
             State::Done => {
-                EmailCoroutineState::Complete(Err(JmapMailboxDeleteError::ResumedAfterDone))
+                JmapCoroutineState::Complete(Err(JmapMailboxDeleteError::ResumedAfterDone))
             }
         }
     }
-}
-
-enum State {
-    Resolving(InnerQuery),
-    Destroying { set: InnerSet, id: String },
-    Done,
 }

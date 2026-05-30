@@ -41,7 +41,6 @@ use secrecy::SecretString;
 use thiserror::Error;
 
 use crate::{
-    coroutine::{EmailBackend, EmailCoroutine, EmailCoroutineArg, EmailCoroutineState, JmapStep},
     envelope::Envelope,
     jmap::convert::{
         compute_position_limit, envelope_from, envelope_properties, find_mailbox_id, keyword_from,
@@ -62,8 +61,6 @@ pub enum JmapEnvelopeSearchError {
     EmailQuery(#[from] QueryErr),
     #[error("no JMAP mailbox named `{0}` found")]
     NotFound(String),
-    #[error("coroutine was resumed with the wrong EmailCoroutineArg variant")]
-    InvalidArg,
     #[error("coroutine was resumed after completion")]
     ResumedAfterDone,
 }
@@ -121,113 +118,6 @@ impl JmapEnvelopeSearch {
             page,
             page_size,
         })
-    }
-}
-
-impl EmailCoroutine for JmapEnvelopeSearch {
-    type Yield = JmapStep;
-    type Return = Result<Vec<Envelope>, JmapEnvelopeSearchError>;
-
-    const BACKEND: EmailBackend = EmailBackend::Jmap;
-
-    fn resume(
-        &mut self,
-        arg: EmailCoroutineArg<'_>,
-    ) -> EmailCoroutineState<Self::Yield, Self::Return> {
-        #[allow(irrefutable_let_patterns)]
-        let EmailCoroutineArg::Jmap { bytes } = arg else {
-            return EmailCoroutineState::Complete(Err(JmapEnvelopeSearchError::InvalidArg));
-        };
-
-        match mem::replace(&mut self.state, State::Done) {
-            State::Resolving(mut resolver) => match resolver.resume(bytes) {
-                JmapCoroutineState::Complete(Ok(ok)) => {
-                    let Some(id) = find_mailbox_id(&ok.mailboxes, &self.name) else {
-                        return EmailCoroutineState::Complete(Err(
-                            JmapEnvelopeSearchError::NotFound(self.name.clone()),
-                        ));
-                    };
-
-                    let Converted {
-                        filter,
-                        sort,
-                        post_filters,
-                    } = build(self.query.as_ref(), id);
-
-                    let paginate_client_side = !post_filters.is_empty();
-                    let (position, limit) = if paginate_client_side {
-                        (None, None)
-                    } else {
-                        compute_position_limit(self.page, self.page_size)
-                    };
-
-                    let inner = match InnerQuery::new(
-                        &self.session,
-                        &self.http_auth,
-                        Some(filter),
-                        Some(sort),
-                        position,
-                        limit,
-                        Some(envelope_properties()),
-                    ) {
-                        Ok(q) => q,
-                        Err(err) => return EmailCoroutineState::Complete(Err(err.into())),
-                    };
-                    self.state = State::Searching {
-                        inner,
-                        post_filters,
-                    };
-                    self.resume(EmailCoroutineArg::Jmap { bytes: None })
-                }
-                JmapCoroutineState::Yielded(JmapYield::WantsRead) => {
-                    self.state = State::Resolving(resolver);
-                    EmailCoroutineState::Yielded(JmapStep::WantsRead)
-                }
-                JmapCoroutineState::Yielded(JmapYield::WantsWrite(out)) => {
-                    self.state = State::Resolving(resolver);
-                    EmailCoroutineState::Yielded(JmapStep::WantsWrite(out))
-                }
-                JmapCoroutineState::Complete(Err(err)) => {
-                    EmailCoroutineState::Complete(Err(err.into()))
-                }
-            },
-            State::Searching {
-                mut inner,
-                post_filters,
-            } => match inner.resume(bytes) {
-                JmapCoroutineState::Complete(Ok(ok)) => {
-                    let mut envelopes: Vec<Envelope> =
-                        ok.emails.into_iter().map(envelope_from).collect();
-
-                    if !post_filters.is_empty() {
-                        envelopes.retain(|env| post_match(env, &post_filters));
-                        envelopes = paginate(envelopes, self.page, self.page_size);
-                    }
-
-                    EmailCoroutineState::Complete(Ok(envelopes))
-                }
-                JmapCoroutineState::Yielded(JmapYield::WantsRead) => {
-                    self.state = State::Searching {
-                        inner,
-                        post_filters,
-                    };
-                    EmailCoroutineState::Yielded(JmapStep::WantsRead)
-                }
-                JmapCoroutineState::Yielded(JmapYield::WantsWrite(out)) => {
-                    self.state = State::Searching {
-                        inner,
-                        post_filters,
-                    };
-                    EmailCoroutineState::Yielded(JmapStep::WantsWrite(out))
-                }
-                JmapCoroutineState::Complete(Err(err)) => {
-                    EmailCoroutineState::Complete(Err(err.into()))
-                }
-            },
-            State::Done => {
-                EmailCoroutineState::Complete(Err(JmapEnvelopeSearchError::ResumedAfterDone))
-            }
-        }
     }
 }
 
@@ -419,6 +309,92 @@ fn utc_midnight(date: NaiveDate) -> String {
         date.month(),
         date.day()
     )
+}
+
+impl JmapCoroutine for JmapEnvelopeSearch {
+    type Yield = JmapYield;
+    type Return = Result<Vec<Envelope>, JmapEnvelopeSearchError>;
+
+    fn resume(&mut self, bytes: Option<&[u8]>) -> JmapCoroutineState<Self::Yield, Self::Return> {
+        match mem::replace(&mut self.state, State::Done) {
+            State::Resolving(mut resolver) => match resolver.resume(bytes) {
+                JmapCoroutineState::Complete(Ok(ok)) => {
+                    let Some(id) = find_mailbox_id(&ok.mailboxes, &self.name) else {
+                        return JmapCoroutineState::Complete(Err(
+                            JmapEnvelopeSearchError::NotFound(self.name.clone()),
+                        ));
+                    };
+
+                    let Converted {
+                        filter,
+                        sort,
+                        post_filters,
+                    } = build(self.query.as_ref(), id);
+
+                    let paginate_client_side = !post_filters.is_empty();
+                    let (position, limit) = if paginate_client_side {
+                        (None, None)
+                    } else {
+                        compute_position_limit(self.page, self.page_size)
+                    };
+
+                    let inner = match InnerQuery::new(
+                        &self.session,
+                        &self.http_auth,
+                        Some(filter),
+                        Some(sort),
+                        position,
+                        limit,
+                        Some(envelope_properties()),
+                    ) {
+                        Ok(q) => q,
+                        Err(err) => return JmapCoroutineState::Complete(Err(err.into())),
+                    };
+                    self.state = State::Searching {
+                        inner,
+                        post_filters,
+                    };
+                    JmapCoroutine::resume(self, None)
+                }
+                JmapCoroutineState::Yielded(y) => {
+                    self.state = State::Resolving(resolver);
+                    JmapCoroutineState::Yielded(y)
+                }
+                JmapCoroutineState::Complete(Err(err)) => {
+                    JmapCoroutineState::Complete(Err(err.into()))
+                }
+            },
+            State::Searching {
+                mut inner,
+                post_filters,
+            } => match inner.resume(bytes) {
+                JmapCoroutineState::Complete(Ok(ok)) => {
+                    let mut envelopes: Vec<Envelope> =
+                        ok.emails.into_iter().map(envelope_from).collect();
+
+                    if !post_filters.is_empty() {
+                        envelopes.retain(|env| post_match(env, &post_filters));
+                        envelopes = paginate(envelopes, self.page, self.page_size);
+                    }
+
+                    JmapCoroutineState::Complete(Ok(envelopes))
+                }
+                JmapCoroutineState::Yielded(y) => {
+                    self.state = State::Searching {
+                        inner,
+                        post_filters,
+                    };
+                    JmapCoroutineState::Yielded(y)
+                }
+                JmapCoroutineState::Complete(Err(err)) => {
+                    JmapCoroutineState::Complete(Err(err.into()))
+                }
+            },
+            State::Done => {
+                JmapCoroutineState::Complete(Err(JmapEnvelopeSearchError::ResumedAfterDone))
+            }
+        }
+    }
 }
 
 #[cfg(test)]

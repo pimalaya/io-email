@@ -7,6 +7,7 @@ use alloc::string::String;
 use core::mem;
 
 use io_imap::{
+    codec::fragmentizer::Fragmentizer,
     coroutine::{ImapCoroutine, ImapCoroutineState, ImapYield},
     rfc3501::{
         copy::{
@@ -19,10 +20,7 @@ use io_imap::{
 use log::trace;
 use thiserror::Error;
 
-use crate::{
-    coroutine::{EmailBackend, EmailCoroutine, EmailCoroutineArg, EmailCoroutineState, ImapStep},
-    imap::convert::{InvalidMailboxName, InvalidUidSet, parse_mailbox, parse_uids},
-};
+use crate::imap::convert::{InvalidMailboxName, InvalidUidSet, parse_mailbox, parse_uids};
 
 /// Errors produced by [`ImapMessageCopy`].
 #[derive(Debug, Error)]
@@ -37,8 +35,6 @@ pub enum ImapMessageCopyError {
     InvalidUid(String),
     #[error("empty UID set")]
     EmptyUidSet,
-    #[error("coroutine was resumed with the wrong EmailCoroutineArg variant")]
-    InvalidArg,
     #[error("coroutine was resumed after completion")]
     ResumedAfterDone,
 }
@@ -87,71 +83,6 @@ impl ImapMessageCopy {
     }
 }
 
-impl EmailCoroutine for ImapMessageCopy {
-    type Yield = ImapStep;
-    type Return = Result<(), ImapMessageCopyError>;
-
-    const BACKEND: EmailBackend = EmailBackend::Imap;
-
-    fn resume(
-        &mut self,
-        arg: EmailCoroutineArg<'_>,
-    ) -> EmailCoroutineState<Self::Yield, Self::Return> {
-        #[allow(irrefutable_let_patterns)]
-        let EmailCoroutineArg::Imap {
-            fragmentizer,
-            mut bytes,
-        } = arg
-        else {
-            return EmailCoroutineState::Complete(Err(ImapMessageCopyError::InvalidArg));
-        };
-
-        loop {
-            match mem::replace(&mut self.state, State::Done) {
-                State::Selecting { mut select, copy } => {
-                    match select.resume(fragmentizer, bytes.take()) {
-                        ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
-                            self.state = State::Selecting { select, copy };
-                            return EmailCoroutineState::Yielded(ImapStep::WantsRead);
-                        }
-                        ImapCoroutineState::Yielded(ImapYield::WantsWrite(out)) => {
-                            self.state = State::Selecting { select, copy };
-                            return EmailCoroutineState::Yielded(ImapStep::WantsWrite(out));
-                        }
-                        ImapCoroutineState::Complete(Ok(_)) => {
-                            self.state = State::Copying(copy);
-                        }
-                        ImapCoroutineState::Complete(Err(err)) => {
-                            return EmailCoroutineState::Complete(Err(err.into()));
-                        }
-                    }
-                }
-                State::Copying(mut copy) => match copy.resume(fragmentizer, bytes.take()) {
-                    ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
-                        self.state = State::Copying(copy);
-                        return EmailCoroutineState::Yielded(ImapStep::WantsRead);
-                    }
-                    ImapCoroutineState::Yielded(ImapYield::WantsWrite(out)) => {
-                        self.state = State::Copying(copy);
-                        return EmailCoroutineState::Yielded(ImapStep::WantsWrite(out));
-                    }
-                    ImapCoroutineState::Complete(Ok(_copyuid)) => {
-                        return EmailCoroutineState::Complete(Ok(()));
-                    }
-                    ImapCoroutineState::Complete(Err(err)) => {
-                        return EmailCoroutineState::Complete(Err(err.into()));
-                    }
-                },
-                State::Done => {
-                    return EmailCoroutineState::Complete(Err(
-                        ImapMessageCopyError::ResumedAfterDone,
-                    ));
-                }
-            }
-        }
-    }
-}
-
 #[allow(clippy::large_enum_variant)] // see flag_store.rs for rationale
 enum State {
     Selecting {
@@ -160,4 +91,51 @@ enum State {
     },
     Copying(InnerImapMessageCopy),
     Done,
+}
+
+impl ImapCoroutine for ImapMessageCopy {
+    type Yield = ImapYield;
+    type Return = Result<(), ImapMessageCopyError>;
+
+    fn resume(
+        &mut self,
+        fragmentizer: &mut Fragmentizer,
+        mut bytes: Option<&[u8]>,
+    ) -> ImapCoroutineState<Self::Yield, Self::Return> {
+        loop {
+            match mem::replace(&mut self.state, State::Done) {
+                State::Selecting { mut select, copy } => {
+                    match select.resume(fragmentizer, bytes.take()) {
+                        ImapCoroutineState::Yielded(yielded) => {
+                            self.state = State::Selecting { select, copy };
+                            return ImapCoroutineState::Yielded(yielded);
+                        }
+                        ImapCoroutineState::Complete(Ok(_)) => {
+                            self.state = State::Copying(copy);
+                        }
+                        ImapCoroutineState::Complete(Err(err)) => {
+                            return ImapCoroutineState::Complete(Err(err.into()));
+                        }
+                    }
+                }
+                State::Copying(mut copy) => match copy.resume(fragmentizer, bytes.take()) {
+                    ImapCoroutineState::Yielded(yielded) => {
+                        self.state = State::Copying(copy);
+                        return ImapCoroutineState::Yielded(yielded);
+                    }
+                    ImapCoroutineState::Complete(Ok(_copyuid)) => {
+                        return ImapCoroutineState::Complete(Ok(()));
+                    }
+                    ImapCoroutineState::Complete(Err(err)) => {
+                        return ImapCoroutineState::Complete(Err(err.into()));
+                    }
+                },
+                State::Done => {
+                    return ImapCoroutineState::Complete(Err(
+                        ImapMessageCopyError::ResumedAfterDone,
+                    ));
+                }
+            }
+        }
+    }
 }

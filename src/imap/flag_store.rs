@@ -14,6 +14,7 @@ use alloc::{string::String, vec::Vec};
 use core::mem;
 
 use io_imap::{
+    codec::fragmentizer::Fragmentizer,
     coroutine::{ImapCoroutine, ImapCoroutineState, ImapYield},
     rfc3501::{
         select::{ImapMailboxSelect, ImapMailboxSelectError},
@@ -25,7 +26,6 @@ use log::trace;
 use thiserror::Error;
 
 use crate::{
-    coroutine::{EmailBackend, EmailCoroutine, EmailCoroutineArg, EmailCoroutineState, ImapStep},
     flag::{Flag, FlagOp},
     imap::convert::{InvalidMailboxName, InvalidUidSet, flag_from, parse_mailbox, parse_uids},
 };
@@ -43,8 +43,6 @@ pub enum ImapFlagStoreError {
     EmptyUidSet,
     #[error("invalid message UID `{0}`")]
     InvalidUid(String),
-    #[error("coroutine was resumed with the wrong EmailCoroutineArg variant")]
-    InvalidArg,
     #[error("coroutine was resumed after completion")]
     ResumedAfterDone,
 }
@@ -103,71 +101,6 @@ impl ImapFlagStore {
     }
 }
 
-impl EmailCoroutine for ImapFlagStore {
-    type Yield = ImapStep;
-    type Return = Result<(), ImapFlagStoreError>;
-
-    const BACKEND: EmailBackend = EmailBackend::Imap;
-
-    fn resume(
-        &mut self,
-        arg: EmailCoroutineArg<'_>,
-    ) -> EmailCoroutineState<Self::Yield, Self::Return> {
-        #[allow(irrefutable_let_patterns)]
-        let EmailCoroutineArg::Imap {
-            fragmentizer,
-            mut bytes,
-        } = arg
-        else {
-            return EmailCoroutineState::Complete(Err(ImapFlagStoreError::InvalidArg));
-        };
-
-        loop {
-            match mem::replace(&mut self.state, State::Done) {
-                State::Selecting { mut select, store } => {
-                    match select.resume(fragmentizer, bytes.take()) {
-                        ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
-                            self.state = State::Selecting { select, store };
-                            return EmailCoroutineState::Yielded(ImapStep::WantsRead);
-                        }
-                        ImapCoroutineState::Yielded(ImapYield::WantsWrite(out)) => {
-                            self.state = State::Selecting { select, store };
-                            return EmailCoroutineState::Yielded(ImapStep::WantsWrite(out));
-                        }
-                        ImapCoroutineState::Complete(Ok(_)) => {
-                            self.state = State::Storing(store);
-                        }
-                        ImapCoroutineState::Complete(Err(err)) => {
-                            return EmailCoroutineState::Complete(Err(err.into()));
-                        }
-                    }
-                }
-                State::Storing(mut store) => match store.resume(fragmentizer, bytes.take()) {
-                    ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
-                        self.state = State::Storing(store);
-                        return EmailCoroutineState::Yielded(ImapStep::WantsRead);
-                    }
-                    ImapCoroutineState::Yielded(ImapYield::WantsWrite(out)) => {
-                        self.state = State::Storing(store);
-                        return EmailCoroutineState::Yielded(ImapStep::WantsWrite(out));
-                    }
-                    ImapCoroutineState::Complete(Ok(_)) => {
-                        return EmailCoroutineState::Complete(Ok(()));
-                    }
-                    ImapCoroutineState::Complete(Err(err)) => {
-                        return EmailCoroutineState::Complete(Err(err.into()));
-                    }
-                },
-                State::Done => {
-                    return EmailCoroutineState::Complete(Err(
-                        ImapFlagStoreError::ResumedAfterDone,
-                    ));
-                }
-            }
-        }
-    }
-}
-
 // NOTE: Selecting carries both coroutines side-by-side; the size
 // difference vs Storing is bounded by ImapMailboxSelect. Boxing would
 // trade a sub-µs allocation for one fewer u-byte of stack — not worth
@@ -180,4 +113,49 @@ enum State {
     },
     Storing(ImapMessageStore),
     Done,
+}
+
+impl ImapCoroutine for ImapFlagStore {
+    type Yield = ImapYield;
+    type Return = Result<(), ImapFlagStoreError>;
+
+    fn resume(
+        &mut self,
+        fragmentizer: &mut Fragmentizer,
+        mut bytes: Option<&[u8]>,
+    ) -> ImapCoroutineState<Self::Yield, Self::Return> {
+        loop {
+            match mem::replace(&mut self.state, State::Done) {
+                State::Selecting { mut select, store } => {
+                    match select.resume(fragmentizer, bytes.take()) {
+                        ImapCoroutineState::Yielded(yielded) => {
+                            self.state = State::Selecting { select, store };
+                            return ImapCoroutineState::Yielded(yielded);
+                        }
+                        ImapCoroutineState::Complete(Ok(_)) => {
+                            self.state = State::Storing(store);
+                        }
+                        ImapCoroutineState::Complete(Err(err)) => {
+                            return ImapCoroutineState::Complete(Err(err.into()));
+                        }
+                    }
+                }
+                State::Storing(mut store) => match store.resume(fragmentizer, bytes.take()) {
+                    ImapCoroutineState::Yielded(yielded) => {
+                        self.state = State::Storing(store);
+                        return ImapCoroutineState::Yielded(yielded);
+                    }
+                    ImapCoroutineState::Complete(Ok(_)) => {
+                        return ImapCoroutineState::Complete(Ok(()));
+                    }
+                    ImapCoroutineState::Complete(Err(err)) => {
+                        return ImapCoroutineState::Complete(Err(err.into()));
+                    }
+                },
+                State::Done => {
+                    return ImapCoroutineState::Complete(Err(ImapFlagStoreError::ResumedAfterDone));
+                }
+            }
+        }
+    }
 }

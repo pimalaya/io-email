@@ -72,25 +72,10 @@ use secrecy::SecretString;
 use thiserror::Error;
 
 use crate::{
-    coroutine::{EmailBackend, EmailCoroutine, EmailCoroutineArg, EmailCoroutineState},
     event::WatchEvent,
     flag::Flag,
     jmap::convert::{account_id_of, envelope_from, envelope_properties, find_mailbox_id},
 };
-
-/// Threads a `Result<State, JmapWatchMailboxError>` through the
-/// generator-shape `CoroutineState<Y, Result<(), E>>` return type:
-/// on `Err` it terminates the coroutine with `Complete`, on `Ok` it
-/// unwraps the state. Hand-rolled `?` analog (the `?` operator
-/// doesn't apply because `resume` does not return a `Result`).
-macro_rules! try_state {
-    ($expr:expr) => {
-        match $expr {
-            Ok(v) => v,
-            Err(err) => return EmailCoroutineState::Complete(Err(err)),
-        }
-    };
-}
 
 /// JMAP type tag we subscribe to and diff against.
 const EMAIL_TYPE: &str = "Email";
@@ -110,8 +95,6 @@ pub enum JmapWatchMailboxError {
     EmailGet(#[from] JmapEmailGetError),
     #[error("no JMAP mailbox named `{0}` found")]
     NotFound(String),
-    #[error("coroutine was resumed with the wrong EmailCoroutineArg variant")]
-    InvalidArg,
 }
 
 /// Per-coroutine Yield: socket I/O on one axis, [`WatchEvent`]s on
@@ -119,7 +102,7 @@ pub enum JmapWatchMailboxError {
 #[derive(Debug)]
 pub enum JmapWatchMailboxYield {
     /// Driver should read more bytes and feed them back via the
-    /// `EmailCoroutineArg::Jmap` variant on the next resume.
+    /// `bytes` argument on the next resume.
     WantsRead,
     /// Driver should write these bytes to the socket; the next
     /// resume typically takes `bytes: None`.
@@ -187,152 +170,6 @@ impl JmapWatchMailbox {
             pending: VecDeque::new(),
             suppress_events: true,
         })
-    }
-}
-
-impl EmailCoroutine for JmapWatchMailbox {
-    type Yield = JmapWatchMailboxYield;
-    type Return = Result<(), JmapWatchMailboxError>;
-
-    const BACKEND: EmailBackend = EmailBackend::Jmap;
-
-    fn resume(
-        &mut self,
-        arg: EmailCoroutineArg<'_>,
-    ) -> EmailCoroutineState<Self::Yield, Self::Return> {
-        #[allow(irrefutable_let_patterns)]
-        let EmailCoroutineArg::Jmap { bytes } = arg else {
-            return EmailCoroutineState::Complete(Err(JmapWatchMailboxError::InvalidArg));
-        };
-
-        if self.shutdown.load(Ordering::SeqCst) {
-            self.state = State::Done;
-            return EmailCoroutineState::Complete(Ok(()));
-        }
-
-        let mut bytes = bytes;
-        loop {
-            match mem::replace(&mut self.state, State::Done) {
-                State::Resolving(mut query) => match query.resume(bytes.take()) {
-                    JmapCoroutineState::Yielded(JmapYield::WantsRead) => {
-                        self.state = State::Resolving(query);
-                        return EmailCoroutineState::Yielded(JmapWatchMailboxYield::WantsRead);
-                    }
-                    JmapCoroutineState::Yielded(JmapYield::WantsWrite(out)) => {
-                        self.state = State::Resolving(query);
-                        return EmailCoroutineState::Yielded(JmapWatchMailboxYield::WantsWrite(
-                            out,
-                        ));
-                    }
-                    JmapCoroutineState::Complete(Err(err)) => {
-                        return EmailCoroutineState::Complete(Err(err.into()));
-                    }
-                    JmapCoroutineState::Complete(Ok(ok)) => {
-                        let Some(id) = find_mailbox_id(&ok.mailboxes, &self.mailbox) else {
-                            return EmailCoroutineState::Complete(Err(
-                                JmapWatchMailboxError::NotFound(self.mailbox.clone()),
-                            ));
-                        };
-                        self.mailbox_id = Some(id);
-                        self.state = try_state!(self.fresh_subscription_state());
-                    }
-                },
-                State::Subscribing {
-                    mut es,
-                    mut latest_change,
-                } => match es.resume(bytes.take()) {
-                    JmapCoroutineState::Yielded(JmapEventSourceYield::WantsRead) => {
-                        self.state = State::Subscribing { es, latest_change };
-                        return EmailCoroutineState::Yielded(JmapWatchMailboxYield::WantsRead);
-                    }
-                    JmapCoroutineState::Yielded(JmapEventSourceYield::WantsWrite(out)) => {
-                        self.state = State::Subscribing { es, latest_change };
-                        return EmailCoroutineState::Yielded(JmapWatchMailboxYield::WantsWrite(
-                            out,
-                        ));
-                    }
-                    JmapCoroutineState::Yielded(JmapEventSourceYield::Frame(change)) => {
-                        latest_change = Some(change);
-                        // Stay in Subscribing; the chunked terminator
-                        // still has to be drained before the socket
-                        // is free for follow-up POSTs.
-                        self.state = State::Subscribing { es, latest_change };
-                    }
-                    JmapCoroutineState::Complete(Ok(())) => {
-                        // Subscription cycle complete; socket is now
-                        // available for Email/changes + Email/get.
-                        self.state = try_state!(self.handle_cycle_end(latest_change));
-                    }
-                    JmapCoroutineState::Complete(Err(err)) => {
-                        return EmailCoroutineState::Complete(Err(err.into()));
-                    }
-                },
-                State::FetchingChanges(mut changes) => match changes.resume(bytes.take()) {
-                    JmapCoroutineState::Yielded(JmapYield::WantsRead) => {
-                        self.state = State::FetchingChanges(changes);
-                        return EmailCoroutineState::Yielded(JmapWatchMailboxYield::WantsRead);
-                    }
-                    JmapCoroutineState::Yielded(JmapYield::WantsWrite(out)) => {
-                        self.state = State::FetchingChanges(changes);
-                        return EmailCoroutineState::Yielded(JmapWatchMailboxYield::WantsWrite(
-                            out,
-                        ));
-                    }
-                    JmapCoroutineState::Complete(Err(err)) => {
-                        return EmailCoroutineState::Complete(Err(err.into()));
-                    }
-                    JmapCoroutineState::Complete(Ok(ok)) => {
-                        self.state = try_state!(self.dispatch_get(ok));
-                    }
-                },
-                State::FetchingEmails {
-                    mut get,
-                    destroyed,
-                    new_state,
-                } => match get.resume(bytes.take()) {
-                    JmapCoroutineState::Yielded(JmapYield::WantsRead) => {
-                        self.state = State::FetchingEmails {
-                            get,
-                            destroyed,
-                            new_state,
-                        };
-                        return EmailCoroutineState::Yielded(JmapWatchMailboxYield::WantsRead);
-                    }
-                    JmapCoroutineState::Yielded(JmapYield::WantsWrite(out)) => {
-                        self.state = State::FetchingEmails {
-                            get,
-                            destroyed,
-                            new_state,
-                        };
-                        return EmailCoroutineState::Yielded(JmapWatchMailboxYield::WantsWrite(
-                            out,
-                        ));
-                    }
-                    JmapCoroutineState::Complete(Err(err)) => {
-                        return EmailCoroutineState::Complete(Err(err.into()));
-                    }
-                    JmapCoroutineState::Complete(Ok(ok)) => {
-                        self.apply_diff(ok.emails, destroyed);
-                        self.email_state = Some(new_state);
-                        // After the bootstrap cycle the shadow is
-                        // seeded; future cycles surface their
-                        // deltas.
-                        self.suppress_events = false;
-                        self.state = State::Emitting;
-                    }
-                },
-                State::Emitting => {
-                    if let Some(evt) = self.pending.pop_front() {
-                        self.state = State::Emitting;
-                        return EmailCoroutineState::Yielded(JmapWatchMailboxYield::Event(evt));
-                    }
-                    // No events left; subscribe again for the next
-                    // cycle.
-                    self.state = try_state!(self.fresh_subscription_state());
-                }
-                State::Done => return EmailCoroutineState::Complete(Ok(())),
-            }
-        }
     }
 }
 
@@ -498,6 +335,136 @@ impl JmapWatchMailbox {
                     mailbox: self.mailbox.clone(),
                     id,
                 });
+            }
+        }
+    }
+}
+
+impl JmapCoroutine for JmapWatchMailbox {
+    type Yield = JmapWatchMailboxYield;
+    type Return = Result<(), JmapWatchMailboxError>;
+
+    fn resume(&mut self, bytes: Option<&[u8]>) -> JmapCoroutineState<Self::Yield, Self::Return> {
+        if self.shutdown.load(Ordering::SeqCst) {
+            self.state = State::Done;
+            return JmapCoroutineState::Complete(Ok(()));
+        }
+
+        let mut bytes = bytes;
+        loop {
+            match mem::replace(&mut self.state, State::Done) {
+                State::Resolving(mut query) => match query.resume(bytes.take()) {
+                    JmapCoroutineState::Yielded(JmapYield::WantsRead) => {
+                        self.state = State::Resolving(query);
+                        return JmapCoroutineState::Yielded(JmapWatchMailboxYield::WantsRead);
+                    }
+                    JmapCoroutineState::Yielded(JmapYield::WantsWrite(out)) => {
+                        self.state = State::Resolving(query);
+                        return JmapCoroutineState::Yielded(JmapWatchMailboxYield::WantsWrite(out));
+                    }
+                    JmapCoroutineState::Complete(Err(err)) => {
+                        return JmapCoroutineState::Complete(Err(err.into()));
+                    }
+                    JmapCoroutineState::Complete(Ok(ok)) => {
+                        let Some(id) = find_mailbox_id(&ok.mailboxes, &self.mailbox) else {
+                            return JmapCoroutineState::Complete(Err(
+                                JmapWatchMailboxError::NotFound(self.mailbox.clone()),
+                            ));
+                        };
+                        self.mailbox_id = Some(id);
+                        self.state = match self.fresh_subscription_state() {
+                            Ok(s) => s,
+                            Err(err) => return JmapCoroutineState::Complete(Err(err)),
+                        };
+                    }
+                },
+                State::Subscribing {
+                    mut es,
+                    mut latest_change,
+                } => match es.resume(bytes.take()) {
+                    JmapCoroutineState::Yielded(JmapEventSourceYield::WantsRead) => {
+                        self.state = State::Subscribing { es, latest_change };
+                        return JmapCoroutineState::Yielded(JmapWatchMailboxYield::WantsRead);
+                    }
+                    JmapCoroutineState::Yielded(JmapEventSourceYield::WantsWrite(out)) => {
+                        self.state = State::Subscribing { es, latest_change };
+                        return JmapCoroutineState::Yielded(JmapWatchMailboxYield::WantsWrite(out));
+                    }
+                    JmapCoroutineState::Yielded(JmapEventSourceYield::Frame(change)) => {
+                        latest_change = Some(change);
+                        self.state = State::Subscribing { es, latest_change };
+                    }
+                    JmapCoroutineState::Complete(Ok(())) => {
+                        self.state = match self.handle_cycle_end(latest_change) {
+                            Ok(s) => s,
+                            Err(err) => return JmapCoroutineState::Complete(Err(err)),
+                        };
+                    }
+                    JmapCoroutineState::Complete(Err(err)) => {
+                        return JmapCoroutineState::Complete(Err(err.into()));
+                    }
+                },
+                State::FetchingChanges(mut changes) => match changes.resume(bytes.take()) {
+                    JmapCoroutineState::Yielded(JmapYield::WantsRead) => {
+                        self.state = State::FetchingChanges(changes);
+                        return JmapCoroutineState::Yielded(JmapWatchMailboxYield::WantsRead);
+                    }
+                    JmapCoroutineState::Yielded(JmapYield::WantsWrite(out)) => {
+                        self.state = State::FetchingChanges(changes);
+                        return JmapCoroutineState::Yielded(JmapWatchMailboxYield::WantsWrite(out));
+                    }
+                    JmapCoroutineState::Complete(Err(err)) => {
+                        return JmapCoroutineState::Complete(Err(err.into()));
+                    }
+                    JmapCoroutineState::Complete(Ok(ok)) => {
+                        self.state = match self.dispatch_get(ok) {
+                            Ok(s) => s,
+                            Err(err) => return JmapCoroutineState::Complete(Err(err)),
+                        };
+                    }
+                },
+                State::FetchingEmails {
+                    mut get,
+                    destroyed,
+                    new_state,
+                } => match get.resume(bytes.take()) {
+                    JmapCoroutineState::Yielded(JmapYield::WantsRead) => {
+                        self.state = State::FetchingEmails {
+                            get,
+                            destroyed,
+                            new_state,
+                        };
+                        return JmapCoroutineState::Yielded(JmapWatchMailboxYield::WantsRead);
+                    }
+                    JmapCoroutineState::Yielded(JmapYield::WantsWrite(out)) => {
+                        self.state = State::FetchingEmails {
+                            get,
+                            destroyed,
+                            new_state,
+                        };
+                        return JmapCoroutineState::Yielded(JmapWatchMailboxYield::WantsWrite(out));
+                    }
+                    JmapCoroutineState::Complete(Err(err)) => {
+                        return JmapCoroutineState::Complete(Err(err.into()));
+                    }
+                    JmapCoroutineState::Complete(Ok(ok)) => {
+                        self.apply_diff(ok.emails, destroyed);
+                        self.email_state = Some(new_state);
+                        self.suppress_events = false;
+                        self.state = State::Emitting;
+                    }
+                },
+                State::Emitting => {
+                    if let Some(evt) = self.pending.pop_front() {
+                        self.state = State::Emitting;
+                        return JmapCoroutineState::Yielded(JmapWatchMailboxYield::Event(evt));
+                    }
+                    self.state = match self.fresh_subscription_state() {
+                        Ok(s) => s,
+                        Err(err) => return JmapCoroutineState::Complete(Err(err)),
+                    };
+                }
+                State::Done => return JmapCoroutineState::Complete(Ok(())),
             }
         }
     }

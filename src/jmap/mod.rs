@@ -1,3 +1,5 @@
+#[cfg(feature = "client")]
+pub mod client;
 pub mod convert;
 pub mod envelope_list;
 #[cfg(feature = "search")]

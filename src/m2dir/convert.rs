@@ -1,10 +1,8 @@
-//! Shared helpers for the m2dir coroutines: mailbox-name → on-disk
+//! Shared helpers for the m2dir coroutines: mailbox-name to on-disk
 //! path resolution, flag / address conversions used by `envelope_list`,
-//! and path-type translations between the shared [`PathBuf`] surface
-//! and io-m2dir's [`M2dirPath`].
+//! and `paginate` shared with the maildir backend.
 
 use alloc::{
-    collections::{BTreeMap, BTreeSet},
     string::{String, ToString},
     vec::Vec,
 };
@@ -132,42 +130,4 @@ fn addresses_from(addrs: &MailParserAddress<'_>) -> Vec<Address> {
             Some(Address { name, email })
         })
         .collect()
-}
-
-/// Translates an m2dir-path set out to the shared [`PathBuf`] surface.
-pub(crate) fn paths_out(paths: BTreeSet<M2dirPath>) -> BTreeSet<PathBuf> {
-    paths.into_iter().map(PathBuf::from).collect()
-}
-
-/// Translates a rename pair list out to the shared surface.
-pub(crate) fn pairs_out(pairs: Vec<(M2dirPath, M2dirPath)>) -> Vec<(PathBuf, PathBuf)> {
-    pairs
-        .into_iter()
-        .map(|(from, to)| (from.into(), to.into()))
-        .collect()
-}
-
-/// Translates a file-create map out to the shared surface.
-pub(crate) fn files_out(files: BTreeMap<M2dirPath, Vec<u8>>) -> BTreeMap<PathBuf, Vec<u8>> {
-    files.into_iter().map(|(k, v)| (k.into(), v)).collect()
-}
-
-/// Translates a shared bool-keyed map back to m2dir-path-keyed.
-pub(crate) fn probes_in(probes: BTreeMap<PathBuf, bool>) -> BTreeMap<M2dirPath, bool> {
-    probes.into_iter().map(|(k, v)| (k.into(), v)).collect()
-}
-
-/// Translates a shared DirRead reply back to m2dir-path types.
-pub(crate) fn dirread_in(
-    entries: BTreeMap<PathBuf, BTreeSet<PathBuf>>,
-) -> BTreeMap<M2dirPath, BTreeSet<M2dirPath>> {
-    entries
-        .into_iter()
-        .map(|(k, v)| (k.into(), v.into_iter().map(M2dirPath::from).collect()))
-        .collect()
-}
-
-/// Translates a shared FileRead reply back to m2dir-path types.
-pub(crate) fn fileread_in(files: BTreeMap<PathBuf, Vec<u8>>) -> BTreeMap<M2dirPath, Vec<u8>> {
-    files.into_iter().map(|(k, v)| (k.into(), v)).collect()
 }

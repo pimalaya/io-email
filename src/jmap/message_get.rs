@@ -32,10 +32,7 @@ use secrecy::SecretString;
 use thiserror::Error;
 use url::Url;
 
-use crate::{
-    coroutine::{EmailBackend, EmailCoroutine, EmailCoroutineArg, EmailCoroutineState, JmapStep},
-    jmap::convert::account_id_of,
-};
+use crate::jmap::convert::account_id_of;
 
 /// Errors produced by [`JmapMessageGet`].
 #[derive(Debug, Error)]
@@ -52,8 +49,6 @@ pub enum JmapMessageGetError {
     InvalidDownloadUrl(String),
     #[error("JMAP blob download was redirected; not yet supported")]
     UnsupportedRedirect,
-    #[error("coroutine was resumed with the wrong EmailCoroutineArg variant")]
-    InvalidArg,
     #[error("coroutine was resumed after completion")]
     ResumedAfterDone,
 }
@@ -92,39 +87,31 @@ impl JmapMessageGet {
     }
 }
 
-impl EmailCoroutine for JmapMessageGet {
-    type Yield = JmapStep;
+enum State {
+    GettingEmail(InnerGet),
+    Downloading(JmapBlobDownload),
+    Done,
+}
+
+impl JmapCoroutine for JmapMessageGet {
+    type Yield = JmapYield;
     type Return = Result<Vec<u8>, JmapMessageGetError>;
 
-    const BACKEND: EmailBackend = EmailBackend::Jmap;
-
-    fn resume(
-        &mut self,
-        arg: EmailCoroutineArg<'_>,
-    ) -> EmailCoroutineState<Self::Yield, Self::Return> {
-        #[allow(irrefutable_let_patterns)]
-        let EmailCoroutineArg::Jmap { bytes } = arg else {
-            return EmailCoroutineState::Complete(Err(JmapMessageGetError::InvalidArg));
-        };
-
+    fn resume(&mut self, bytes: Option<&[u8]>) -> JmapCoroutineState<Self::Yield, Self::Return> {
         match mem::replace(&mut self.state, State::Done) {
             State::GettingEmail(mut get) => match get.resume(bytes) {
-                JmapCoroutineState::Yielded(JmapYield::WantsRead) => {
+                JmapCoroutineState::Yielded(y) => {
                     self.state = State::GettingEmail(get);
-                    EmailCoroutineState::Yielded(JmapStep::WantsRead)
-                }
-                JmapCoroutineState::Yielded(JmapYield::WantsWrite(out)) => {
-                    self.state = State::GettingEmail(get);
-                    EmailCoroutineState::Yielded(JmapStep::WantsWrite(out))
+                    JmapCoroutineState::Yielded(y)
                 }
                 JmapCoroutineState::Complete(Ok(ok)) => {
                     let Some(email) = ok.emails.into_iter().next() else {
-                        return EmailCoroutineState::Complete(Err(
+                        return JmapCoroutineState::Complete(Err(
                             JmapMessageGetError::EmailNotFound,
                         ));
                     };
                     let Some(blob_id) = email.blob_id else {
-                        return EmailCoroutineState::Complete(Err(
+                        return JmapCoroutineState::Complete(Err(
                             JmapMessageGetError::MissingBlobId,
                         ));
                     };
@@ -134,47 +121,39 @@ impl EmailCoroutine for JmapMessageGet {
                         &blob_id,
                     );
                     let Ok(url) = Url::parse(&url_str) else {
-                        return EmailCoroutineState::Complete(Err(
+                        return JmapCoroutineState::Complete(Err(
                             JmapMessageGetError::InvalidDownloadUrl(url_str),
                         ));
                     };
                     self.state = State::Downloading(JmapBlobDownload::new(&self.http_auth, &url));
-                    self.resume(EmailCoroutineArg::Jmap { bytes: None })
+                    JmapCoroutine::resume(self, None)
                 }
                 JmapCoroutineState::Complete(Err(err)) => {
-                    EmailCoroutineState::Complete(Err(err.into()))
+                    JmapCoroutineState::Complete(Err(err.into()))
                 }
             },
             State::Downloading(mut dl) => match dl.resume(bytes) {
                 JmapCoroutineState::Yielded(JmapRedirectYield::WantsRead) => {
                     self.state = State::Downloading(dl);
-                    EmailCoroutineState::Yielded(JmapStep::WantsRead)
+                    JmapCoroutineState::Yielded(JmapYield::WantsRead)
                 }
                 JmapCoroutineState::Yielded(JmapRedirectYield::WantsWrite(out)) => {
                     self.state = State::Downloading(dl);
-                    EmailCoroutineState::Yielded(JmapStep::WantsWrite(out))
+                    JmapCoroutineState::Yielded(JmapYield::WantsWrite(out))
                 }
                 JmapCoroutineState::Yielded(JmapRedirectYield::WantsRedirect { .. }) => {
-                    EmailCoroutineState::Complete(Err(JmapMessageGetError::UnsupportedRedirect))
+                    JmapCoroutineState::Complete(Err(JmapMessageGetError::UnsupportedRedirect))
                 }
                 JmapCoroutineState::Complete(Ok(JmapBlobDownloadOutput { data, .. })) => {
-                    EmailCoroutineState::Complete(Ok(data))
+                    JmapCoroutineState::Complete(Ok(data))
                 }
                 JmapCoroutineState::Complete(Err(err)) => {
-                    EmailCoroutineState::Complete(Err(err.into()))
+                    JmapCoroutineState::Complete(Err(err.into()))
                 }
             },
-            State::Done => {
-                EmailCoroutineState::Complete(Err(JmapMessageGetError::ResumedAfterDone))
-            }
+            State::Done => JmapCoroutineState::Complete(Err(JmapMessageGetError::ResumedAfterDone)),
         }
     }
-}
-
-enum State {
-    GettingEmail(InnerGet),
-    Downloading(JmapBlobDownload),
-    Done,
 }
 
 /// Resolves the RFC 8620 download URL template against the live

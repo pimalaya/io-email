@@ -13,7 +13,7 @@ use alloc::{string::String, vec::Vec};
 use std::path::PathBuf;
 
 use io_maildir::{
-    coroutine::{MaildirCoroutine, MaildirCoroutineState, MaildirReply, MaildirYield},
+    coroutine::*,
     coroutines::message_store::{
         MaildirMessageStore as InnerStore, MaildirMessageStoreError as InnerErr,
     },
@@ -23,13 +23,8 @@ use log::trace;
 use thiserror::Error;
 
 use crate::{
-    coroutine::{
-        EmailBackend, EmailCoroutine, EmailCoroutineArg, EmailCoroutineState, FsBatch, FsStep,
-    },
     flag::Flag,
-    maildir::convert::{
-        InvalidMailboxName, files_out, flags_to_maildir, pairs_out, resolve_mailbox,
-    },
+    maildir::convert::{InvalidMailboxName, flags_to_maildir, resolve_mailbox},
 };
 
 /// Errors produced by [`MaildirMessageAdd`].
@@ -39,10 +34,6 @@ pub enum MaildirMessageAddError {
     Store(#[from] InnerErr),
     #[error(transparent)]
     InvalidMailbox(#[from] InvalidMailboxName),
-    #[error("coroutine was resumed with the wrong EmailCoroutineArg variant")]
-    InvalidArg,
-    #[error("coroutine was resumed with an FsBatch variant it did not request")]
-    UnexpectedBatch,
 }
 
 /// I/O-free coroutine appending a raw message to a Maildir under `cur/`.
@@ -68,56 +59,19 @@ impl MaildirMessageAdd {
     }
 }
 
-impl EmailCoroutine for MaildirMessageAdd {
-    type Yield = FsStep;
+impl MaildirCoroutine for MaildirMessageAdd {
+    type Yield = MaildirYield;
     type Return = Result<String, MaildirMessageAddError>;
-
-    const BACKEND: EmailBackend = EmailBackend::Maildir;
 
     fn resume(
         &mut self,
-        arg: EmailCoroutineArg<'_>,
-    ) -> EmailCoroutineState<Self::Yield, Self::Return> {
-        #[allow(irrefutable_let_patterns)]
-        let EmailCoroutineArg::Fs { batch } = arg else {
-            return EmailCoroutineState::Complete(Err(MaildirMessageAddError::InvalidArg));
-        };
-
-        let inner_arg = match batch {
-            None => None,
-            Some(FsBatch::Time { secs, nanos }) => Some(MaildirReply::Time { secs, nanos }),
-            Some(FsBatch::Pid(p)) => Some(MaildirReply::Pid(p)),
-            Some(FsBatch::Hostname(h)) => Some(MaildirReply::Hostname(h)),
-            Some(FsBatch::FileCreate) => Some(MaildirReply::FileCreate),
-            Some(FsBatch::Rename) => Some(MaildirReply::Rename),
-            Some(_) => {
-                return EmailCoroutineState::Complete(Err(MaildirMessageAddError::UnexpectedBatch));
-            }
-        };
-
-        match self.inner.resume(inner_arg) {
-            MaildirCoroutineState::Complete(Ok(ok)) => EmailCoroutineState::Complete(Ok(ok.id)),
-            MaildirCoroutineState::Yielded(MaildirYield::WantsTime) => {
-                EmailCoroutineState::Yielded(FsStep::WantsTime)
-            }
-            MaildirCoroutineState::Yielded(MaildirYield::WantsPid) => {
-                EmailCoroutineState::Yielded(FsStep::WantsPid)
-            }
-            MaildirCoroutineState::Yielded(MaildirYield::WantsHostname) => {
-                EmailCoroutineState::Yielded(FsStep::WantsHostname)
-            }
-            MaildirCoroutineState::Yielded(MaildirYield::WantsFileCreate(files)) => {
-                EmailCoroutineState::Yielded(FsStep::WantsFileCreate(files_out(files)))
-            }
-            MaildirCoroutineState::Yielded(MaildirYield::WantsRename(pairs)) => {
-                EmailCoroutineState::Yielded(FsStep::WantsRename(pairs_out(pairs)))
-            }
+        arg: Option<MaildirReply>,
+    ) -> MaildirCoroutineState<Self::Yield, Self::Return> {
+        match self.inner.resume(arg) {
+            MaildirCoroutineState::Yielded(y) => MaildirCoroutineState::Yielded(y),
+            MaildirCoroutineState::Complete(Ok(ok)) => MaildirCoroutineState::Complete(Ok(ok.id)),
             MaildirCoroutineState::Complete(Err(err)) => {
-                EmailCoroutineState::Complete(Err(err.into()))
-            }
-            other => {
-                let _ = other;
-                unreachable!("MaildirMessageStore never yields this state");
+                MaildirCoroutineState::Complete(Err(err.into()))
             }
         }
     }

@@ -19,6 +19,7 @@ use alloc::{
 use core::mem;
 
 use io_imap::{
+    codec::fragmentizer::Fragmentizer,
     coroutine::{ImapCoroutine, ImapCoroutineState, ImapYield},
     rfc3501::{
         append::{ImapMessageAppend, ImapMessageAppendError},
@@ -37,7 +38,6 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
-    coroutine::{EmailBackend, EmailCoroutine, EmailCoroutineArg, EmailCoroutineState, ImapStep},
     flag::Flag,
     imap::convert::{InvalidMailboxName, flag_from, parse_mailbox},
 };
@@ -57,8 +57,6 @@ pub enum ImapMessageAddError {
     InvalidContent(String),
     #[error("fallback UID search returned no match (server omitted UIDPLUS)")]
     UidLookupFailed,
-    #[error("coroutine was resumed with the wrong EmailCoroutineArg variant")]
-    InvalidArg,
     #[error("coroutine was resumed after completion")]
     ResumedAfterDone,
 }
@@ -122,72 +120,59 @@ impl ImapMessageAdd {
     }
 }
 
-impl EmailCoroutine for ImapMessageAdd {
-    type Yield = ImapStep;
-    type Return = Result<String, ImapMessageAddError>;
+enum State {
+    Appending(ImapMessageAppend),
+    SelectingForLookup { select: ImapMailboxSelect },
+    Searching(ImapMessageSearch),
+    Done,
+}
 
-    const BACKEND: EmailBackend = EmailBackend::Imap;
+impl ImapCoroutine for ImapMessageAdd {
+    type Yield = ImapYield;
+    type Return = Result<String, ImapMessageAddError>;
 
     fn resume(
         &mut self,
-        arg: EmailCoroutineArg<'_>,
-    ) -> EmailCoroutineState<Self::Yield, Self::Return> {
-        #[allow(irrefutable_let_patterns)]
-        let EmailCoroutineArg::Imap {
-            fragmentizer,
-            mut bytes,
-        } = arg
-        else {
-            return EmailCoroutineState::Complete(Err(ImapMessageAddError::InvalidArg));
-        };
-
+        fragmentizer: &mut Fragmentizer,
+        mut bytes: Option<&[u8]>,
+    ) -> ImapCoroutineState<Self::Yield, Self::Return> {
         loop {
             match mem::replace(&mut self.state, State::Done) {
                 State::Appending(mut append) => match append.resume(fragmentizer, bytes.take()) {
-                    ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
+                    ImapCoroutineState::Yielded(yielded) => {
                         self.state = State::Appending(append);
-                        return EmailCoroutineState::Yielded(ImapStep::WantsRead);
-                    }
-                    ImapCoroutineState::Yielded(ImapYield::WantsWrite(out)) => {
-                        self.state = State::Appending(append);
-                        return EmailCoroutineState::Yielded(ImapStep::WantsWrite(out));
+                        return ImapCoroutineState::Yielded(yielded);
                     }
                     ImapCoroutineState::Complete(Ok((_exists, appenduid))) => {
                         if let Some((_, uid)) = appenduid {
-                            return EmailCoroutineState::Complete(Ok(uid.to_string()));
+                            return ImapCoroutineState::Complete(Ok(uid.to_string()));
                         }
-                        // UIDPLUS missing: fall back to SELECT +
-                        // UID SEARCH HEADER Message-ID <id>.
                         let mbox = match parse_mailbox(&self.mailbox) {
                             Ok(m) => m,
-                            Err(err) => return EmailCoroutineState::Complete(Err(err.into())),
+                            Err(err) => return ImapCoroutineState::Complete(Err(err.into())),
                         };
                         self.state = State::SelectingForLookup {
                             select: ImapMailboxSelect::new(mbox),
                         };
                     }
                     ImapCoroutineState::Complete(Err(err)) => {
-                        return EmailCoroutineState::Complete(Err(err.into()));
+                        return ImapCoroutineState::Complete(Err(err.into()));
                     }
                 },
                 State::SelectingForLookup { mut select } => {
                     match select.resume(fragmentizer, bytes.take()) {
-                        ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
+                        ImapCoroutineState::Yielded(yielded) => {
                             self.state = State::SelectingForLookup { select };
-                            return EmailCoroutineState::Yielded(ImapStep::WantsRead);
-                        }
-                        ImapCoroutineState::Yielded(ImapYield::WantsWrite(out)) => {
-                            self.state = State::SelectingForLookup { select };
-                            return EmailCoroutineState::Yielded(ImapStep::WantsWrite(out));
+                            return ImapCoroutineState::Yielded(yielded);
                         }
                         ImapCoroutineState::Complete(Ok(_)) => {
                             let Ok(field) = AString::try_from("Message-ID") else {
-                                return EmailCoroutineState::Complete(Err(
+                                return ImapCoroutineState::Complete(Err(
                                     ImapMessageAddError::UidLookupFailed,
                                 ));
                             };
                             let Ok(value) = AString::try_from(self.message_id.clone()) else {
-                                return EmailCoroutineState::Complete(Err(
+                                return ImapCoroutineState::Complete(Err(
                                     ImapMessageAddError::UidLookupFailed,
                                 ));
                             };
@@ -195,44 +180,33 @@ impl EmailCoroutine for ImapMessageAdd {
                             self.state = State::Searching(ImapMessageSearch::new(criteria, true));
                         }
                         ImapCoroutineState::Complete(Err(err)) => {
-                            return EmailCoroutineState::Complete(Err(err.into()));
+                            return ImapCoroutineState::Complete(Err(err.into()));
                         }
                     }
                 }
                 State::Searching(mut search) => match search.resume(fragmentizer, bytes.take()) {
-                    ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
+                    ImapCoroutineState::Yielded(yielded) => {
                         self.state = State::Searching(search);
-                        return EmailCoroutineState::Yielded(ImapStep::WantsRead);
-                    }
-                    ImapCoroutineState::Yielded(ImapYield::WantsWrite(out)) => {
-                        self.state = State::Searching(search);
-                        return EmailCoroutineState::Yielded(ImapStep::WantsWrite(out));
+                        return ImapCoroutineState::Yielded(yielded);
                     }
                     ImapCoroutineState::Complete(Ok(uids)) => match uids.into_iter().max() {
-                        Some(uid) => return EmailCoroutineState::Complete(Ok(uid.to_string())),
+                        Some(uid) => return ImapCoroutineState::Complete(Ok(uid.to_string())),
                         None => {
-                            return EmailCoroutineState::Complete(Err(
+                            return ImapCoroutineState::Complete(Err(
                                 ImapMessageAddError::UidLookupFailed,
                             ));
                         }
                     },
                     ImapCoroutineState::Complete(Err(err)) => {
-                        return EmailCoroutineState::Complete(Err(err.into()));
+                        return ImapCoroutineState::Complete(Err(err.into()));
                     }
                 },
                 State::Done => {
-                    return EmailCoroutineState::Complete(Err(
+                    return ImapCoroutineState::Complete(Err(
                         ImapMessageAddError::ResumedAfterDone,
                     ));
                 }
             }
         }
     }
-}
-
-enum State {
-    Appending(ImapMessageAppend),
-    SelectingForLookup { select: ImapMailboxSelect },
-    Searching(ImapMessageSearch),
-    Done,
 }

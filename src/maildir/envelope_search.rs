@@ -6,12 +6,12 @@
 //! 1. [`MaildirMessagesList`] walks `cur/` + `new/` and returns one
 //!    [`MaildirEntry`] per file.
 //! 2. A second pass batches the entry paths through
-//!    [`FsStep::WantsFileRead`]; the driver reads each
-//!    file and feeds the bytes back so the coroutine can build
-//!    envelopes (subject, from, to, date, flags) via
-//!    [`mail_parser::Message`], evaluate the shared filter against
-//!    those envelopes (with `body` filters falling back to a scan of
-//!    the same in-memory bytes), apply the sort chain, and paginate.
+//!    [`MaildirYield::WantsFileRead`]; the driver reads each file and
+//!    feeds the bytes back so the coroutine can build envelopes
+//!    (subject, from, to, date, flags) via [`mail_parser::Message`],
+//!    evaluate the shared filter against those envelopes (with `body`
+//!    filters falling back to a scan of the same in-memory bytes),
+//!    apply the sort chain, and paginate.
 //!
 //! Body-filter handling: the listing pass already loads every
 //! candidate file's bytes for header parsing, so `body <pattern>`
@@ -21,7 +21,7 @@
 //! [`MaildirMessagesList`]: io_maildir::coroutines::message_list::MaildirMessagesList
 
 use alloc::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     string::{String, ToString},
     vec::Vec,
 };
@@ -30,7 +30,7 @@ use std::path::PathBuf;
 
 use chrono::{DateTime, FixedOffset, NaiveDate};
 use io_maildir::{
-    coroutine::{MaildirCoroutine, MaildirCoroutineState, MaildirReply, MaildirYield},
+    coroutine::*,
     coroutines::message_list::{
         MaildirMessagesList as InnerList, MaildirMessagesListError as InnerErr,
     },
@@ -45,15 +45,9 @@ use thiserror::Error;
 
 use crate::{
     address::Address,
-    coroutine::{
-        EmailBackend, EmailCoroutine, EmailCoroutineArg, EmailCoroutineState, FsBatch, FsStep,
-    },
     envelope::{Envelope, normalize_message_id},
     flag::Flag,
-    maildir::convert::{
-        InvalidMailboxName, dirread_in, flag_from_char, paginate, paths_out, probes_in,
-        resolve_mailbox,
-    },
+    maildir::convert::{InvalidMailboxName, flag_from_char, paginate, resolve_mailbox},
     search::{
         filter::query::SearchEmailsFilterQuery,
         query::SearchEmailsQuery,
@@ -68,10 +62,8 @@ pub enum MaildirEnvelopeSearchError {
     List(#[from] InnerErr),
     #[error(transparent)]
     InvalidMailbox(#[from] InvalidMailboxName),
-    #[error("coroutine was resumed with the wrong EmailCoroutineArg variant")]
-    InvalidArg,
-    #[error("coroutine was resumed with an FsBatch variant it did not request")]
-    UnexpectedBatch,
+    #[error("coroutine was resumed with a MaildirReply variant it did not request")]
+    UnexpectedReply,
     #[error("coroutine was resumed after completion")]
     ResumedAfterDone,
 }
@@ -110,79 +102,41 @@ impl MaildirEnvelopeSearch {
     }
 }
 
-impl EmailCoroutine for MaildirEnvelopeSearch {
-    type Yield = FsStep;
+impl MaildirCoroutine for MaildirEnvelopeSearch {
+    type Yield = MaildirYield;
     type Return = Result<Vec<Envelope>, MaildirEnvelopeSearchError>;
-
-    const BACKEND: EmailBackend = EmailBackend::Maildir;
 
     fn resume(
         &mut self,
-        arg: EmailCoroutineArg<'_>,
-    ) -> EmailCoroutineState<Self::Yield, Self::Return> {
-        #[allow(irrefutable_let_patterns)]
-        let EmailCoroutineArg::Fs { batch } = arg else {
-            return EmailCoroutineState::Complete(Err(MaildirEnvelopeSearchError::InvalidArg));
-        };
-
+        arg: Option<MaildirReply>,
+    ) -> MaildirCoroutineState<Self::Yield, Self::Return> {
         match mem::replace(&mut self.state, State::Done) {
-            State::Listing(mut inner) => {
-                let inner_arg = match batch {
-                    None => None,
-                    Some(FsBatch::DirRead(entries)) => {
-                        Some(MaildirReply::DirRead(dirread_in(entries)))
-                    }
-                    Some(FsBatch::FileExists(probes)) => {
-                        Some(MaildirReply::FileExists(probes_in(probes)))
-                    }
-                    Some(_) => {
-                        return EmailCoroutineState::Complete(Err(
-                            MaildirEnvelopeSearchError::UnexpectedBatch,
-                        ));
-                    }
-                };
-                match inner.resume(inner_arg) {
-                    MaildirCoroutineState::Yielded(MaildirYield::WantsDirRead(paths)) => {
-                        self.state = State::Listing(inner);
-                        EmailCoroutineState::Yielded(FsStep::WantsDirRead(paths_out(paths)))
-                    }
-                    MaildirCoroutineState::Yielded(MaildirYield::WantsFileExists(paths)) => {
-                        self.state = State::Listing(inner);
-                        EmailCoroutineState::Yielded(FsStep::WantsFileExists(paths_out(paths)))
-                    }
-                    MaildirCoroutineState::Complete(Ok(entries)) => {
-                        if entries.is_empty() {
-                            return EmailCoroutineState::Complete(Ok(Vec::new()));
-                        }
-                        let paths: BTreeSet<PathBuf> = entries
-                            .iter()
-                            .map(|e| PathBuf::from(e.path().clone()))
-                            .collect();
-                        self.state = State::Reading(entries);
-                        EmailCoroutineState::Yielded(FsStep::WantsFileRead(paths))
-                    }
-                    MaildirCoroutineState::Complete(Err(err)) => {
-                        EmailCoroutineState::Complete(Err(err.into()))
-                    }
-                    other => {
-                        let _ = other;
-                        unreachable!("MaildirMessagesList never yields this state");
-                    }
+            State::Listing(mut inner) => match inner.resume(arg) {
+                MaildirCoroutineState::Yielded(y) => {
+                    self.state = State::Listing(inner);
+                    MaildirCoroutineState::Yielded(y)
                 }
-            }
-            State::Reading(entries) => {
-                let Some(FsBatch::FileRead(contents)) = batch else {
+                MaildirCoroutineState::Complete(Ok(entries)) => {
+                    if entries.is_empty() {
+                        return MaildirCoroutineState::Complete(Ok(Vec::new()));
+                    }
+                    let paths: BTreeSet<MaildirPath> =
+                        entries.iter().map(|e| e.path().clone()).collect();
                     self.state = State::Reading(entries);
-                    return EmailCoroutineState::Complete(Err(
-                        MaildirEnvelopeSearchError::UnexpectedBatch,
+                    MaildirCoroutineState::Yielded(MaildirYield::WantsFileRead(paths))
+                }
+                MaildirCoroutineState::Complete(Err(err)) => {
+                    MaildirCoroutineState::Complete(Err(err.into()))
+                }
+            },
+            State::Reading(entries) => {
+                let Some(MaildirReply::FileRead(mut contents)) = arg else {
+                    self.state = State::Reading(entries);
+                    return MaildirCoroutineState::Complete(Err(
+                        MaildirEnvelopeSearchError::UnexpectedReply,
                     ));
                 };
-                let mut contents: BTreeMap<MaildirPath, Vec<u8>> =
-                    contents.into_iter().map(|(k, v)| (k.into(), v)).collect();
 
-                // For each entry, materialise (Envelope, raw bytes) so
-                // that `body` filters can scan the same buffer used for
-                // header parsing.
                 let mut hits: Vec<Envelope> = Vec::with_capacity(entries.len());
                 for entry in entries {
                     let Some(bytes) = contents.remove(entry.path()) else {
@@ -205,10 +159,10 @@ impl EmailCoroutine for MaildirEnvelopeSearch {
                     _ => hits.sort_by(|a, b| b.date.cmp(&a.date)),
                 }
 
-                EmailCoroutineState::Complete(Ok(paginate(hits, self.page, self.page_size)))
+                MaildirCoroutineState::Complete(Ok(paginate(hits, self.page, self.page_size)))
             }
             State::Done => {
-                EmailCoroutineState::Complete(Err(MaildirEnvelopeSearchError::ResumedAfterDone))
+                MaildirCoroutineState::Complete(Err(MaildirEnvelopeSearchError::ResumedAfterDone))
             }
         }
     }

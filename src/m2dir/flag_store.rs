@@ -13,7 +13,7 @@ use alloc::{collections::VecDeque, string::String};
 use std::path::PathBuf;
 
 use io_m2dir::{
-    coroutine::{M2dirArg, M2dirCoroutine, M2dirCoroutineState, M2dirYield},
+    coroutine::*,
     coroutines::{
         flag_add::{M2dirFlagAdd as InnerAdd, M2dirFlagAddError as AddErr},
         flag_remove::{M2dirFlagRemove as InnerRemove, M2dirFlagRemoveError as RemoveErr},
@@ -26,11 +26,8 @@ use log::trace;
 use thiserror::Error;
 
 use crate::{
-    coroutine::{
-        EmailBackend, EmailCoroutine, EmailCoroutineArg, EmailCoroutineState, FsBatch, FsStep,
-    },
     flag::{Flag, FlagOp},
-    m2dir::convert::{InvalidMailboxName, files_out, flags_to_m2dir, paths_out, resolve_mailbox},
+    m2dir::convert::{InvalidMailboxName, flags_to_m2dir, resolve_mailbox},
 };
 
 /// Errors produced by [`M2dirFlagStore`].
@@ -44,10 +41,6 @@ pub enum M2dirFlagStoreError {
     Remove(#[from] RemoveErr),
     #[error(transparent)]
     InvalidMailbox(#[from] InvalidMailboxName),
-    #[error("coroutine was resumed with the wrong EmailCoroutineArg variant")]
-    InvalidArg,
-    #[error("coroutine was resumed with an FsBatch variant it did not request")]
-    UnexpectedBatch,
 }
 
 /// I/O-free coroutine applying a flag store across every id in turn.
@@ -79,51 +72,10 @@ impl M2dirFlagStore {
     }
 }
 
-impl EmailCoroutine for M2dirFlagStore {
-    type Yield = FsStep;
-    type Return = Result<(), M2dirFlagStoreError>;
-
-    const BACKEND: EmailBackend = EmailBackend::M2dir;
-
-    fn resume(
-        &mut self,
-        arg: EmailCoroutineArg<'_>,
-    ) -> EmailCoroutineState<Self::Yield, Self::Return> {
-        #[allow(irrefutable_let_patterns)]
-        let EmailCoroutineArg::Fs { batch } = arg else {
-            return EmailCoroutineState::Complete(Err(M2dirFlagStoreError::InvalidArg));
-        };
-
-        let mut batch = batch;
-        loop {
-            if self.current.is_none() {
-                let Some(id) = self.pending.pop_front() else {
-                    return EmailCoroutineState::Complete(Ok(()));
-                };
-                self.current = Some(Stage::start(&self.m2dir, id, self.flags.clone(), self.op));
-            }
-            let stage = self.current.as_mut().unwrap();
-            match stage.step(batch.take()) {
-                StepOutcome::Done => {
-                    self.current = None;
-                }
-                StepOutcome::Yield(state) => return state,
-                StepOutcome::Err(err) => return EmailCoroutineState::Complete(Err(err)),
-            }
-        }
-    }
-}
-
 enum Stage {
     Add(InnerAdd),
     Set(InnerSet),
     Remove(InnerRemove),
-}
-
-enum StepOutcome {
-    Done,
-    Yield(EmailCoroutineState<FsStep, Result<(), M2dirFlagStoreError>>),
-    Err(M2dirFlagStoreError),
 }
 
 impl Stage {
@@ -134,86 +86,49 @@ impl Stage {
             FlagOp::Remove => Stage::Remove(InnerRemove::new(m2dir, id, flags)),
         }
     }
+}
 
-    fn step(&mut self, batch: Option<FsBatch>) -> StepOutcome {
-        match self {
-            Stage::Add(inner) => {
-                let arg = match batch {
-                    None => None,
-                    Some(FsBatch::FileRead(files)) => Some(M2dirArg::FileRead(
-                        files.into_iter().map(|(k, v)| (k.into(), v)).collect(),
-                    )),
-                    Some(FsBatch::FileCreate) => Some(M2dirArg::FileCreate),
-                    Some(_) => return StepOutcome::Err(M2dirFlagStoreError::UnexpectedBatch),
+impl M2dirCoroutine for M2dirFlagStore {
+    type Yield = M2dirYield;
+    type Return = Result<(), M2dirFlagStoreError>;
+
+    fn resume(&mut self, arg: Option<M2dirArg>) -> M2dirCoroutineState<Self::Yield, Self::Return> {
+        let mut arg = arg;
+        loop {
+            if self.current.is_none() {
+                let Some(id) = self.pending.pop_front() else {
+                    return M2dirCoroutineState::Complete(Ok(()));
                 };
-                match inner.resume(arg) {
-                    M2dirCoroutineState::Complete(Ok(())) => StepOutcome::Done,
-                    M2dirCoroutineState::Yielded(M2dirYield::WantsFileRead(p)) => {
-                        StepOutcome::Yield(EmailCoroutineState::Yielded(FsStep::WantsFileRead(
-                            paths_out(p),
-                        )))
-                    }
-                    M2dirCoroutineState::Yielded(M2dirYield::WantsFileCreate(f)) => {
-                        StepOutcome::Yield(EmailCoroutineState::Yielded(FsStep::WantsFileCreate(
-                            files_out(f),
-                        )))
-                    }
-                    M2dirCoroutineState::Complete(Err(err)) => StepOutcome::Err(err.into()),
-                    _ => unreachable!("M2dirFlagAdd never yields this state"),
-                }
+                self.current = Some(Stage::start(&self.m2dir, id, self.flags.clone(), self.op));
             }
-            Stage::Set(inner) => {
-                let arg = match batch {
-                    None => None,
-                    Some(FsBatch::FileCreate) => Some(M2dirArg::FileCreate),
-                    Some(FsBatch::FileRemove) => Some(M2dirArg::FileRemove),
-                    Some(_) => return StepOutcome::Err(M2dirFlagStoreError::UnexpectedBatch),
-                };
-                match inner.resume(arg) {
-                    M2dirCoroutineState::Complete(Ok(())) => StepOutcome::Done,
-                    M2dirCoroutineState::Yielded(M2dirYield::WantsFileCreate(f)) => {
-                        StepOutcome::Yield(EmailCoroutineState::Yielded(FsStep::WantsFileCreate(
-                            files_out(f),
-                        )))
+            let stage = self.current.as_mut().unwrap();
+            let inner_state = match stage {
+                Stage::Add(inner) => match inner.resume(arg.take()) {
+                    M2dirCoroutineState::Yielded(y) => M2dirCoroutineState::Yielded(y),
+                    M2dirCoroutineState::Complete(r) => {
+                        M2dirCoroutineState::Complete(r.map_err(M2dirFlagStoreError::from))
                     }
-                    M2dirCoroutineState::Yielded(M2dirYield::WantsFileRemove(p)) => {
-                        StepOutcome::Yield(EmailCoroutineState::Yielded(FsStep::WantsFileRemove(
-                            paths_out(p),
-                        )))
+                },
+                Stage::Set(inner) => match inner.resume(arg.take()) {
+                    M2dirCoroutineState::Yielded(y) => M2dirCoroutineState::Yielded(y),
+                    M2dirCoroutineState::Complete(r) => {
+                        M2dirCoroutineState::Complete(r.map_err(M2dirFlagStoreError::from))
                     }
-                    M2dirCoroutineState::Complete(Err(err)) => StepOutcome::Err(err.into()),
-                    _ => unreachable!("M2dirFlagSet never yields this state"),
+                },
+                Stage::Remove(inner) => match inner.resume(arg.take()) {
+                    M2dirCoroutineState::Yielded(y) => M2dirCoroutineState::Yielded(y),
+                    M2dirCoroutineState::Complete(r) => {
+                        M2dirCoroutineState::Complete(r.map_err(M2dirFlagStoreError::from))
+                    }
+                },
+            };
+            match inner_state {
+                M2dirCoroutineState::Yielded(y) => return M2dirCoroutineState::Yielded(y),
+                M2dirCoroutineState::Complete(Ok(())) => {
+                    self.current = None;
                 }
-            }
-            Stage::Remove(inner) => {
-                let arg = match batch {
-                    None => None,
-                    Some(FsBatch::FileRead(files)) => Some(M2dirArg::FileRead(
-                        files.into_iter().map(|(k, v)| (k.into(), v)).collect(),
-                    )),
-                    Some(FsBatch::FileCreate) => Some(M2dirArg::FileCreate),
-                    Some(FsBatch::FileRemove) => Some(M2dirArg::FileRemove),
-                    Some(_) => return StepOutcome::Err(M2dirFlagStoreError::UnexpectedBatch),
-                };
-                match inner.resume(arg) {
-                    M2dirCoroutineState::Complete(Ok(())) => StepOutcome::Done,
-                    M2dirCoroutineState::Yielded(M2dirYield::WantsFileRead(p)) => {
-                        StepOutcome::Yield(EmailCoroutineState::Yielded(FsStep::WantsFileRead(
-                            paths_out(p),
-                        )))
-                    }
-                    M2dirCoroutineState::Yielded(M2dirYield::WantsFileCreate(f)) => {
-                        StepOutcome::Yield(EmailCoroutineState::Yielded(FsStep::WantsFileCreate(
-                            files_out(f),
-                        )))
-                    }
-                    M2dirCoroutineState::Yielded(M2dirYield::WantsFileRemove(p)) => {
-                        StepOutcome::Yield(EmailCoroutineState::Yielded(FsStep::WantsFileRemove(
-                            paths_out(p),
-                        )))
-                    }
-                    M2dirCoroutineState::Complete(Err(err)) => StepOutcome::Err(err.into()),
-                    _ => unreachable!("M2dirFlagRemove never yields this state"),
+                M2dirCoroutineState::Complete(Err(err)) => {
+                    return M2dirCoroutineState::Complete(Err(err));
                 }
             }
         }

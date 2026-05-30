@@ -17,7 +17,7 @@ use core::mem;
 use std::path::PathBuf;
 
 use io_m2dir::{
-    coroutine::{M2dirArg, M2dirCoroutine, M2dirCoroutineState, M2dirYield},
+    coroutine::*,
     coroutines::{
         message_get::{M2dirMessageGet as InnerGet, M2dirMessageGetError as GetErr},
         message_store::{M2dirMessageStore as InnerStore, M2dirMessageStoreError as StoreErr},
@@ -27,15 +27,7 @@ use io_m2dir::{
 use log::trace;
 use thiserror::Error;
 
-use crate::{
-    coroutine::{
-        EmailBackend, EmailCoroutine, EmailCoroutineArg, EmailCoroutineState, FsBatch, FsStep,
-    },
-    m2dir::convert::{
-        InvalidMailboxName, dirread_in, fileread_in, files_out, pairs_out, paths_out, probes_in,
-        resolve_mailbox,
-    },
-};
+use crate::m2dir::convert::{InvalidMailboxName, resolve_mailbox};
 
 /// Errors produced by [`M2dirMessageCopy`].
 #[derive(Debug, Error)]
@@ -46,10 +38,6 @@ pub enum M2dirMessageCopyError {
     Store(#[from] StoreErr),
     #[error(transparent)]
     InvalidMailbox(#[from] InvalidMailboxName),
-    #[error("coroutine was resumed with the wrong EmailCoroutineArg variant")]
-    InvalidArg,
-    #[error("coroutine was resumed with an FsBatch variant it did not request")]
-    UnexpectedBatch,
 }
 
 /// I/O-free coroutine copying every id from `from` to `to`.
@@ -80,129 +68,53 @@ impl M2dirMessageCopy {
     }
 }
 
-impl EmailCoroutine for M2dirMessageCopy {
-    type Yield = FsStep;
+enum Stage {
+    Idle,
+    Getting(InnerGet),
+    Storing(InnerStore),
+}
+
+impl M2dirCoroutine for M2dirMessageCopy {
+    type Yield = M2dirYield;
     type Return = Result<(), M2dirMessageCopyError>;
 
-    const BACKEND: EmailBackend = EmailBackend::M2dir;
-
-    fn resume(
-        &mut self,
-        arg: EmailCoroutineArg<'_>,
-    ) -> EmailCoroutineState<Self::Yield, Self::Return> {
-        #[allow(irrefutable_let_patterns)]
-        let EmailCoroutineArg::Fs { batch } = arg else {
-            return EmailCoroutineState::Complete(Err(M2dirMessageCopyError::InvalidArg));
-        };
-
-        let mut batch = batch;
+    fn resume(&mut self, arg: Option<M2dirArg>) -> M2dirCoroutineState<Self::Yield, Self::Return> {
+        let mut arg = arg;
         loop {
             if matches!(self.stage, Stage::Idle) {
                 let Some(id) = self.pending.pop_front() else {
-                    return EmailCoroutineState::Complete(Ok(()));
+                    return M2dirCoroutineState::Complete(Ok(()));
                 };
                 self.stage = Stage::Getting(InnerGet::new(self.source.clone(), id));
             }
             match mem::replace(&mut self.stage, Stage::Idle) {
                 Stage::Idle => unreachable!(),
-                Stage::Getting(mut get) => {
-                    let inner_arg = match batch.take() {
-                        None => None,
-                        Some(FsBatch::DirRead(entries)) => {
-                            Some(M2dirArg::DirRead(dirread_in(entries)))
-                        }
-                        Some(FsBatch::FileExists(probes)) => {
-                            Some(M2dirArg::FileExists(probes_in(probes)))
-                        }
-                        Some(FsBatch::FileRead(files)) => {
-                            Some(M2dirArg::FileRead(fileread_in(files)))
-                        }
-                        Some(_) => {
-                            return EmailCoroutineState::Complete(Err(
-                                M2dirMessageCopyError::UnexpectedBatch,
-                            ));
-                        }
-                    };
-                    match get.resume(inner_arg) {
-                        M2dirCoroutineState::Complete(Ok(ok)) => {
-                            self.stage =
-                                Stage::Storing(InnerStore::new(self.target.clone(), ok.contents));
-                        }
-                        M2dirCoroutineState::Yielded(M2dirYield::WantsDirRead(p)) => {
-                            self.stage = Stage::Getting(get);
-                            return EmailCoroutineState::Yielded(FsStep::WantsDirRead(paths_out(
-                                p,
-                            )));
-                        }
-                        M2dirCoroutineState::Yielded(M2dirYield::WantsFileExists(p)) => {
-                            self.stage = Stage::Getting(get);
-                            return EmailCoroutineState::Yielded(FsStep::WantsFileExists(
-                                paths_out(p),
-                            ));
-                        }
-                        M2dirCoroutineState::Yielded(M2dirYield::WantsFileRead(p)) => {
-                            self.stage = Stage::Getting(get);
-                            return EmailCoroutineState::Yielded(FsStep::WantsFileRead(paths_out(
-                                p,
-                            )));
-                        }
-                        M2dirCoroutineState::Complete(Err(err)) => {
-                            return EmailCoroutineState::Complete(Err(err.into()));
-                        }
-                        _ => unreachable!("M2dirMessageGet never yields this state"),
+                Stage::Getting(mut get) => match get.resume(arg.take()) {
+                    M2dirCoroutineState::Yielded(y) => {
+                        self.stage = Stage::Getting(get);
+                        return M2dirCoroutineState::Yielded(y);
                     }
-                }
-                Stage::Storing(mut store) => {
-                    let inner_arg = match batch.take() {
-                        None => None,
-                        Some(FsBatch::Pid(p)) => Some(M2dirArg::Pid(p)),
-                        Some(FsBatch::Random(bytes)) => Some(M2dirArg::Random(bytes)),
-                        Some(FsBatch::FileCreate) => Some(M2dirArg::FileCreate),
-                        Some(FsBatch::Rename) => Some(M2dirArg::Rename),
-                        Some(_) => {
-                            return EmailCoroutineState::Complete(Err(
-                                M2dirMessageCopyError::UnexpectedBatch,
-                            ));
-                        }
-                    };
-                    match store.resume(inner_arg) {
-                        M2dirCoroutineState::Complete(Ok(_entry)) => {
-                            // Next id (Idle) or done if pending is
-                            // empty (next loop iter handles both).
-                        }
-                        M2dirCoroutineState::Yielded(M2dirYield::WantsPid) => {
-                            self.stage = Stage::Storing(store);
-                            return EmailCoroutineState::Yielded(FsStep::WantsPid);
-                        }
-                        M2dirCoroutineState::Yielded(M2dirYield::WantsRandom { len }) => {
-                            self.stage = Stage::Storing(store);
-                            return EmailCoroutineState::Yielded(FsStep::WantsRandom { len });
-                        }
-                        M2dirCoroutineState::Yielded(M2dirYield::WantsFileCreate(f)) => {
-                            self.stage = Stage::Storing(store);
-                            return EmailCoroutineState::Yielded(FsStep::WantsFileCreate(
-                                files_out(f),
-                            ));
-                        }
-                        M2dirCoroutineState::Yielded(M2dirYield::WantsRename(pairs)) => {
-                            self.stage = Stage::Storing(store);
-                            return EmailCoroutineState::Yielded(FsStep::WantsRename(pairs_out(
-                                pairs,
-                            )));
-                        }
-                        M2dirCoroutineState::Complete(Err(err)) => {
-                            return EmailCoroutineState::Complete(Err(err.into()));
-                        }
-                        _ => unreachable!("M2dirMessageStore never yields this state"),
+                    M2dirCoroutineState::Complete(Ok(ok)) => {
+                        self.stage =
+                            Stage::Storing(InnerStore::new(self.target.clone(), ok.contents));
                     }
-                }
+                    M2dirCoroutineState::Complete(Err(err)) => {
+                        return M2dirCoroutineState::Complete(Err(err.into()));
+                    }
+                },
+                Stage::Storing(mut store) => match store.resume(arg.take()) {
+                    M2dirCoroutineState::Yielded(y) => {
+                        self.stage = Stage::Storing(store);
+                        return M2dirCoroutineState::Yielded(y);
+                    }
+                    M2dirCoroutineState::Complete(Ok(_entry)) => {
+                        // NOTE: loop back to pull the next id or finish.
+                    }
+                    M2dirCoroutineState::Complete(Err(err)) => {
+                        return M2dirCoroutineState::Complete(Err(err.into()));
+                    }
+                },
             }
         }
     }
-}
-
-enum Stage {
-    Idle,
-    Getting(InnerGet),
-    Storing(InnerStore),
 }
