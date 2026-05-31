@@ -29,4 +29,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Added optional `io-http` and `notify` dependencies, enabled by the `jmap` and `maildir` features respectively for the push / fsnotify transports.
 
+- Added `ping()` on `ImapClientStd` and `SmtpClientStd` (delegates to the inner `noop()`), plus a shared `EmailClientStd::ping()` that pings every registered network backend to reset server-side inactivity timers on long-idle sessions. Storage backends and JMAP are skipped.
+
 [unreleased]: https://github.com/pimalaya/io-email/compare/root..HEAD

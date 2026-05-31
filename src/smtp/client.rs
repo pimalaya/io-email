@@ -106,6 +106,13 @@ impl SmtpClientStd {
         }
     }
 
+    /// Sends a NOOP to keep the connection alive (RFC 5321 §4.1.1.9).
+    /// Sole purpose is to reset the server's inactivity timer on
+    /// long-idle TUI sessions; the response is discarded.
+    pub fn ping(&mut self) -> Result<(), SmtpClientError> {
+        Ok(self.inner.noop()?)
+    }
+
     /// Sends the raw RFC 5322 `raw` message through the authenticated
     /// stream. Reverse path comes from
     /// [`Self::default_reverse_path`] when set, otherwise from the

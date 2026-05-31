@@ -172,6 +172,13 @@ impl ImapClientStd {
         }
     }
 
+    /// Sends a NOOP to keep the connection alive (RFC 3501 §6.1.2).
+    /// Sole purpose is to reset the server's inactivity timer on
+    /// long-idle TUI sessions; the response is discarded.
+    pub fn ping(&mut self) -> Result<(), ImapClientError> {
+        Ok(self.inner.noop()?)
+    }
+
     /// Lists every mailbox visible to the session. When
     /// `with_counts` is set, follows up with one `STATUS` per row
     /// to populate [`Mailbox::total`] / [`Mailbox::unread`].

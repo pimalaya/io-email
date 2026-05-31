@@ -238,6 +238,24 @@ impl EmailClientStd {
         Ok(self.with_smtp(SmtpClientStd::connect(url, tls, starttls, domain, sasl)?))
     }
 
+    /// Pings every registered network backend (IMAP, SMTP) to reset
+    /// the server's inactivity timer on long-idle sessions. Storage
+    /// backends (Maildir, M2dir) and JMAP (HTTP, stateless) have
+    /// nothing to keep alive and are skipped. Returns the first
+    /// error encountered, or `Ok(())` when every registered network
+    /// backend acknowledged the NOOP.
+    pub fn ping(&mut self) -> Result<(), EmailClientStdError> {
+        #[cfg(feature = "imap")]
+        if let Some(c) = self.imap.as_mut() {
+            c.ping()?;
+        }
+        #[cfg(feature = "smtp")]
+        if let Some(c) = self.smtp.as_mut() {
+            c.ping()?;
+        }
+        Ok(())
+    }
+
     // ---- Shared-API dispatch (storage: Maildir → M2dir → JMAP → IMAP) ----
 
     /// Lists every visible mailbox via the highest-priority registered
