@@ -89,6 +89,25 @@ enum State {
     Done,
 }
 
+/// Keeps only LIST rows that can actually be SELECTed. Containers
+/// flagged `\Noselect` (RFC 3501 §6.3.8) cannot hold messages and
+/// would error out on any subsequent shared-API op, so they're
+/// dropped before they reach the caller.
+fn is_selectable(
+    row: &(
+        ImapMailbox<'static>,
+        Option<QuotedChar>,
+        Vec<FlagNameAttribute<'static>>,
+    ),
+) -> bool {
+    let (mailbox, _, attrs) = row;
+    if attrs.contains(&FlagNameAttribute::Noselect) {
+        trace!("skip non-selectable IMAP mailbox {mailbox:?}");
+        return false;
+    }
+    true
+}
+
 /// Converts one IMAP `LIST` row into the shared [`Mailbox`] shape.
 ///
 /// Delimiter and attribute flags are dropped on purpose: they're
@@ -160,7 +179,11 @@ impl ImapCoroutine for ImapMailboxList {
                         return ImapCoroutineState::Yielded(yielded);
                     }
                     ImapCoroutineState::Complete(Ok(rows)) => {
-                        self.mailboxes = rows.into_iter().map(mailbox_from).collect();
+                        self.mailboxes = rows
+                            .into_iter()
+                            .filter(is_selectable)
+                            .map(mailbox_from)
+                            .collect();
                         if !self.with_counts || self.mailboxes.is_empty() {
                             return ImapCoroutineState::Complete(Ok(mem::take(
                                 &mut self.mailboxes,
