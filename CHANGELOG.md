@@ -31,4 +31,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Added `ping()` on `ImapClientStd` and `SmtpClientStd` (delegates to the inner `noop()`), plus a shared `EmailClientStd::ping()` that pings every registered network backend to reset server-side inactivity timers on long-idle sessions. Storage backends and JMAP are skipped.
 
+### Changed
+
+- IMAP `list_mailboxes` now filters out rows carrying the `\Noselect` attribute (RFC 3501 §6.3.8) so the shared API only returns mailboxes that can actually be SELECTed.
+
+- Added an `auto_id: Option<Vec<(IString<'static>, NString<'static>)>>` argument to `ImapClientStd::connect` and `EmailClientStd::connect_imap`; the field is forwarded to the inner io-imap connect, where the auth coroutine chains an RFC 2971 `ID` round-trip after authentication. None skips the exchange (default), Some(empty) sends `ID NIL`, Some(non-empty) sends `ID (key val …)`.
+
 [unreleased]: https://github.com/pimalaya/io-email/compare/root..HEAD

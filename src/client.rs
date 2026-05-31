@@ -52,6 +52,8 @@ use crate::maildir::client::{MaildirClient, MaildirClientError};
 #[cfg(feature = "smtp")]
 use crate::smtp::client::{SmtpClientError, SmtpClientStd};
 
+#[cfg(feature = "imap")]
+use io_imap::types::core::{IString, NString};
 #[cfg(all(
     feature = "smtp",
     any(
@@ -179,7 +181,8 @@ impl EmailClientStd {
     }
 
     /// Opens an IMAP connection via [`ImapClientStd::connect`] and
-    /// registers the resulting client.
+    /// registers the resulting client. See [`ImapClientStd::connect`]
+    /// for the `auto_id` semantics.
     #[cfg(all(
         feature = "imap",
         any(
@@ -194,8 +197,9 @@ impl EmailClientStd {
         tls: &Tls,
         starttls: bool,
         sasl: Option<impl Into<ImapSasl>>,
+        auto_id: Option<Vec<(IString<'static>, NString<'static>)>>,
     ) -> Result<Self, EmailClientStdError> {
-        Ok(self.with_imap(ImapClientStd::connect(url, tls, starttls, sasl)?))
+        Ok(self.with_imap(ImapClientStd::connect(url, tls, starttls, sasl, auto_id)?))
     }
 
     /// Opens a JMAP connection via [`JmapClientStd::connect`] and

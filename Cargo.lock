@@ -689,7 +689,7 @@ dependencies = [
 [[package]]
 name = "io-imap"
 version = "0.0.1"
-source = "git+https://github.com/pimalaya/io-imap#523ce8fd9e09fba5d91c066805e61cd798fab9e2"
+source = "git+https://github.com/pimalaya/io-imap#518da423e551684fa8202a9cc4fede99f1be3f23"
 dependencies = [
  "anyhow",
  "base64",
@@ -863,9 +863,9 @@ dependencies = [
 
 [[package]]
 name = "kqueue"
-version = "1.1.1"
+version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eac30106d7dce88daf4a3fcb4879ea939476d5074a9b7ddd0fb97fa4bed5596a"
+checksum = "273c0752728918e0ac4976f2b275b6fefb9ecd400585dec929419f3844cd87b5"
 dependencies = [
  "kqueue-sys",
  "libc",

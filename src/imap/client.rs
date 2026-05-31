@@ -2,8 +2,8 @@
 //!
 //! Holds an inner [`ImapClientStd`] (from io-imap) wrapping the stream
 //! and its fragmentizer, plus the per-connection knobs the shared-API
-//! IMAP methods need: the `auto_select` policy and the last-known
-//! capability list discovered at login.
+//! IMAP methods need: the `auto_select` policy, the optional `auto_id`
+//! payload, and the last-known capability list discovered at login.
 //!
 //! [`Self::run`] pumps io-email IMAP coroutines directly against the
 //! inner client's stream and fragmentizer; the inner client's own
@@ -29,6 +29,7 @@ use io_imap::{
     client::{ImapClientStd as InnerImapClientStd, ImapClientStdError as InnerImapClientStdError},
     coroutine::*,
     types::{
+        core::{IString, NString},
         fetch::{MacroOrMessageDataItemNames, MessageDataItem, MessageDataItemName},
         mailbox::Mailbox as ImapMailbox,
         response::Capability,
@@ -122,7 +123,13 @@ const READ_BUFFER_SIZE: usize = 16 * 1024;
 /// `auto_select` is the per-message policy flag the IMAP coroutines
 /// read at construction time; flip it off when the caller already
 /// pre-selects the target mailbox. `capabilities` is the live list
-/// discovered at login; `watch_mailbox` needs `QRESYNC` to be present.
+/// discovered at login; `watch_mailbox` needs `QRESYNC` to be
+/// present.
+///
+/// The RFC 2971 `auto_id` knob lives on the inner io-imap client
+/// (`inner.auto_id`) because the auth coroutines themselves chain
+/// the `ID` round-trip; set it before any auth_*/login call (or pass
+/// it through [`Self::connect`]).
 pub struct ImapClientStd {
     pub inner: InnerImapClientStd,
     pub auto_select: bool,
@@ -131,9 +138,9 @@ pub struct ImapClientStd {
 
 impl ImapClientStd {
     /// Wraps an already-connected stream with a fresh inner client,
-    /// the default `auto_select = true` policy and an empty capability
-    /// list. Callers that intend to use `watch_mailbox` should
-    /// populate `capabilities` after login.
+    /// the default `auto_select = true` policy, and an empty
+    /// capability list. Callers that intend to use `watch_mailbox`
+    /// should populate `capabilities` after login.
     pub fn new<S: Read + Write + Send + 'static>(stream: S) -> Self {
         Self {
             inner: InnerImapClientStd::new(stream),
@@ -515,14 +522,18 @@ impl ImapClientStd {
     /// Delegates the protocol dance to
     /// [`InnerImapClientStd::connect`], which also sets a 5 s read
     /// timeout on the underlying socket so [`Self::watch_mailbox`]
-    /// can poll its shutdown flag at every timeout tick.
+    /// can poll its shutdown flag at every timeout tick. `auto_id`
+    /// is forwarded to the inner connect and triggers an RFC 2971
+    /// `ID` round-trip after authentication (see
+    /// [`InnerImapClientStd::auto_id`]).
     pub fn connect(
         url: &Url,
         tls: &Tls,
         starttls: bool,
         sasl: Option<impl Into<Sasl>>,
+        auto_id: Option<Vec<(IString<'static>, NString<'static>)>>,
     ) -> Result<Self, ImapClientError> {
-        let (inner, capabilities) = InnerImapClientStd::connect(url, tls, starttls, sasl)?;
+        let (inner, capabilities) = InnerImapClientStd::connect(url, tls, starttls, sasl, auto_id)?;
         Ok(Self {
             inner,
             auto_select: true,
