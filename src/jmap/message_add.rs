@@ -1,14 +1,12 @@
 //! JMAP message-add coroutine.
 //!
-//! Three-stage state machine:
+//! Two-stage state machine:
 //! 1. `Blob/upload` posts the raw RFC 5322 bytes to the session
 //!    `upload_url` and yields a blob id.
-//! 2. `Mailbox/query + Mailbox/get` resolves the destination mailbox
-//!    name to a JMAP id.
-//! 3. `Email/import` materialises the blob into the resolved mailbox
-//!    with the requested keywords.
+//! 2. `Email/import` materialises the blob into the supplied mailbox
+//!    id with the requested keywords.
 
-use alloc::{collections::BTreeMap, string::String, vec, vec::Vec};
+use alloc::{collections::BTreeMap, string::String, vec::Vec};
 use core::mem;
 
 use io_jmap::{
@@ -21,8 +19,6 @@ use io_jmap::{
     rfc8621::{
         email::EmailImport,
         email_import::{JmapEmailImport as InnerImport, JmapEmailImportError as ImportErr},
-        mailbox::{MailboxFilter, MailboxProperty},
-        mailbox_query::{JmapMailboxQuery as InnerQuery, JmapMailboxQueryError as QueryErr},
     },
 };
 use log::trace;
@@ -30,10 +26,7 @@ use secrecy::SecretString;
 use thiserror::Error;
 use url::Url;
 
-use crate::{
-    flag::Flag,
-    jmap::convert::{find_mailbox_id, keyword_from},
-};
+use crate::{flag::Flag, jmap::convert::keyword_from};
 
 /// Errors produced by [`JmapMessageAdd`].
 #[derive(Debug, Error)]
@@ -41,11 +34,7 @@ pub enum JmapMessageAddError {
     #[error(transparent)]
     BlobUpload(#[from] JmapBlobUploadError),
     #[error(transparent)]
-    Query(#[from] QueryErr),
-    #[error(transparent)]
     Import(#[from] ImportErr),
-    #[error("no JMAP mailbox named `{0}` found")]
-    NotFound(String),
     #[error("resolved JMAP upload URL is invalid: {0}")]
     InvalidUploadUrl(String),
     #[error("Email/import did not create the imported email")]
@@ -60,7 +49,7 @@ pub enum JmapMessageAddError {
 /// mailbox.
 pub struct JmapMessageAdd {
     state: State,
-    mailbox_name: String,
+    mailbox_id: String,
     keywords: BTreeMap<String, bool>,
     session: JmapSession,
     http_auth: SecretString,
@@ -80,7 +69,7 @@ impl JmapMessageAdd {
         let keywords = flags.iter().map(|f| (keyword_from(f), true)).collect();
         Ok(Self {
             state: State::Uploading(upload),
-            mailbox_name: mailbox.into(),
+            mailbox_id: mailbox.into(),
             keywords,
             session: session.clone(),
             http_auth: http_auth.clone(),
@@ -90,10 +79,6 @@ impl JmapMessageAdd {
 
 enum State {
     Uploading(JmapBlobUpload),
-    Resolving {
-        query: InnerQuery,
-        blob_id: String,
-    },
     Importing {
         import: InnerImport,
         client_id: String,
@@ -120,37 +105,8 @@ impl JmapCoroutine for JmapMessageAdd {
                     JmapCoroutineState::Complete(Err(JmapMessageAddError::UnsupportedRedirect))
                 }
                 JmapCoroutineState::Complete(Ok(JmapBlobUploadOutput { blob_id, .. })) => {
-                    let query = match InnerQuery::new(
-                        &self.session,
-                        &self.http_auth,
-                        Some(MailboxFilter {
-                            name: Some(self.mailbox_name.clone()),
-                            ..MailboxFilter::default()
-                        }),
-                        None,
-                        None,
-                        None,
-                        Some(vec![MailboxProperty::Id, MailboxProperty::Name]),
-                    ) {
-                        Ok(q) => q,
-                        Err(err) => return JmapCoroutineState::Complete(Err(err.into())),
-                    };
-                    self.state = State::Resolving { query, blob_id };
-                    JmapCoroutine::resume(self, None)
-                }
-                JmapCoroutineState::Complete(Err(err)) => {
-                    JmapCoroutineState::Complete(Err(err.into()))
-                }
-            },
-            State::Resolving { mut query, blob_id } => match query.resume(bytes) {
-                JmapCoroutineState::Complete(Ok(ok)) => {
-                    let Some(id) = find_mailbox_id(&ok.mailboxes, &self.mailbox_name) else {
-                        return JmapCoroutineState::Complete(Err(JmapMessageAddError::NotFound(
-                            self.mailbox_name.clone(),
-                        )));
-                    };
                     let mut mailbox_ids = BTreeMap::new();
-                    mailbox_ids.insert(id, true);
+                    mailbox_ids.insert(self.mailbox_id.clone(), true);
                     let client_id = String::from("new");
                     let mut imports = BTreeMap::new();
                     imports.insert(
@@ -172,10 +128,6 @@ impl JmapCoroutine for JmapMessageAdd {
                     };
                     self.state = State::Importing { import, client_id };
                     JmapCoroutine::resume(self, None)
-                }
-                JmapCoroutineState::Yielded(y) => {
-                    self.state = State::Resolving { query, blob_id };
-                    JmapCoroutineState::Yielded(y)
                 }
                 JmapCoroutineState::Complete(Err(err)) => {
                     JmapCoroutineState::Complete(Err(err.into()))

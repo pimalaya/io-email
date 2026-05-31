@@ -13,8 +13,6 @@
 //! State machine:
 //!
 //! ```text
-//! Resolving (Mailbox/query, exact-name post-filter)
-//!     ↓ mailbox_id resolved
 //! Subscribing (JmapEventSource, closeafter=state)
 //!     ↓ one StateChange + chunked terminator
 //! FetchingChanges (Email/changes since previous Email-type state)
@@ -42,7 +40,6 @@ use alloc::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     string::String,
     sync::Arc,
-    vec,
     vec::Vec,
 };
 use core::{
@@ -63,8 +60,6 @@ use io_jmap::{
         email::{Email, EmailProperty},
         email_changes::{JmapEmailChanges, JmapEmailChangesError},
         email_get::{JmapEmailGet, JmapEmailGetError},
-        mailbox::{MailboxFilter, MailboxProperty},
-        mailbox_query::{JmapMailboxQuery, JmapMailboxQueryError},
     },
 };
 use log::trace;
@@ -74,7 +69,7 @@ use thiserror::Error;
 use crate::{
     event::WatchEvent,
     flag::Flag,
-    jmap::convert::{account_id_of, envelope_from, envelope_properties, find_mailbox_id},
+    jmap::convert::{account_id_of, envelope_from, envelope_properties},
 };
 
 /// JMAP type tag we subscribe to and diff against.
@@ -86,15 +81,11 @@ const PING_SECONDS: u64 = 30;
 #[derive(Debug, Error)]
 pub enum JmapWatchMailboxError {
     #[error(transparent)]
-    MailboxQuery(#[from] JmapMailboxQueryError),
-    #[error(transparent)]
     EventSource(#[from] JmapEventSourceError),
     #[error(transparent)]
     EmailChanges(#[from] JmapEmailChangesError),
     #[error(transparent)]
     EmailGet(#[from] JmapEmailGetError),
-    #[error("no JMAP mailbox named `{0}` found")]
-    NotFound(String),
 }
 
 /// Per-coroutine Yield: socket I/O on one axis, [`WatchEvent`]s on
@@ -115,8 +106,7 @@ pub enum JmapWatchMailboxYield {
 /// over a single HTTP/1.1 connection.
 pub struct JmapWatchMailbox {
     state: State,
-    mailbox: String,
-    mailbox_id: Option<String>,
+    mailbox_id: String,
     session: JmapSession,
     http_auth: SecretString,
     account_id: String,
@@ -145,22 +135,20 @@ impl JmapWatchMailbox {
         shutdown: Arc<AtomicBool>,
     ) -> Result<Self, JmapWatchMailboxError> {
         trace!("prepare JMAP mailbox watch");
-        let query = JmapMailboxQuery::new(
+        let es = JmapEventSource::new(
             session,
             http_auth,
-            Some(MailboxFilter {
-                name: Some(mailbox.into()),
-                ..MailboxFilter::default()
-            }),
-            None,
-            None,
-            None,
-            Some(vec![MailboxProperty::Id, MailboxProperty::Name]),
+            &[EMAIL_TYPE],
+            PING_SECONDS,
+            CloseAfter::State,
+            shutdown.clone(),
         )?;
         Ok(Self {
-            state: State::Resolving(query),
-            mailbox: mailbox.into(),
-            mailbox_id: None,
+            state: State::Subscribing {
+                es,
+                latest_change: None,
+            },
+            mailbox_id: mailbox.into(),
             session: session.clone(),
             http_auth: http_auth.clone(),
             account_id: account_id_of(session),
@@ -171,9 +159,7 @@ impl JmapWatchMailbox {
             suppress_events: true,
         })
     }
-}
 
-impl JmapWatchMailbox {
     /// Builds a fresh [`State::Subscribing`] (a new SSE round) using
     /// the configured shutdown flag.
     fn fresh_subscription_state(&self) -> Result<State, JmapWatchMailboxError> {
@@ -266,10 +252,6 @@ impl JmapWatchMailbox {
     /// shadow, queueing one [`WatchEvent`] per delta unless the
     /// bootstrap cycle is in progress.
     fn apply_diff(&mut self, emails: Vec<Email>, destroyed: Vec<String>) {
-        let Some(mailbox_id) = self.mailbox_id.as_ref() else {
-            return;
-        };
-
         for email in emails {
             let Some(id) = email.id.clone() else {
                 continue;
@@ -277,7 +259,7 @@ impl JmapWatchMailbox {
             let in_mailbox = email
                 .mailbox_ids
                 .as_ref()
-                .is_some_and(|map| map.get(mailbox_id).copied().unwrap_or(false));
+                .is_some_and(|map| map.get(&self.mailbox_id).copied().unwrap_or(false));
             let new_keywords: BTreeSet<String> = email
                 .keywords
                 .clone()
@@ -295,14 +277,14 @@ impl JmapWatchMailbox {
                         old.difference(&new_keywords).cloned().collect();
                     if !added.is_empty() && !self.suppress_events {
                         self.pending.push_back(WatchEvent::FlagsAdded {
-                            mailbox: self.mailbox.clone(),
+                            mailbox: self.mailbox_id.clone(),
                             id: id.clone(),
                             flags: added.into_iter().map(Flag::from_raw).collect(),
                         });
                     }
                     if !removed.is_empty() && !self.suppress_events {
                         self.pending.push_back(WatchEvent::FlagsRemoved {
-                            mailbox: self.mailbox.clone(),
+                            mailbox: self.mailbox_id.clone(),
                             id: id.clone(),
                             flags: removed.into_iter().map(Flag::from_raw).collect(),
                         });
@@ -312,7 +294,7 @@ impl JmapWatchMailbox {
                     let envelope = envelope_from(email);
                     if !self.suppress_events {
                         self.pending.push_back(WatchEvent::EnvelopeAdded {
-                            mailbox: self.mailbox.clone(),
+                            mailbox: self.mailbox_id.clone(),
                             envelope: envelope.clone(),
                         });
                     }
@@ -321,7 +303,7 @@ impl JmapWatchMailbox {
             } else if was_in_shadow {
                 if !self.suppress_events {
                     self.pending.push_back(WatchEvent::EnvelopeRemoved {
-                        mailbox: self.mailbox.clone(),
+                        mailbox: self.mailbox_id.clone(),
                         id: id.clone(),
                     });
                 }
@@ -332,7 +314,7 @@ impl JmapWatchMailbox {
         for id in destroyed {
             if self.shadow.remove(&id).is_some() && !self.suppress_events {
                 self.pending.push_back(WatchEvent::EnvelopeRemoved {
-                    mailbox: self.mailbox.clone(),
+                    mailbox: self.mailbox_id.clone(),
                     id,
                 });
             }
@@ -353,31 +335,6 @@ impl JmapCoroutine for JmapWatchMailbox {
         let mut bytes = bytes;
         loop {
             match mem::replace(&mut self.state, State::Done) {
-                State::Resolving(mut query) => match query.resume(bytes.take()) {
-                    JmapCoroutineState::Yielded(JmapYield::WantsRead) => {
-                        self.state = State::Resolving(query);
-                        return JmapCoroutineState::Yielded(JmapWatchMailboxYield::WantsRead);
-                    }
-                    JmapCoroutineState::Yielded(JmapYield::WantsWrite(out)) => {
-                        self.state = State::Resolving(query);
-                        return JmapCoroutineState::Yielded(JmapWatchMailboxYield::WantsWrite(out));
-                    }
-                    JmapCoroutineState::Complete(Err(err)) => {
-                        return JmapCoroutineState::Complete(Err(err.into()));
-                    }
-                    JmapCoroutineState::Complete(Ok(ok)) => {
-                        let Some(id) = find_mailbox_id(&ok.mailboxes, &self.mailbox) else {
-                            return JmapCoroutineState::Complete(Err(
-                                JmapWatchMailboxError::NotFound(self.mailbox.clone()),
-                            ));
-                        };
-                        self.mailbox_id = Some(id);
-                        self.state = match self.fresh_subscription_state() {
-                            Ok(s) => s,
-                            Err(err) => return JmapCoroutineState::Complete(Err(err)),
-                        };
-                    }
-                },
                 State::Subscribing {
                     mut es,
                     mut latest_change,
@@ -472,8 +429,6 @@ impl JmapCoroutine for JmapWatchMailbox {
 
 /// Internal progression of [`JmapWatchMailbox`].
 enum State {
-    /// Resolving the mailbox name to a JMAP id.
-    Resolving(JmapMailboxQuery),
     /// Subscribed: one cycle's [`JmapEventSource`] running.
     Subscribing {
         es: JmapEventSource,

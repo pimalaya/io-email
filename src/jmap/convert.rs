@@ -1,7 +1,6 @@
 //! Shared helpers for the JMAP coroutines: keyword translation,
-//! pagination, account id extraction, exact-name mailbox lookup, and
-//! the `Email` → [`Envelope`] conversion used by `envelope_list` and
-//! `message_*`.
+//! pagination, account id extraction, and the `Email` → [`Envelope`]
+//! conversion used by `envelope_list` and `message_*`.
 
 use alloc::{
     string::{String, ToString},
@@ -14,7 +13,6 @@ use io_jmap::rfc8620::session::JmapSession;
 use io_jmap::rfc8621::{
     capabilities,
     email::{Email, EmailAddress as JmapAddress, EmailProperty},
-    mailbox::Mailbox as JmapMailbox,
 };
 
 use crate::{
@@ -67,17 +65,6 @@ pub(crate) fn account_id_of(session: &JmapSession) -> String {
         .get(capabilities::MAIL)
         .cloned()
         .unwrap_or_default()
-}
-
-/// Finds the mailbox whose `name` matches `target` exactly within a
-/// `Mailbox/get` result list. `Mailbox/query` filters with a substring
-/// match, so the post-filter is needed to avoid picking `Inbox.Sub`
-/// when the caller asked for `Inbox`.
-pub(crate) fn find_mailbox_id(mailboxes: &[JmapMailbox], target: &str) -> Option<String> {
-    mailboxes
-        .iter()
-        .find(|m| m.name.as_deref() == Some(target))
-        .and_then(|m| m.id.clone())
 }
 
 /// Properties requested from `Email/get` to populate an [`Envelope`].

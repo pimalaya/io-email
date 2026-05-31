@@ -1,10 +1,9 @@
 //! JMAP envelope-search coroutine.
 //!
-//! Two-stage state machine:
-//! 1. `Mailbox/query + Mailbox/get` resolves the shared mailbox name
-//!    to a JMAP id.
-//! 2. `Email/query + Email/get` (batched in a single HTTP round-trip)
-//!    runs the translated filter + sort scoped to that mailbox.
+//! Single-stage state machine:
+//! `Email/query + Email/get` (batched in a single HTTP round-trip)
+//! runs the translated filter + sort scoped to the supplied mailbox
+//! id.
 //!
 //! The shared filter AST is translated into a JMAP
 //! [`Filter<EmailFilter>`] tree: AND/OR/NOT map to
@@ -30,10 +29,6 @@ use io_jmap::{
     rfc8621::{
         email::{EmailComparator, EmailFilter, EmailSortProperty},
         email_query::{JmapEmailQuery as InnerQuery, JmapEmailQueryError as QueryErr},
-        mailbox::{MailboxFilter, MailboxProperty},
-        mailbox_query::{
-            JmapMailboxQuery as InnerMailboxQuery, JmapMailboxQueryError as MailboxQueryErr,
-        },
     },
 };
 use log::trace;
@@ -42,9 +37,7 @@ use thiserror::Error;
 
 use crate::{
     envelope::Envelope,
-    jmap::convert::{
-        compute_position_limit, envelope_from, envelope_properties, find_mailbox_id, keyword_from,
-    },
+    jmap::convert::{compute_position_limit, envelope_from, envelope_properties, keyword_from},
     search::{
         filter::query::SearchEmailsFilterQuery,
         query::SearchEmailsQuery,
@@ -56,11 +49,7 @@ use crate::{
 #[derive(Debug, Error)]
 pub enum JmapEnvelopeSearchError {
     #[error(transparent)]
-    MailboxQuery(#[from] MailboxQueryErr),
-    #[error(transparent)]
     EmailQuery(#[from] QueryErr),
-    #[error("no JMAP mailbox named `{0}` found")]
-    NotFound(String),
     #[error("coroutine was resumed after completion")]
     ResumedAfterDone,
 }
@@ -74,15 +63,11 @@ pub enum PostFilter {
     AfterDate(NaiveDate),
 }
 
-/// I/O-free coroutine wrapping a mailbox-name lookup + batched
-/// `Email/query` + `Email/get`. Applies any residual `sentAt`
+/// I/O-free coroutine wrapping a batched `Email/query` + `Email/get`
+/// scoped to a JMAP mailbox id. Applies any residual `sentAt`
 /// predicate client-side before paginating.
 pub struct JmapEnvelopeSearch {
     state: State,
-    name: String,
-    session: JmapSession,
-    http_auth: SecretString,
-    query: Option<SearchEmailsQuery>,
     page: Option<u32>,
     page_size: Option<u32>,
 }
@@ -97,24 +82,33 @@ impl JmapEnvelopeSearch {
         page_size: Option<u32>,
     ) -> Result<Self, JmapEnvelopeSearchError> {
         trace!("prepare JMAP envelope search");
-        let resolver = InnerMailboxQuery::new(
+        let Converted {
+            filter,
+            sort,
+            post_filters,
+        } = build(query, mailbox.into());
+
+        let paginate_client_side = !post_filters.is_empty();
+        let (position, limit) = if paginate_client_side {
+            (None, None)
+        } else {
+            compute_position_limit(page, page_size)
+        };
+
+        let inner = InnerQuery::new(
             session,
             http_auth,
-            Some(MailboxFilter {
-                name: Some(mailbox.into()),
-                ..MailboxFilter::default()
-            }),
-            None,
-            None,
-            None,
-            Some(vec![MailboxProperty::Id, MailboxProperty::Name]),
+            Some(filter),
+            Some(sort),
+            position,
+            limit,
+            Some(envelope_properties()),
         )?;
         Ok(Self {
-            state: State::Resolving(resolver),
-            name: mailbox.into(),
-            session: session.clone(),
-            http_auth: http_auth.clone(),
-            query: query.cloned(),
+            state: State::Searching {
+                inner,
+                post_filters,
+            },
             page,
             page_size,
         })
@@ -122,7 +116,6 @@ impl JmapEnvelopeSearch {
 }
 
 enum State {
-    Resolving(InnerMailboxQuery),
     Searching {
         inner: InnerQuery,
         post_filters: Vec<PostFilter>,
@@ -317,53 +310,6 @@ impl JmapCoroutine for JmapEnvelopeSearch {
 
     fn resume(&mut self, bytes: Option<&[u8]>) -> JmapCoroutineState<Self::Yield, Self::Return> {
         match mem::replace(&mut self.state, State::Done) {
-            State::Resolving(mut resolver) => match resolver.resume(bytes) {
-                JmapCoroutineState::Complete(Ok(ok)) => {
-                    let Some(id) = find_mailbox_id(&ok.mailboxes, &self.name) else {
-                        return JmapCoroutineState::Complete(Err(
-                            JmapEnvelopeSearchError::NotFound(self.name.clone()),
-                        ));
-                    };
-
-                    let Converted {
-                        filter,
-                        sort,
-                        post_filters,
-                    } = build(self.query.as_ref(), id);
-
-                    let paginate_client_side = !post_filters.is_empty();
-                    let (position, limit) = if paginate_client_side {
-                        (None, None)
-                    } else {
-                        compute_position_limit(self.page, self.page_size)
-                    };
-
-                    let inner = match InnerQuery::new(
-                        &self.session,
-                        &self.http_auth,
-                        Some(filter),
-                        Some(sort),
-                        position,
-                        limit,
-                        Some(envelope_properties()),
-                    ) {
-                        Ok(q) => q,
-                        Err(err) => return JmapCoroutineState::Complete(Err(err.into())),
-                    };
-                    self.state = State::Searching {
-                        inner,
-                        post_filters,
-                    };
-                    JmapCoroutine::resume(self, None)
-                }
-                JmapCoroutineState::Yielded(y) => {
-                    self.state = State::Resolving(resolver);
-                    JmapCoroutineState::Yielded(y)
-                }
-                JmapCoroutineState::Complete(Err(err)) => {
-                    JmapCoroutineState::Complete(Err(err.into()))
-                }
-            },
             State::Searching {
                 mut inner,
                 post_filters,
