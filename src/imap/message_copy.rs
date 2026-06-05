@@ -1,7 +1,13 @@
-//! IMAP message-copy coroutine.
+//! IMAP message-copy coroutine: optional SELECT then UID COPY (RFC
+//! 3501 §6.4.7).
 //!
-//! Optional `SELECT <from>` (gated on `auto_select`) followed by
-//! `UID COPY <ids> <to>` (RFC 3501 §6.4.7).
+//! # Example
+//!
+//! ```rust,ignore
+//! use io_email::imap::message_copy::ImapMessageCopy;
+//!
+//! client.run(ImapMessageCopy::new("INBOX", "Archive", &["12"], true)?)?;
+//! ```
 
 use alloc::string::String;
 use core::mem;

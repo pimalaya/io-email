@@ -1,9 +1,14 @@
-//! Maildir message-get coroutine.
+//! Maildir message-get coroutine wrapping
+//! [`io_maildir::entry::get::MaildirEntryGet`]: locates the message
+//! across cur/new/tmp and returns raw RFC 5322 bytes.
 //!
-//! Wraps [`io_maildir::entry::get::MaildirEntryGet`]: locates the
-//! message inside the resolved mailbox via the embedded
-//! [`MaildirEntryLocate`](io_maildir::entry::locate::MaildirEntryLocate)
-//! (cur → new → tmp probing) and reads its raw RFC 5322 bytes.
+//! # Example
+//!
+//! ```rust,ignore
+//! use io_email::maildir::message_get::MaildirMessageGet;
+//!
+//! let raw = client.run(MaildirMessageGet::new(&client.store, "INBOX", "msg-id")?)?;
+//! ```
 
 use alloc::vec::Vec;
 

@@ -1,8 +1,14 @@
-//! m2dir message-delete coroutine.
+//! m2dir message-delete coroutine wrapping
+//! [`io_m2dir::entry::delete::M2dirEntryDelete`]: removes the entry
+//! and every .meta/<id>.* sidecar.
 //!
-//! Wraps [`io_m2dir::entry::delete::M2dirEntryDelete`]: locates the
-//! entry file, then removes both the entry and its `.meta/<id>.*`
-//! sidecar files.
+//! # Example
+//!
+//! ```rust,ignore
+//! use io_email::m2dir::message_delete::M2dirMessageDelete;
+//!
+//! client.run(M2dirMessageDelete::new(&client.root, "INBOX", "msg-id")?)?;
+//! ```
 
 use std::path::PathBuf;
 

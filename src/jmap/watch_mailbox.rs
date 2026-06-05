@@ -1,40 +1,21 @@
-//! JMAP watch-mailbox coroutine (generator shape).
+//! JMAP watch-mailbox coroutine: EventSource (closeafter=state) +
+//! Email/changes + Email/get diffed against an in-memory shadow.
 //!
-//! Mirrors the IMAP-IDLE pattern over a single HTTP/1.1 connection
-//! by driving the JMAP EventSource in `closeafter=state` mode: each
-//! subscription cycle delivers exactly one
-//! [`JmapJmapStateChange`](io_jmap::rfc8620::event_source::JmapJmapStateChange),
-//! the server closes the chunked response, the TCP socket is released
-//! (HTTP keep-alive), the coroutine runs the follow-up `Email/changes`
-//! + `Email/get` POSTs on the same connection, diffs the response
-//! against an in-memory shadow, emits one [`WatchEvent`] per delta,
-//! then resubscribes for the next cycle.
+//! State machine: Subscribing → FetchingChanges → FetchingEmails →
+//! Emitting → back to Subscribing. Shutdown via the caller-owned
+//! [`Arc<AtomicBool>`] polled at every resume.
 //!
-//! State machine:
+//! Bootstrap cycle (`sinceState = ""`) returns the full inventory as
+//! `created`; events from that cycle populate the shadow silently.
 //!
-//! ```text
-//! Subscribing (JmapEventSource, closeafter=state)
-//!     ↓ one JmapJmapStateChange + chunked terminator
-//! FetchingChanges (Email/changes since previous Email-type state)
-//!     ↓ created/updated/destroyed ids
-//! FetchingEmails (Email/get on created+updated with envelope + mailboxIds props)
-//!     ↓ shadow diff produces N WatchEvent
-//! Emitting → drain one event per `Yielded(Event(_))`
-//!     ↺ back to Subscribing for next cycle
+//! # Example
+//!
+//! ```rust,ignore
+//! use io_email::jmap::watch_mailbox::JmapWatchMailbox;
+//!
+//! let cor = JmapWatchMailbox::new(&session, &auth, "mailbox-id", shutdown)?;
+//! // drive with a JMAP-aware watch loop that handles the Event yield.
 //! ```
-//!
-//! Cooperative shutdown via the caller-owned [`Arc<AtomicBool>`]:
-//! polled at every resume; transitions to terminal
-//! [`CoroutineState::Complete`] when set. The client driver loop is
-//! the one that has to honour the flag during an in-progress
-//! blocking socket read.
-//!
-//! Bootstrap suppression: the very first subscription cycle runs
-//! against `sinceState = ""`, which on most JMAP servers returns the
-//! mailbox's entire current inventory as `created`. To match the
-//! IMAP watcher's contract (seed → emit only deltas afterwards),
-//! events produced during the bootstrap cycle are silently consumed
-//! to populate the shadow without surfacing them to the caller.
 
 use alloc::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -89,22 +70,19 @@ pub enum JmapWatchMailboxError {
     EmailGet(#[from] JmapEmailGetError),
 }
 
-/// Per-coroutine Yield: socket I/O on one axis, [`WatchEvent`]s on
-/// the other.
+/// Yield mixing socket I/O requests and pre-diffed [`WatchEvent`]s.
 #[derive(Debug)]
 pub enum JmapWatchMailboxYield {
-    /// Driver should read more bytes and feed them back via the
-    /// `bytes` argument on the next resume.
+    /// Read more bytes and feed them via `bytes` on the next resume.
     WantsRead,
-    /// Driver should write these bytes to the socket; the next
-    /// resume typically takes `bytes: None`.
+    /// Write these bytes; the next resume usually takes `bytes: None`.
     WantsWrite(Vec<u8>),
-    /// One pre-diffed delta computed against the in-memory shadow.
+    /// One pre-diffed delta from the in-memory shadow.
     Event(WatchEvent),
 }
 
-/// I/O-free generator-shape coroutine watching a single JMAP mailbox
-/// over a single HTTP/1.1 connection.
+/// I/O-free coroutine watching a single JMAP mailbox over one
+/// HTTP/1.1 connection.
 pub struct JmapWatchMailbox {
     state: State,
     mailbox_id: String,
@@ -112,19 +90,13 @@ pub struct JmapWatchMailbox {
     http_auth: SecretString,
     account_id: String,
     shutdown: Arc<AtomicBool>,
-    /// email_id → keyword bag. Maintained in lockstep with the
-    /// server-side view of the watched mailbox.
+    /// email_id to keyword bag; mirrors the server view of the mailbox.
     shadow: BTreeMap<String, BTreeSet<String>>,
-    /// Latest known Email-type state for the watched account; passed
-    /// as `sinceState` on the next `Email/changes`. `None` on the
-    /// bootstrap cycle.
+    /// Latest Email-type state; `sinceState` on the next Email/changes.
     email_state: Option<String>,
-    /// FIFO of events to emit one per resume between subscription
-    /// cycles.
+    /// FIFO of events drained one per resume between cycles.
     pending: VecDeque<WatchEvent>,
-    /// `true` until the bootstrap cycle has populated the shadow.
-    /// Events produced while set are dropped (they would otherwise
-    /// fire one EnvelopeAdded per existing email at startup).
+    /// True until the bootstrap cycle has populated the shadow.
     suppress_events: bool,
 }
 
@@ -161,8 +133,7 @@ impl JmapWatchMailbox {
         })
     }
 
-    /// Builds a fresh [`State::Subscribing`] (a new SSE round) using
-    /// the configured shutdown flag.
+    /// Fresh [`State::Subscribing`] for the next SSE round.
     fn fresh_subscription_state(&self) -> Result<State, JmapWatchMailboxError> {
         let es = JmapEventSource::new(
             &self.session,
@@ -178,9 +149,8 @@ impl JmapWatchMailbox {
         })
     }
 
-    /// Cycle ended: inspect the `JmapStateChange` (if any) and decide
-    /// whether to issue `Email/changes`, queue a `KeepAlive`, or
-    /// resubscribe immediately.
+    /// Inspects the trailing [`JmapStateChange`] and picks the next
+    /// State: Email/changes, KeepAlive, or fresh subscription.
     fn handle_cycle_end(
         &mut self,
         change: Option<JmapStateChange>,
@@ -193,10 +163,9 @@ impl JmapWatchMailbox {
 
         let needs_diff = match (&observed_state, &self.email_state) {
             (Some(observed), Some(known)) => observed != known,
-            // Bootstrap cycle or first observation: always sync.
+            // NOTE: bootstrap or first observation: always sync.
             (_, None) => true,
-            // Server reported no Email state at all (KeepAlive or
-            // non-Email change for our account): nothing to do.
+            // NOTE: no Email state for our account: nothing to do.
             (None, _) => false,
         };
 
@@ -217,8 +186,8 @@ impl JmapWatchMailbox {
         Ok(State::Emitting)
     }
 
-    /// Builds an `Email/get` for the union of created+updated ids
-    /// and stashes the destroyed-id list for later diffing.
+    /// Email/get for the union of created+updated ids; carries the
+    /// destroyed list for later diffing.
     fn dispatch_get(&self, ok: JmapChangesOutput) -> Result<State, JmapWatchMailboxError> {
         let JmapChangesOutput {
             new_state,
@@ -250,9 +219,8 @@ impl JmapWatchMailbox {
         })
     }
 
-    /// Folds the freshly-fetched emails + destroyed ids into the
-    /// shadow, queueing one [`WatchEvent`] per delta unless the
-    /// bootstrap cycle is in progress.
+    /// Folds emails + destroyed ids into the shadow, queueing one
+    /// [`WatchEvent`] per delta unless the bootstrap cycle is running.
     fn apply_diff(&mut self, emails: Vec<JmapEmail>, destroyed: Vec<String>) {
         for email in emails {
             let Some(id) = email.id.clone() else {
@@ -431,24 +399,16 @@ impl JmapCoroutine for JmapWatchMailbox {
 
 /// Internal progression of [`JmapWatchMailbox`].
 enum State {
-    /// Subscribed: one cycle's [`JmapEventSource`] running.
     Subscribing {
         es: JmapEventSource,
         latest_change: Option<JmapStateChange>,
     },
-    /// Running `Email/changes` since the last known Email-type
-    /// state.
     FetchingChanges(JmapEmailChanges),
-    /// Running `Email/get` on the changed ids; carries the
-    /// destroyed-id list and the post-changes state to commit on
-    /// completion.
     FetchingEmails {
         get: JmapEmailGet,
         destroyed: Vec<String>,
         new_state: String,
     },
-    /// Draining the per-cycle event queue one at a time.
     Emitting,
-    /// Terminal.
     Done,
 }

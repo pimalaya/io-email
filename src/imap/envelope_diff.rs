@@ -1,10 +1,5 @@
-//! IMAP incremental envelope fetch (CONDSTORE / QRESYNC).
-//!
-//! Helpers used by [`crate::client::EmailClientStd::diff_envelopes`]
-//! to encode the opaque state blob, build the QRESYNC SELECT
-//! parameter, scope the follow-up UID FETCH against the highest known
-//! UID, and translate QRESYNC's implicit FETCH payload into
-//! [`crate::envelope::FlagUpdate`].
+//! Helpers for incremental envelope sync (CONDSTORE / QRESYNC) used
+//! by [`crate::client::EmailClientStd::diff_envelopes`].
 
 use core::num::NonZeroU32;
 
@@ -26,14 +21,13 @@ use crate::{
     imap::envelope_list::envelope_from,
 };
 
-/// Wire size of [`ImapState::encode`] / [`ImapState::decode`]:
-/// `uid_validity` (u32 LE) + `highest_mod_seq` (u64 LE) +
-/// `highest_uid` (u32 LE).
+/// Wire size of an [`ImapState`]: uid_validity (u32) + highest_mod_seq
+/// (u64) + highest_uid (u32), little-endian.
 const STATE_BYTES: usize = 4 + 8 + 4;
 
-/// Decoded IMAP checkpoint. `uid_validity` and `highest_mod_seq` feed
-/// `SELECT (QRESYNC ...)`; `highest_uid` scopes the follow-up
-/// `UID FETCH <high+1>:*` for newly added messages.
+/// IMAP sync checkpoint: uid_validity + highest_mod_seq feed SELECT
+/// (QRESYNC ...); highest_uid scopes the follow-up UID FETCH
+/// high+1:*.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ImapState {
     pub uid_validity: u32,
@@ -42,9 +36,8 @@ pub struct ImapState {
 }
 
 impl ImapState {
-    /// Decodes an opaque byte blob produced by [`Self::encode`].
-    /// Returns `None` when the length is wrong; callers should treat
-    /// that as "no usable state" and fall through to a full list.
+    /// Decodes a byte blob produced by [`Self::encode`]; `None` on
+    /// length mismatch (treat as no usable state).
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         if bytes.len() != STATE_BYTES {
             return None;
@@ -61,8 +54,7 @@ impl ImapState {
         })
     }
 
-    /// Encodes the checkpoint into a 16-byte little-endian blob. The
-    /// engine stores this opaquely; only this module reads it.
+    /// Encodes the checkpoint into a 16-byte little-endian blob.
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(STATE_BYTES);
         out.extend_from_slice(&self.uid_validity.to_le_bytes());
@@ -72,10 +64,9 @@ impl ImapState {
     }
 }
 
-/// FETCH items for the follow-up `UID FETCH <high+1>:*`, the same set
-/// used by [`crate::imap::envelope_list::build_item_names`] minus
-/// `BodyStructure` (incremental sync does not care about attachment
-/// detection).
+/// FETCH items for the follow-up UID FETCH high+1:*; same as
+/// [`crate::imap::envelope_list::build_item_names`] without
+/// BodyStructure.
 pub fn new_message_item_names() -> MacroOrMessageDataItemNames<'static> {
     MacroOrMessageDataItemNames::MessageDataItemNames(vec![
         MessageDataItemName::Uid,
@@ -85,17 +76,14 @@ pub fn new_message_item_names() -> MacroOrMessageDataItemNames<'static> {
     ])
 }
 
-/// IMAP UID sequence-set spelling `(high+1):*`. Returns `None` when
-/// `high.checked_add(1)` overflows (a 4-billion-UID mailbox is not
-/// our problem).
+/// UID sequence-set high+1:*; `None` on overflow.
 pub fn new_message_window(high: u32) -> Option<String> {
     let start = high.checked_add(1)?;
     Some(format!("{start}:*"))
 }
 
 /// Translates one QRESYNC implicit `* FETCH` payload into a
-/// [`FlagUpdate`]. Returns `None` when neither UID nor FLAGS were
-/// surfaced (an unsupported response shape, not a fatal error).
+/// [`FlagUpdate`]; `None` when neither UID nor FLAGS were surfaced.
 pub fn flag_update_from_items(items: &[MessageDataItem<'static>]) -> Option<FlagUpdate> {
     let mut uid: Option<NonZeroU32> = None;
     let mut flags: Option<alloc::collections::BTreeSet<Flag>> = None;
@@ -123,9 +111,8 @@ pub fn flag_update_from_items(items: &[MessageDataItem<'static>]) -> Option<Flag
     })
 }
 
-/// Builds an [`crate::envelope::Envelope`] from a raw FETCH item list.
-/// Thin wrapper around [`envelope_from`] so the changes path does not
-/// need to import private symbols.
+/// Builds an [`crate::envelope::Envelope`] from a FETCH item list;
+/// thin wrapper over [`envelope_from`].
 pub fn envelope_from_items(items: Vec<MessageDataItem<'static>>) -> Envelope {
     envelope_from(0, items)
 }

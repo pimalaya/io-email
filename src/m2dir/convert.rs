@@ -1,6 +1,5 @@
-//! Shared helpers for the m2dir coroutines: mailbox-name to on-disk
-//! path resolution, flag / address conversions used by `envelope_list`,
-//! and `paginate` shared with the maildir backend.
+//! Shared helpers for the m2dir coroutines: mailbox path resolution,
+//! flag and address conversions, plus `paginate` shared with maildir.
 
 use alloc::{
     string::{String, ToString},
@@ -32,15 +31,14 @@ pub enum InvalidMailboxName {
     Store(#[from] M2dirStoreError),
 }
 
-/// Builds an [`M2dirStore`] handle from the shared root.
+/// Builds an [`M2dirStore`] from a shared root path.
 pub(crate) fn store_from_root(root: impl Into<PathBuf>) -> M2dirStore {
     let path: M2dirPath = root.into().into();
     M2dirStore::from_path(path)
 }
 
-/// Resolves a mailbox name to its on-disk m2dir directory under the
-/// configured root. Honours the same `/`-separated convention as
-/// io-m2dir's `M2dirStore::resolve_folder_path`.
+/// Resolves a mailbox name to its on-disk m2dir under the store
+/// root; same `/`-separated convention as io-m2dir.
 pub(crate) fn resolve_mailbox(
     root: impl Into<PathBuf>,
     name: &str,
@@ -50,26 +48,23 @@ pub(crate) fn resolve_mailbox(
     Ok(M2dir::from_path(path))
 }
 
-/// Parses a `.meta/<id>.flags` line into a shared [`Flag`]. Whitespace
-/// is trimmed so stray editor newlines do not break IANA recognition.
+/// One .meta/<id>.flags line to shared [`Flag`]; whitespace trimmed.
 pub(crate) fn flag_from_meta_line(line: &str) -> Flag {
     Flag::from_raw(line.trim())
 }
 
-/// Inverse of [`flag_from_meta_line`]: each flag is serialised on its
-/// own line in canonical wire form.
+/// Inverse of [`flag_from_meta_line`]: one canonical line per flag.
 pub(crate) fn flag_to_meta_line(flag: &Flag) -> String {
     flag.raw().to_string()
 }
 
-/// Builds an [`M2dirFlags`] payload from the shared flag slice.
+/// Shared flag slice to [`M2dirFlags`].
 pub(crate) fn flags_to_m2dir(flags: &[Flag]) -> M2dirFlags {
     flags.iter().map(flag_to_meta_line).collect()
 }
 
-/// Folds an entry + meta flags + parsed message into a shared
-/// [`Envelope`]. `has_attachment` is left `None`; the caller can
-/// overwrite it after a full body parse.
+/// Folds an entry + meta flags + parsed message into an [`Envelope`];
+/// `has_attachment` is left `None` for the caller to fill in.
 pub fn envelope_from(
     entry: &M2dirEntry,
     meta: &M2dirFlags,
@@ -98,9 +93,8 @@ pub fn envelope_from(
     }
 }
 
-/// 1-indexed pagination on an in-memory list. `page_size = None`
-/// returns the full slice; `page_size = 0` or a page past the end
-/// returns an empty vector.
+/// 1-indexed in-memory pagination; `page_size = None` returns the
+/// full slice; size 0 or a page past the end returns empty.
 pub(crate) fn paginate<T>(items: Vec<T>, page: Option<u32>, page_size: Option<u32>) -> Vec<T> {
     let Some(size) = page_size else {
         return items;

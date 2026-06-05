@@ -1,17 +1,18 @@
-//! IMAP watch-envelopes coroutine (generator shape).
+//! IMAP watch-mailbox coroutine wrapping
+//! [`io_imap::watch::ImapMailboxWatch`] (IDLE + QRESYNC).
 //!
-//! Wraps [`io_imap::watch::ImapMailboxWatch`]: the inner watcher runs
-//! the IDLE + QRESYNC dance, maintains its own UID→flag shadow, and
-//! emits pre-diffed deltas. This module translates each delta into
-//! the shared [`WatchEvent`] surface and threads everything through
-//! the [`io_imap::coroutine::ImapCoroutine`] trait so the I/O steps
-//! and the domain events ride on the same Yield axis.
+//! Translates inner deltas into shared [`WatchEvent`]s. The caller
+//! owns the shutdown [`Arc<AtomicBool>`](alloc::sync::Arc); flipping
+//! it winds the IDLE down at the next loop tick.
 //!
-//! Cooperative shutdown: the caller owns the
-//! [`Arc<AtomicBool>`](alloc::sync::Arc) handed to [`Self::new`].
-//! Flipping it asks the running IDLE to wind down at its next loop
-//! tick; on the following resume the coroutine returns
-//! [`CoroutineState::Complete`] with `Ok(())`.
+//! # Example
+//!
+//! ```rust,ignore
+//! use io_email::imap::watch_mailbox::ImapWatchMailbox;
+//!
+//! let cor = ImapWatchMailbox::new("INBOX", &capabilities, shutdown)?;
+//! // drive via the same client.run as the other IMAP coroutines.
+//! ```
 
 use alloc::{
     collections::BTreeSet,
@@ -57,39 +58,27 @@ impl From<InvalidMailboxName> for ImapWatchMailboxError {
     }
 }
 
-/// Per-coroutine Yield: socket I/O step requests on one axis, domain
-/// events on the other. The driver dispatches on the variant: I/O
-/// variants pump the IMAP socket, [`Self::Event`] is delivered to the
-/// caller (callback / channel / async stream — driver's choice).
+/// Yield mixing socket I/O requests and pre-diffed domain events.
 #[derive(Debug)]
 pub enum ImapWatchMailboxYield {
-    /// Socket: read more bytes and feed them back via the `bytes`
-    /// argument on the next resume.
+    /// Read more bytes and feed them via `bytes` on the next resume.
     WantsRead,
-    /// Socket: write these bytes; the next resume typically takes
-    /// `bytes: None`.
+    /// Write these bytes; the next resume usually takes `bytes: None`.
     WantsWrite(Vec<u8>),
-    /// Domain: one pre-diffed delta computed by the inner watcher.
+    /// One pre-diffed delta from the inner watcher.
     Event(WatchEvent),
 }
 
-/// I/O-free generator-shape coroutine watching a single IMAP mailbox
-/// for envelope-level deltas.
+/// I/O-free coroutine watching a single IMAP mailbox for
+/// envelope-level deltas.
 pub struct ImapWatchMailbox {
     inner: InnerWatch,
     mailbox: String,
 }
 
 impl ImapWatchMailbox {
-    /// Constructs the inner watcher. `capabilities` must include
-    /// `QRESYNC` (RFC 7162); the inner constructor checks and errors
-    /// otherwise. Run `CAPABILITY` (or
-    /// [`io_imap::sasl`]-flavoured login with `ensure_capabilities`)
-    /// before reaching here so the slice is non-empty.
-    ///
-    /// `shutdown` is shared with the caller; the watcher polls it on
-    /// every loop iteration and winds the IDLE down cleanly when
-    /// flipped.
+    /// `capabilities` must include QRESYNC (RFC 7162). The watcher
+    /// polls `shutdown` on every loop iteration.
     pub fn new(
         mailbox: &str,
         capabilities: &[Capability<'static>],
@@ -104,11 +93,7 @@ impl ImapWatchMailbox {
     }
 }
 
-/// Translates an io-imap delta into the shared [`WatchEvent`] shape.
-/// `EnvelopeAdded` rebuilds a full [`crate::envelope::Envelope`] via
-/// [`envelope_from`]; `FlagsAdded` / `FlagsRemoved` map wire-level
-/// flags via [`flag_from_imap`]; `EnvelopeRemoved` carries the UID as
-/// the shared id.
+/// Translates an io-imap delta into a shared [`WatchEvent`].
 fn translate_event(mailbox: &str, evt: ImapMailboxWatchEvent) -> WatchEvent {
     match evt {
         ImapMailboxWatchEvent::EnvelopeAdded { uid, items } => WatchEvent::EnvelopeAdded {
@@ -138,9 +123,7 @@ fn translate_event(mailbox: &str, evt: ImapMailboxWatchEvent) -> WatchEvent {
     }
 }
 
-/// Converts a wire-level IMAP flag into a shared [`Flag`] using the
-/// same `to_string` → [`Flag::from_raw`] path the envelope listing
-/// uses.
+/// Wire IMAP flag to shared [`Flag`] via `to_string` + [`Flag::from_raw`].
 fn flag_from_imap(flag: ImapFlag<'_>) -> Flag {
     Flag::from_raw(flag.to_string())
 }

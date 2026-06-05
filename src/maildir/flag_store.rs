@@ -1,11 +1,17 @@
-//! Maildir flag-store coroutine.
+//! Maildir flag-store coroutine: walks every id and drives one
+//! per-id inner coroutine ([`MaildirFlagsAdd`] / [`MaildirFlagsSet`] /
+//! [`MaildirFlagsRemove`]) per pass.
 //!
-//! Drives the io-maildir
-//! [`MaildirFlagsAdd`] / [`MaildirFlagsSet`] / [`MaildirFlagsRemove`]
-//! triad in a single state machine that walks every `id` in turn.
-//! Each per-id inner coroutine locates the message file (cur, new),
-//! computes the new info-section letter set, and yields a single
-//! [`MaildirYield::WantsRename`].
+//! Each inner coroutine relocates the message file in cur/new with
+//! the updated info-section letters.
+//!
+//! # Example
+//!
+//! ```rust,ignore
+//! use io_email::{flag::FlagOp, maildir::flag_store::MaildirFlagStore};
+//!
+//! client.run(MaildirFlagStore::new(&client.store, "INBOX", &["msg-id"], &flags, FlagOp::Add)?)?;
+//! ```
 //!
 //! [`MaildirFlagsAdd`]: io_maildir::flag::add::MaildirFlagsAdd
 //! [`MaildirFlagsSet`]: io_maildir::flag::set::MaildirFlagsSet
@@ -110,7 +116,7 @@ impl MaildirCoroutine for MaildirFlagStore {
                 self.current = Some(Stage::start(&self.maildir, id, self.flags.clone(), self.op));
             }
 
-            // SAFETY by construction: `current` was just set if it was None.
+            // SAFETY: `current` was just set above if it was None.
             let stage = self.current.as_mut().unwrap();
             match stage.resume_passthrough(arg.take()) {
                 MaildirCoroutineState::Complete(Ok(())) => {

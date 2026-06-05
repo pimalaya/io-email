@@ -1,24 +1,17 @@
-//! Maildir envelope-search coroutine.
+//! Maildir envelope-search coroutine: same two-phase shape as
+//! [`crate::maildir::envelope_list::MaildirEnvelopeList`], with shared
+//! filter + sort + paginate applied client-side.
 //!
-//! Same two-phase shape as
-//! [`crate::maildir::envelope_list::MaildirEnvelopeList`]:
+//! Body filters reuse the already-loaded message bytes via
+//! [`mail_parser::MessageParser`]; no second read pass.
 //!
-//! 1. [`MaildirMessagesList`] walks `cur/` + `new/` and returns one
-//!    [`MaildirEntry`] per file.
-//! 2. A second pass batches the entry paths through
-//!    [`MaildirYield::WantsFileRead`]; the driver reads each file and
-//!    feeds the bytes back so the coroutine can build envelopes
-//!    (subject, from, to, date, flags) via [`mail_parser::Message`],
-//!    evaluate the shared filter against those envelopes (with `body`
-//!    filters falling back to a scan of the same in-memory bytes),
-//!    apply the sort chain, and paginate.
+//! # Example
 //!
-//! Body-filter handling: the listing pass already loads every
-//! candidate file's bytes for header parsing, so `body <pattern>`
-//! reuses that buffer to scan plain-text and HTML body parts via
-//! [`mail_parser::MessageParser`]. No extra round-trip is needed.
+//! ```rust,ignore
+//! use io_email::maildir::envelope_search::MaildirEnvelopeSearch;
 //!
-//! [`MaildirEntryList`]: io_maildir::entry::list::MaildirEntryList
+//! let envs = client.run(MaildirEnvelopeSearch::new(&client.store, "INBOX", Some(&query), None, None)?)?;
+//! ```
 
 use alloc::{
     collections::BTreeSet,
@@ -67,10 +60,8 @@ pub enum MaildirEnvelopeSearchError {
     ResumedAfterDone,
 }
 
-/// I/O-free coroutine listing every message inside a single Maildir,
-/// then applying the shared filter + sort + paginate client-side.
-/// `page = None` is treated as page 1; `page_size = None` keeps the
-/// whole match.
+/// I/O-free coroutine listing then client-side filtering + sorting +
+/// paginating a Maildir's messages.
 pub struct MaildirEnvelopeSearch {
     state: State,
     filter: Option<SearchEmailsFilterQuery>,
@@ -172,8 +163,8 @@ enum State {
     Done,
 }
 
-/// Builds an [`Envelope`] from a Maildir file: filename letters for
-/// flags, RFC 5322 headers via mail-parser.
+/// Builds an [`Envelope`] from a Maildir file: filename flags +
+/// RFC 5322 headers via mail-parser.
 fn envelope_from_bytes(path: &FsPath, bytes: &[u8]) -> Envelope {
     let entry = MaildirFullEntry::from((path.clone(), bytes.to_vec()));
     let id = entry.id().unwrap_or_default().to_string();
@@ -250,8 +241,7 @@ fn addresses_from(addrs: &MailParserAddress<'_>) -> Vec<Address> {
         .collect()
 }
 
-/// Evaluates `filter` against `envelope`. `body` clauses re-parse
-/// `raw` to scan the message's text and HTML body parts.
+/// Evaluates `filter` against `envelope`; `body` re-parses `raw`.
 fn matches_filter(envelope: &Envelope, raw: &[u8], filter: &SearchEmailsFilterQuery) -> bool {
     use SearchEmailsFilterQuery as Q;
 
@@ -291,9 +281,7 @@ fn body_contains(raw: &[u8], pattern: &str) -> bool {
     false
 }
 
-/// Sliding-window case-insensitive substring search on raw bytes.
-/// Used for body matching where we want to avoid the UTF-8 decode
-/// cost on a multi-megabyte payload.
+/// Case-insensitive substring search on raw bytes, ASCII semantics.
 fn contains_ignore_ascii_case(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() {
         return true;

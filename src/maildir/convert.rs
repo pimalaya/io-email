@@ -1,6 +1,5 @@
 //! Shared helpers for the Maildir coroutines: flag conversions,
-//! logical-mailbox-name validation, and `paginate` shared with the
-//! m2dir backend.
+//! mailbox-name validation, and `paginate` shared with m2dir.
 
 use alloc::{
     string::{String, ToString},
@@ -20,13 +19,9 @@ use crate::flag::{Flag, IanaFlag};
 #[error("invalid Maildir mailbox `{0}`")]
 pub struct InvalidMailboxName(pub String);
 
-/// Validates a logical mailbox `name` and returns the matching
-/// [`MaildirPath`]. The store handles the layout-aware translation
-/// to an on-disk path through its `maildirpp` switch.
-///
-/// - empty name maps to the store root (INBOX-equivalent under
-///   Maildir++);
-/// - `..` segments are rejected so callers cannot escape the store.
+/// Validates a logical mailbox `name`; rejects `..` segments so
+/// callers cannot escape the store. Empty name maps to the store root
+/// (INBOX-equivalent under Maildir++).
 pub(crate) fn mailbox_path(name: &str) -> Result<MaildirPath, InvalidMailboxName> {
     if name.split('/').any(|seg| seg == "..") {
         return Err(InvalidMailboxName(name.to_string()));
@@ -34,9 +29,8 @@ pub(crate) fn mailbox_path(name: &str) -> Result<MaildirPath, InvalidMailboxName
     Ok(MaildirPath::from(name))
 }
 
-/// Maps a shared [`Flag`] onto a [`MaildirFlag`]. Non-IANA keywords
-/// flow through as [`MaildirFlag::Keyword`], preserving the wire
-/// spelling for the dovecot-keywords sidecar.
+/// Maps a shared [`Flag`] to a [`MaildirFlag`]; non-IANA keywords go
+/// through [`MaildirFlag::Keyword`] for the dovecot-keywords sidecar.
 pub(crate) fn flag_to_maildir(flag: &Flag) -> MaildirFlag {
     match flag.iana() {
         Some(IanaFlag::Seen) => MaildirFlag::Seen,
@@ -49,15 +43,13 @@ pub(crate) fn flag_to_maildir(flag: &Flag) -> MaildirFlag {
     }
 }
 
-/// Builds a [`MaildirFlags`] set from the shared flag slice for the
-/// inner io-maildir coroutines.
+/// Shared flag slice to [`MaildirFlags`].
 pub(crate) fn flags_to_maildir(flags: &[Flag]) -> MaildirFlags {
     flags.iter().map(flag_to_maildir).collect()
 }
 
-/// Builds a shared [`Flag`] from a Maildir info-section letter
-/// (`S`, `R`, `F`, `D`, `T`, `P`). Returns `None` for letters outside
-/// the standard six (dovecot custom-keyword slots `a..z` etc.).
+/// Maildir info-section letter (S/R/F/D/T/P) to shared [`Flag`];
+/// `None` for letters outside the standard six.
 pub(crate) fn flag_from_char(c: char) -> Option<Flag> {
     match c {
         'S' => Some(Flag::from_iana(IanaFlag::Seen)),
@@ -70,11 +62,8 @@ pub(crate) fn flag_from_char(c: char) -> Option<Flag> {
     }
 }
 
-/// 1-indexed pagination on an in-memory list. `page_size = None`
-/// returns the full slice; `page_size = 0` or a page past the end
-/// returns an empty vector. Shared between Maildir and m2dir
-/// envelope listings whose backends don't paginate at the filesystem
-/// level.
+/// 1-indexed in-memory pagination shared with m2dir; `page_size = None`
+/// returns the full slice; size 0 or a page past the end returns empty.
 pub(crate) fn paginate<T>(items: Vec<T>, page: Option<u32>, page_size: Option<u32>) -> Vec<T> {
     let Some(size) = page_size else {
         return items;

@@ -1,7 +1,14 @@
-//! Maildir mailbox-delete coroutine.
+//! Maildir mailbox-delete coroutine wrapping
+//! [`io_maildir::maildir::delete::MaildirDelete`]: recursively removes
+//! the mailbox directory under the [`MaildirStore`].
 //!
-//! Wraps [`io_maildir::maildir::delete::MaildirDelete`]: recursively
-//! removes the on-disk directory for the named mailbox.
+//! # Example
+//!
+//! ```rust,ignore
+//! use io_email::maildir::mailbox_delete::MaildirMailboxDelete;
+//!
+//! client.run(MaildirMailboxDelete::new(&client.store, "Archive")?)?;
+//! ```
 
 use io_maildir::{
     coroutine::*,
@@ -24,8 +31,7 @@ pub enum MaildirMailboxDeleteError {
     InvalidMailbox(#[from] InvalidMailboxName),
 }
 
-/// I/O-free coroutine deleting a Maildir mailbox under the configured
-/// store.
+/// I/O-free coroutine deleting a Maildir mailbox under the store.
 pub struct MaildirMailboxDelete {
     inner: InnerMaildirDelete,
 }

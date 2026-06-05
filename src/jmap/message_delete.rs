@@ -1,6 +1,13 @@
-//! JMAP message-delete coroutine: `Email/set { destroy }` (RFC 8621
-//! §4.7). Removes the email from every mailbox it references; JMAP's
-//! data model treats `destroy` as a global delete.
+//! JMAP message-delete coroutine wrapping Email/set { destroy } (RFC
+//! 8621 §4.7); JMAP destroy is a global delete across all mailboxes.
+//!
+//! # Example
+//!
+//! ```rust,ignore
+//! use io_email::jmap::message_delete::JmapMessageDelete;
+//!
+//! client.run(JmapMessageDelete::new(&session, &auth, "_", "email-id")?)?;
+//! ```
 
 use alloc::{string::String, vec};
 
@@ -31,8 +38,7 @@ pub struct JmapMessageDelete {
 }
 
 impl JmapMessageDelete {
-    /// `mailbox` is part of the shared signature for symmetry with
-    /// IMAP / Maildir but is unused: JMAP destroy is global.
+    /// `mailbox` is unused; kept for shared-API symmetry.
     pub fn new(
         session: &JmapSession,
         http_auth: &SecretString,

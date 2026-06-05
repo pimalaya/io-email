@@ -1,9 +1,14 @@
-//! m2dir message-get coroutine.
+//! m2dir message-get coroutine wrapping
+//! [`io_m2dir::entry::get::M2dirEntryGet`]: locates the entry file by
+//! id, validates the checksum, and returns raw RFC 5322 bytes.
 //!
-//! Wraps [`io_m2dir::entry::get::M2dirEntryGet`]: walks the m2dir
-//! entry directory until it finds the file whose id matches, then
-//! reads its bytes. The checksum embedded in the filename is
-//! validated by the inner coroutine before yielding.
+//! # Example
+//!
+//! ```rust,ignore
+//! use io_email::m2dir::message_get::M2dirMessageGet;
+//!
+//! let raw = client.run(M2dirMessageGet::new(&client.root, "INBOX", "msg-id")?)?;
+//! ```
 
 use alloc::vec::Vec;
 use std::path::PathBuf;

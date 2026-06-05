@@ -1,11 +1,16 @@
-//! m2dir message-move coroutine: per id, copies via [`M2dirEntryGet`]
-//! + [`M2dirEntryStore`], then removes the source entry via
-//! [`M2dirEntryDelete`].
+//! m2dir message-move coroutine: per id chains [`M2dirEntryGet`] +
+//! [`M2dirEntryStore`] + [`M2dirEntryDelete`].
 //!
-//! Flag preservation across the move follows the same rule as
-//! [`M2dirMessageCopy`](super::message_copy::M2dirMessageCopy): the
-//! `.meta/<id>.flags` sidecar is not propagated. Callers add flags
-//! explicitly after the move when needed.
+//! Flags are not propagated; the .meta/<id>.flags sidecar must be
+//! re-applied after the move when needed.
+//!
+//! # Example
+//!
+//! ```rust,ignore
+//! use io_email::m2dir::message_move::M2dirMessageMove;
+//!
+//! client.run(M2dirMessageMove::new(&client.root, "INBOX", "Archive", &["msg-id"])?)?;
+//! ```
 //!
 //! [`M2dirEntryGet`]: io_m2dir::entry::get::M2dirEntryGet
 //! [`M2dirEntryStore`]: io_m2dir::entry::store::M2dirEntryStore
@@ -147,7 +152,7 @@ impl M2dirCoroutine for M2dirMessageMove {
                         return M2dirCoroutineState::Yielded(y);
                     }
                     M2dirCoroutineState::Complete(Ok(())) => {
-                        // NOTE: loop back to pull the next id or finish.
+                        // NOTE: loop back to the next id or finish.
                     }
                     M2dirCoroutineState::Complete(Err(err)) => {
                         return M2dirCoroutineState::Complete(Err(err.into()));

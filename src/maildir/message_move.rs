@@ -1,6 +1,14 @@
-//! Maildir message-move coroutine: moves every id from one Maildir to
-//! another by chaining [`io_maildir::entry::r#move::MaildirEntryMove`]
-//! per id. Target subdir reuses the source subdir.
+//! Maildir message-move coroutine: chains one
+//! [`io_maildir::entry::r#move::MaildirEntryMove`] per id between
+//! Maildirs; target subdir mirrors the source subdir.
+//!
+//! # Example
+//!
+//! ```rust,ignore
+//! use io_email::maildir::message_move::MaildirMessageMove;
+//!
+//! client.run(MaildirMessageMove::new(&client.store, "INBOX", "Archive", &["msg-id"])?)?;
+//! ```
 
 use alloc::{collections::VecDeque, string::String};
 

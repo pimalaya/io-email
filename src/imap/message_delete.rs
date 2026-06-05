@@ -1,9 +1,16 @@
-//! IMAP message-delete coroutine.
+//! IMAP message-delete coroutine: optional SELECT, UID STORE
+//! +FLAGS (\\Deleted), then EXPUNGE (RFC 3501 §6.4.3).
 //!
-//! Optional `SELECT <mailbox>` (gated on `auto_select`), `UID STORE
-//! <id> +FLAGS (\Deleted)`, then `EXPUNGE` (RFC 3501 §6.4.3). The
-//! shared API treats "delete" as permanent removal, which on IMAP
-//! requires both flag-set and expunge.
+//! The shared API treats delete as permanent, which on IMAP requires
+//! both the flag-set and expunge.
+//!
+//! # Example
+//!
+//! ```rust,ignore
+//! use io_email::imap::message_delete::ImapMessageDelete;
+//!
+//! client.run(ImapMessageDelete::new("INBOX", "12", true)?)?;
+//! ```
 
 use alloc::{string::String, vec};
 use core::mem;

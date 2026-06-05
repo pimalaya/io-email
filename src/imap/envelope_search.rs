@@ -1,19 +1,18 @@
-//! IMAP envelope-search coroutine.
+//! IMAP envelope-search coroutine: SELECT then UID SORT (RFC 5256) +
+//! UID FETCH (RFC 3501 §6.4.5).
 //!
-//! Composes `SELECT <mailbox>` with `UID SORT <criteria> UTF-8 <keys>`
-//! (RFC 5256) and `UID FETCH <uids> (UID FLAGS ENVELOPE RFC822.SIZE
-//! [BODYSTRUCTURE])` (RFC 3501 §6.4.5).
+//! Date filters target the Date: header via SENTON / SENTSINCE.
+//! An absent filter is ALL; an absent sort is REVERSE DATE. UID SORT
+//! needs the server SORT capability; absence surfaces as
+//! [`ImapEnvelopeSearchError::Sort`].
 //!
-//! The shared filter AST is translated to RFC 9051 §6.4.4 `SearchKey`
-//! clauses (date filters target the `Date:` header through `SENTON` /
-//! `SENTSINCE`; the sent-at rule must stay consistent across every
-//! backend). An absent filter defaults to `[ALL]`; an absent sort
-//! defaults to `REVERSE DATE` (date descending).
+//! # Example
 //!
-//! UID SORT requires the server to advertise the `SORT` capability
-//! (RFC 5256). When unsupported, the server returns `BAD` and the
-//! error surfaces as [`ImapEnvelopeSearchError::Sort`]; callers can
-//! decide to fall back to plain `UID SEARCH` + client-side sort.
+//! ```rust,ignore
+//! use io_email::imap::envelope_search::ImapEnvelopeSearch;
+//!
+//! let envs = client.run(ImapEnvelopeSearch::new("INBOX", query, None, None, false)?)?;
+//! ```
 
 use alloc::{
     boxed::Box,
@@ -87,10 +86,9 @@ impl From<InvalidMailboxName> for ImapEnvelopeSearchError {
     }
 }
 
-/// I/O-free coroutine listing envelopes matching the shared search
-/// query from a mailbox. Pagination is applied to the SORT-ordered UID
-/// list before FETCH; `page = 1`-indexed; `page_size = None` keeps the
-/// whole result set.
+/// I/O-free coroutine listing envelopes that match a shared search
+/// query. Pagination is 1-indexed and applied to the SORT-ordered UID
+/// list before FETCH.
 pub struct ImapEnvelopeSearch {
     state: State,
 }
@@ -144,8 +142,7 @@ enum State {
     Done,
 }
 
-/// Builds the IMAP `SEARCH` key list for the given filter, defaulting
-/// to `[ALL]` when no filter is provided.
+/// SEARCH key list for `filter`, defaulting to ALL.
 fn search_keys(
     filter: Option<&SearchEmailsFilterQuery>,
 ) -> Result<Vec1<SearchKey<'static>>, ImapEnvelopeSearchError> {
@@ -156,8 +153,7 @@ fn search_keys(
     Ok(Vec1::from(key))
 }
 
-/// Builds the IMAP `SORT` criterion list for the given sort chain,
-/// defaulting to `REVERSE DATE` when the chain is empty or absent.
+/// SORT criterion list for `sort`, defaulting to REVERSE DATE.
 fn sort_criteria(sort: Option<&[SearchEmailsSorter]>) -> Vec1<SortCriterion> {
     let criteria: Vec<SortCriterion> = match sort {
         Some(chain) if !chain.is_empty() => chain.iter().map(convert_sorter).collect(),
@@ -170,9 +166,7 @@ fn sort_criteria(sort: Option<&[SearchEmailsSorter]>) -> Vec1<SortCriterion> {
     Vec1::try_from(criteria).expect("non-empty by construction")
 }
 
-/// Slices `uids` according to `(page, page_size)`, preserving SORT
-/// order. `page = None` is treated as page 1; `page_size = None` keeps
-/// the whole list.
+/// Slices `uids` for `(page, page_size)`, preserving SORT order.
 fn paginate_uids(uids: &[NonZeroU32], page: Option<u32>, page_size: Option<u32>) -> Vec<u32> {
     let total = uids.len();
     let size = page_size.map(|n| n as usize);
@@ -206,12 +200,11 @@ fn convert_filter(
         ),
         Q::Not(inner) => SearchKey::Not(Box::new(convert_filter(inner)?)),
 
-        // `Date(D)` is "Date: header on day D", same shape as IMAP
-        // `SENTON`.
+        // NOTE: Date(D) maps onto SENTON (Date: header on day D).
         Q::Date(date) => SearchKey::SentOn(imap_date(*date)?),
 
-        // `AfterDate(D)` is the strict `Date: header > D`. IMAP
-        // `SENTSINCE D'` is `Date: header >= D'`, so bump by one day.
+        // NOTE: AfterDate(D) is strict "> D"; SENTSINCE is ">=", so
+        // bump by one day.
         Q::AfterDate(date) => {
             let bumped = date.succ_opt().unwrap_or(*date);
             SearchKey::SentSince(imap_date(bumped)?)
@@ -223,9 +216,8 @@ fn convert_filter(
         Q::Body(pattern) => SearchKey::Body(astring(pattern)?),
 
         Q::Flag(flag) => {
-            // IMAP exposes dedicated search keys for the four classic
-            // system flags plus `\Deleted`; every other IANA keyword
-            // and every custom keyword goes through `Keyword(Atom)`.
+            // NOTE: IMAP has dedicated keys for the four classic system
+            // flags plus \Deleted; the rest goes through Keyword(Atom).
             match flag.iana() {
                 Some(IanaFlag::Seen) => SearchKey::Seen,
                 Some(IanaFlag::Answered) => SearchKey::Answered,
@@ -267,8 +259,8 @@ fn imap_date(date: chrono::NaiveDate) -> Result<ImapNaiveDate, ImapEnvelopeSearc
         .map_err(|_| ImapEnvelopeSearchError::InvalidDate(date.to_string()))
 }
 
-/// Maps the FETCH response back into the requested UID order, dropping
-/// UIDs the server failed to return.
+/// Reorders the FETCH response into the requested UID order, dropping
+/// UIDs the server skipped.
 fn reorder_envelopes(
     data: BTreeMap<NonZeroU32, Vec1<MessageDataItem<'static>>>,
     order: &[u32],

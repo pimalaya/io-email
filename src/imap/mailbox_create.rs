@@ -1,4 +1,12 @@
-//! IMAP mailbox-create coroutine: `CREATE <mailbox>` (RFC 3501 §6.3.3).
+//! IMAP mailbox-create coroutine wrapping CREATE (RFC 3501 §6.3.3).
+//!
+//! # Example
+//!
+//! ```rust,ignore
+//! use io_email::imap::mailbox_create::ImapMailboxCreate;
+//!
+//! client.run(ImapMailboxCreate::new("Archive")?)?;
+//! ```
 
 use alloc::string::String;
 

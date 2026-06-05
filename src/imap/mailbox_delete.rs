@@ -1,4 +1,12 @@
-//! IMAP mailbox-delete coroutine: `DELETE <mailbox>` (RFC 3501 §6.3.4).
+//! IMAP mailbox-delete coroutine wrapping DELETE (RFC 3501 §6.3.4).
+//!
+//! # Example
+//!
+//! ```rust,ignore
+//! use io_email::imap::mailbox_delete::ImapMailboxDelete;
+//!
+//! client.run(ImapMailboxDelete::new("Archive")?)?;
+//! ```
 
 use alloc::string::String;
 

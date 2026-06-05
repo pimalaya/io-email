@@ -1,6 +1,16 @@
-//! JMAP mailbox-create coroutine: `Mailbox/set { create }` (RFC 8621
-//! §2.6). Creates a top-level mailbox whose display name is `name`.
-//! Parent / role / sort-order belong to a protocol-specific extension.
+//! JMAP mailbox-create coroutine wrapping Mailbox/set { create }
+//! (RFC 8621 §2.6).
+//!
+//! Creates a top-level mailbox; parent/role/sort-order belong to a
+//! protocol-specific extension.
+//!
+//! # Example
+//!
+//! ```rust,ignore
+//! use io_email::jmap::mailbox_create::JmapMailboxCreate;
+//!
+//! client.run(JmapMailboxCreate::new(&session, &auth, "Archive")?)?;
+//! ```
 
 use alloc::{collections::BTreeMap, string::String};
 

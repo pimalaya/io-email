@@ -1,16 +1,16 @@
-//! m2dir envelope-listing coroutine.
+//! m2dir envelope-list coroutine: M2dirEntryList over the entry
+//! directory then a batched WantsFileRead for message bytes plus the
+//! .meta sidecar; headers parse via [`mail_parser`].
 //!
-//! Composes:
-//! 1. [`M2dirMessageList`] walks the m2dir entry directory and emits
-//!    one [`M2dirEntry`] per file (yields DirRead / FileExists).
-//! 2. For each entry, a `WantsFileRead` batch fetches the message
-//!    bytes plus the `.meta/<id>.flags` sidecar in a single round.
-//! 3. The coroutine parses RFC 5322 headers via [`mail_parser`] and
-//!    folds the flags + headers + size into a shared [`Envelope`].
+//! Sorted by Date: header descending, paginated 1-indexed.
 //!
-//! Sorting is by `Date:` header descending; pagination is 1-indexed.
+//! # Example
 //!
-//! [`M2dirEntryList`]: io_m2dir::entry::list::M2dirEntryList
+//! ```rust,ignore
+//! use io_email::m2dir::envelope_list::M2dirEnvelopeList;
+//!
+//! let envs = client.run(M2dirEnvelopeList::new(&client.root, "INBOX", Some(1), Some(50), false)?)?;
+//! ```
 
 use alloc::{collections::BTreeSet, vec::Vec};
 use core::mem;
@@ -53,8 +53,8 @@ pub enum M2dirEnvelopeListError {
     Parse(M2dirPath),
 }
 
-/// I/O-free coroutine listing every message inside a single m2dir,
-/// sorted by date descending then paginated.
+/// I/O-free coroutine listing every message in an m2dir, sorted by
+/// Date: descending then paginated.
 pub struct M2dirEnvelopeList {
     state: State,
     m2dir: M2dir,
@@ -90,8 +90,7 @@ enum State {
     Done,
 }
 
-/// Parses the contents of a `.meta/<id>.flags` file (one flag per
-/// non-empty trimmed line) into an [`M2dirFlags`] payload.
+/// Reads a .meta/<id>.flags file (one flag per non-empty trimmed line).
 fn parse_meta_flags(bytes: &[u8]) -> M2dirFlags {
     let Ok(text) = core::str::from_utf8(bytes) else {
         return M2dirFlags::default();

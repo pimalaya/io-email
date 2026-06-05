@@ -1,15 +1,16 @@
-//! JMAP list-mailboxes coroutine.
+//! JMAP list-mailboxes coroutine wrapping a batched Mailbox/query +
+//! Mailbox/get (RFC 8621 §2.4 + §2.5).
 //!
-//! Wraps `Mailbox/query` + `Mailbox/get` (RFC 8621 §2.4 + §2.5), sent
-//! as a single batched JMAP request so one HTTP round-trip covers the
-//! whole listing. Unlike IMAP, JMAP returns counts inline as
-//! `totalEmails` / `unreadEmails` on the same response, so the
-//! `with_counts` switch only widens the requested property set; no
-//! second round-trip.
+//! `with_counts` only widens the requested property set: JMAP returns
+//! totalEmails/unreadEmails inline, no second round-trip.
 //!
-//! Emits the shared [`Mailbox`] shape directly; JMAP-specific data
-//! (role, sort order, rights, threads, subscription) is dropped on
-//! purpose to stay LCD.
+//! # Example
+//!
+//! ```rust,ignore
+//! use io_email::jmap::mailbox_list::JmapMailboxList;
+//!
+//! let mailboxes = client.run(JmapMailboxList::new(&session, &auth, true)?)?;
+//! ```
 
 use alloc::{vec, vec::Vec};
 
@@ -37,19 +38,15 @@ pub enum JmapMailboxListError {
     Query(#[from] JmapMailboxQueryError),
 }
 
-/// I/O-free coroutine listing every JMAP mailbox visible to the
-/// session's primary mail account, optionally enriched with
-/// per-mailbox total / unread counts.
+/// I/O-free coroutine listing every JMAP mailbox in the primary mail
+/// account.
 pub struct JmapMailboxList {
     inner: JmapMailboxQuery,
 }
 
 impl JmapMailboxList {
-    /// `Mailbox/query` (no filter, no sort, no pagination) chained
-    /// with `Mailbox/get` against the matched ids. Requested
-    /// properties trim the wire payload: `id` + `name` for the plain
-    /// listing, plus `totalEmails` + `unreadEmails` when `with_counts`
-    /// is set.
+    /// Requests id + name; adds totalEmails + unreadEmails when
+    /// `with_counts` is set.
     pub fn new(
         session: &JmapSession,
         http_auth: &SecretString,
@@ -76,14 +73,7 @@ impl JmapMailboxList {
     }
 }
 
-/// Converts one JMAP `Mailbox` object into the shared [`Mailbox`]
-/// shape.
-///
-/// JMAP-specific fields (role, parent_id, sort_order, threads,
-/// rights, subscription) are dropped on purpose: they're not part of
-/// the LCD surface. Counts always populate from the wire: the caller
-/// requested the matching properties via `with_counts`, so a
-/// deserialized `0` from a "not requested" payload is on them, not us.
+/// Converts one JMAP Mailbox object into the shared [`Mailbox`] shape.
 fn mailbox_from(mailbox: JmapMailboxObject) -> Mailbox {
     Mailbox {
         id: mailbox.id.unwrap_or_default(),

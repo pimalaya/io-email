@@ -1,24 +1,20 @@
-//! JMAP envelope-search coroutine.
+//! JMAP envelope-search coroutine: batched Email/query + Email/get
+//! scoped to one mailbox id.
 //!
-//! Single-stage state machine:
-//! `Email/query + Email/get` (batched in a single HTTP round-trip)
-//! runs the translated filter + sort scoped to the supplied mailbox
-//! id.
+//! AND/OR/NOT become [`JmapFilterOperator`](io_jmap::rfc8620::JmapFilterOperator)s;
+//! leaves become flat [`JmapEmailFilter`] conditions. Date filters
+//! target the Date: header (sentAt) while JMAP before/after are
+//! receivedAt-anchored, so the coroutine over-approximates on the
+//! wire and re-applies the strict predicate client-side via
+//! [`PostFilter`], paginating after the trim.
 //!
-//! The shared filter AST is translated into a JMAP
-//! [`JmapFilter<JmapJmapEmailFilter>`] tree: AND/OR/NOT map to
-//! [`JmapFilterOperator`](io_jmap::rfc8620::JmapFilterOperator)s and
-//! leaves map to flat `JmapJmapEmailFilter` conditions. The mailbox
-//! scoping is added as a top-level AND.
+//! # Example
 //!
-//! Date semantics: the shared DSL targets the `Date:` header
-//! (sent-at) while JMAP's `before` / `after` filter primitives are
-//! anchored to `receivedAt`. The conversion over-approximates by
-//! anchoring on `receivedAt`, then re-applies the exact `sentAt`
-//! predicate client-side via [`PostFilter`]. When post-filters are
-//! present, server-side pagination would slice the over-approximated
-//! result before we trim it, so the coroutine fetches without
-//! `position` / `limit` and paginates after the client-side pass.
+//! ```rust,ignore
+//! use io_email::jmap::envelope_search::JmapEnvelopeSearch;
+//!
+//! let envs = client.run(JmapEnvelopeSearch::new(&session, &auth, "mailbox-id", Some(&query), None, None)?)?;
+//! ```
 
 use alloc::{string::String, vec, vec::Vec};
 use core::mem;
@@ -57,18 +53,15 @@ pub enum JmapEnvelopeSearchError {
     ResumedAfterDone,
 }
 
-/// Residual client-side predicate left over after the server filter
-/// was applied. Each variant re-checks one AST leaf against the
-/// envelope's `sentAt` (carried in [`Envelope::date`]).
+/// Residual client-side predicate left after the JMAP filter ran.
 #[derive(Clone, Debug)]
 pub enum PostFilter {
     Date(NaiveDate),
     AfterDate(NaiveDate),
 }
 
-/// I/O-free coroutine wrapping a batched `Email/query` + `Email/get`
-/// scoped to a JMAP mailbox id. Applies any residual `sentAt`
-/// predicate client-side before paginating.
+/// I/O-free coroutine running Email/query + Email/get scoped to one
+/// JMAP mailbox id, with optional client-side `sentAt` re-check.
 pub struct JmapEnvelopeSearch {
     state: State,
     page: Option<u32>,
@@ -125,19 +118,14 @@ enum State {
     Done,
 }
 
-/// Output of [`build`]: the JMAP-side filter (mailbox-scoped, AND/OR/NOT
-/// supported), the JMAP-side comparator list, and the residual
-/// client-side predicates the coroutine must re-apply on the returned
-/// envelopes.
+/// JMAP-side filter + sort, plus the residual client-side predicates.
 struct Converted {
     filter: JmapFilter<JmapEmailFilter>,
     sort: Vec<JmapEmailComparator>,
     post_filters: Vec<PostFilter>,
 }
 
-/// Converts `query` into JMAP primitives. The result is always
-/// AND-scoped to `mailbox_id`; an empty user filter yields just the
-/// mailbox scope.
+/// Converts `query` into JMAP primitives, AND-scoped to `mailbox_id`.
 fn build(query: Option<&SearchEmailsQuery>, mailbox_id: String) -> Converted {
     let mailbox_scope = JmapFilter::Condition(JmapEmailFilter {
         in_mailbox: Some(mailbox_id),
@@ -167,9 +155,8 @@ fn build(query: Option<&SearchEmailsQuery>, mailbox_id: String) -> Converted {
     }
 }
 
-/// Recursively translates `node` into a JMAP filter tree. Date-leaf
-/// conversions push a [`PostFilter`] entry so the strict sent-at
-/// semantics can be re-applied client-side.
+/// Recursively translates `node` into a JMAP filter tree; date leaves
+/// push a [`PostFilter`] so the strict sentAt rule can be re-applied.
 fn convert_filter(
     node: &SearchEmailsFilterQuery,
     post_filters: &mut Vec<PostFilter>,
@@ -208,9 +195,8 @@ fn convert_filter(
             ..JmapEmailFilter::default()
         }),
 
-        // Over-approximate via `after = start-of-day(D)` (the lowest
-        // `receivedAt` consistent with "sentAt-day == D"); the exact
-        // sent-at constraint is re-checked client-side.
+        // NOTE: over-approximate via after = start-of-day(D); the
+        // exact sent-at rule is re-checked client-side.
         Q::Date(target) => {
             post_filters.push(PostFilter::Date(*target));
             JmapFilter::Condition(JmapEmailFilter {
@@ -218,9 +204,8 @@ fn convert_filter(
                 ..JmapEmailFilter::default()
             })
         }
-        // Over-approximate via `after = start-of-day(D+1)` (the
-        // lowest `receivedAt` consistent with "sentAt-day > D"); the
-        // strict sent-at constraint is re-checked client-side.
+        // NOTE: over-approximate via after = start-of-day(D+1); the
+        // strict sent-at rule is re-checked client-side.
         Q::AfterDate(target) => {
             post_filters.push(PostFilter::AfterDate(*target));
             let bumped = target.succ_opt().unwrap_or(*target);
@@ -232,9 +217,7 @@ fn convert_filter(
     }
 }
 
-/// Returns `true` when `envelope` matches every residual predicate.
-/// Apply after the JMAP server returns its (over-approximating)
-/// result set to drop the false positives.
+/// True when `envelope` matches every residual predicate.
 fn post_match(envelope: &Envelope, post_filters: &[PostFilter]) -> bool {
     post_filters.iter().all(|pf| match pf {
         PostFilter::Date(target) => envelope
@@ -377,8 +360,8 @@ mod tests {
     }
 
     fn pluck_user_filter(filter: JmapFilter<JmapEmailFilter>) -> JmapFilter<JmapEmailFilter> {
-        // build() always wraps the user filter in `AND(mailbox_scope,
-        // user_filter)` when a user filter is present.
+        // NOTE: build() wraps the user filter in AND(mailbox_scope,
+        // user_filter) when a user filter is present.
         let JmapFilter::Operator(JmapFilterOperator { conditions, .. }) = filter else {
             panic!("expected top-level AND combinator");
         };

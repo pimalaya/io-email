@@ -1,14 +1,16 @@
-//! IMAP flag-store coroutine.
+//! IMAP flag-store coroutine: optional SELECT then UID STORE (RFC
+//! 3501 §6.4.6).
 //!
-//! Optional `SELECT <mailbox>` (gated on `auto_select`) followed by
-//! `UID STORE <ids> <op> (<flags>)` (RFC 3501 §6.4.6). Sub-second
-//! latency win: when [`auto_select`] is off (sync engines pre-select
-//! once per mailbox batch), the SELECT stage is skipped entirely.
+//! `auto_select = false` skips SELECT for sync engines that
+//! pre-select per batch. Shared by add/set/delete via [`FlagOp`].
 //!
-//! Shared by `add_flags` / `set_flags` / `delete_flags` via the
-//! [`FlagOp`] selector.
+//! # Example
 //!
-//! [`auto_select`]: crate::client::ImapContext::auto_select
+//! ```rust,ignore
+//! use io_email::{flag::FlagOp, imap::flag_store::ImapFlagStore};
+//!
+//! client.run(ImapFlagStore::new("INBOX", &["12"], &flags, FlagOp::Add, true)?)?;
+//! ```
 
 use alloc::{string::String, vec::Vec};
 use core::mem;
@@ -62,15 +64,14 @@ impl From<InvalidUidSet> for ImapFlagStoreError {
     }
 }
 
-/// I/O-free coroutine adding / setting / removing flags on a UID set.
+/// I/O-free coroutine adding/setting/removing flags on a UID set.
 pub struct ImapFlagStore {
     state: State,
 }
 
 impl ImapFlagStore {
     /// `op` picks the STORE variant. When `auto_select` is set the
-    /// target mailbox is SELECTed first; sync engines flip it off and
-    /// pre-select once per batch.
+    /// mailbox is SELECTed first.
     pub fn new(
         mailbox: &str,
         ids: &[&str],
@@ -106,10 +107,9 @@ impl ImapFlagStore {
     }
 }
 
-// NOTE: Selecting carries both coroutines side-by-side; the size
-// difference vs Storing is bounded by ImapMailboxSelect. Boxing would
-// trade a sub-µs allocation for one fewer u-byte of stack — not worth
-// it for short-lived per-op state machines.
+// NOTE: Selecting carries both coroutines; the size delta vs Storing
+// is bounded by ImapMailboxSelect. Boxing isn't worth it for
+// short-lived per-op state machines.
 #[allow(clippy::large_enum_variant)]
 enum State {
     Selecting {

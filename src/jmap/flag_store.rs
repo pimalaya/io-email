@@ -1,14 +1,17 @@
-//! JMAP flag-store coroutine: `Email/set { update: patch }` (RFC 8621
-//! §4.7).
+//! JMAP flag-store coroutine wrapping Email/set with a per-id keyword
+//! patch (RFC 8621 §4.7).
 //!
-//! Builds a single batched request:
-//! - `Add` → `SetKeyword` patch per (id, flag).
-//! - `Remove` → `UnsetKeyword` patch per (id, flag).
-//! - `Set` → `ReplaceKeywords` patch per id (the full bag is the
-//!   requested flags; everything else is dropped).
+//! Add/Remove emit per-keyword patches; Set replaces the full bag.
+//! Mailbox is part of the shared signature but unused: JMAP keywords
+//! are global per email.
 //!
-//! Mailbox name is part of the shared signature but unused: JMAP
-//! keywords are global per email, not per mailbox.
+//! # Example
+//!
+//! ```rust,ignore
+//! use io_email::{flag::FlagOp, jmap::flag_store::JmapFlagStore};
+//!
+//! client.run(JmapFlagStore::new(&session, &auth, "_", &["email-id"], &flags, FlagOp::Add)?)?;
+//! ```
 
 use alloc::{collections::BTreeMap, string::String};
 
@@ -37,7 +40,7 @@ pub enum JmapFlagStoreError {
     NotUpdated(alloc::vec::Vec<String>),
 }
 
-/// I/O-free coroutine applying a flag store across every id in turn.
+/// I/O-free coroutine applying a flag store across every id.
 pub struct JmapFlagStore {
     inner: InnerSet,
 }

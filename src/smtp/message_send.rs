@@ -1,15 +1,18 @@
-//! SMTP message-send coroutine.
+//! SMTP message-send coroutine wrapping
+//! [`io_smtp::message::SmtpMessageSend`]: runs the RFC 5321 mail
+//! transaction (MAIL FROM, RCPT TO, DATA) on an authenticated stream.
 //!
-//! Wraps [`io_smtp::send::SmtpMessageSend`]: runs an RFC 5321 mail
-//! transaction (MAIL FROM → RCPT TO → DATA) against an already
-//! authenticated SMTP stream. Reverse and forward paths are extracted
-//! from the raw RFC 5322 message itself (`From:` → reverse path,
-//! `To:` + `Cc:` + `Bcc:` → forward paths) via mail-parser, so the
-//! shared API takes only the raw bytes as input.
-//!
-//! Callers needing a different envelope sender (alias accounts,
-//! bounce-address rewriting) override the reverse path on
+//! Reverse path is the From: header; forward paths are To:/Cc:/Bcc:.
+//! Override the envelope sender via
 //! [`SmtpContext::default_reverse_path`].
+//!
+//! # Example
+//!
+//! ```rust,ignore
+//! use io_email::smtp::message_send::SmtpMessageSend;
+//!
+//! client.run(SmtpMessageSend::new(raw, None)?)?;
+//! ```
 //!
 //! [`SmtpContext::default_reverse_path`]: crate::client::SmtpContext::default_reverse_path
 
@@ -53,10 +56,9 @@ pub struct SmtpMessageSend {
 }
 
 impl SmtpMessageSend {
-    /// Builds the coroutine from the raw RFC 5322 bytes. When
-    /// `override_reverse_path` is set (e.g. via
-    /// [`SmtpContext::default_reverse_path`]), it takes precedence
-    /// over the message's `From:` header.
+    /// `override_reverse_path` (e.g. from
+    /// [`SmtpContext::default_reverse_path`]) takes precedence over
+    /// the message's From: header.
     ///
     /// [`SmtpContext::default_reverse_path`]: crate::client::SmtpContext::default_reverse_path
     pub fn new(
@@ -99,8 +101,8 @@ impl SmtpMessageSend {
     }
 }
 
-/// Flattens a mail-parser address group into a list of bare
-/// `local-part@domain` strings.
+/// Flattens a mail-parser address group into bare local-part@domain
+/// strings.
 fn addresses(addrs: &MailParserAddress<'_>) -> Vec<String> {
     addrs
         .clone()
@@ -113,8 +115,7 @@ fn addresses(addrs: &MailParserAddress<'_>) -> Vec<String> {
         .collect()
 }
 
-/// First address in an address group, or `None` when the group is
-/// empty. Used to pick the lone `From:` envelope sender.
+/// First address in a group; used to pick the From: envelope sender.
 fn first_address(addrs: &MailParserAddress<'_>) -> Option<String> {
     addresses(addrs).into_iter().next()
 }
@@ -131,9 +132,7 @@ impl SmtpCoroutine for SmtpMessageSend {
     }
 }
 
-/// Parses `local-part@domain` into a static-lifetime [`SmtpMailbox`].
-/// Both halves are wrapped in `Cow::Owned` so the result outlives the
-/// input slice.
+/// Parses local-part@domain into a 'static [`SmtpMailbox`] (owned).
 fn parse_smtp_mailbox(addr: &str) -> Result<SmtpMailbox<'static>, SmtpMessageSendError> {
     let (local, domain) = addr
         .rsplit_once('@')

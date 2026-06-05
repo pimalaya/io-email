@@ -1,12 +1,17 @@
-//! m2dir message-add coroutine.
+//! m2dir message-add coroutine: wraps
+//! [`io_m2dir::entry::store::M2dirEntryStore`] and, when `flags` is
+//! non-empty, chains [`M2dirFlagSet`] to persist the sidecar.
 //!
-//! Wraps [`io_m2dir::message::store::M2dirMessageStore`]
-//! and, when `flags` is non-empty, chains a follow-up
-//! [`M2dirFlagSet`] to persist them as
-//! `.meta/<id>.flags`.
+//! The store coroutine probes pid + 4 random bytes per the m2dir
+//! `<date>,<checksum>.<nonce>` id convention.
 //!
-//! The store coroutine probes pid + 4 random bytes to mint the entry
-//! id (`<date>,<checksum>.<nonce>` per the m2dir spec).
+//! # Example
+//!
+//! ```rust,ignore
+//! use io_email::m2dir::message_add::M2dirMessageAdd;
+//!
+//! let id = client.run(M2dirMessageAdd::new(&client.root, "INBOX", &flags, raw)?)?;
+//! ```
 //!
 //! [`M2dirFlagSet`]: io_m2dir::flag::set::M2dirFlagSet
 

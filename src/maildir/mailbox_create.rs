@@ -1,9 +1,14 @@
-//! Maildir mailbox-create coroutine.
+//! Maildir mailbox-create coroutine wrapping
+//! [`io_maildir::maildir::create::MaildirCreate`]: creates the
+//! mailbox dir with its cur/new/tmp triad under the [`MaildirStore`].
 //!
-//! Wraps [`io_maildir::maildir::create::MaildirCreate`]: creates the
-//! `<mailbox>/`, `<mailbox>/cur/`, `<mailbox>/new/` and `<mailbox>/tmp/`
-//! directories. The on-disk name is computed from the configured
-//! [`MaildirStore`] (fs or Maildir++ layout).
+//! # Example
+//!
+//! ```rust,ignore
+//! use io_email::maildir::mailbox_create::MaildirMailboxCreate;
+//!
+//! client.run(MaildirMailboxCreate::new(&client.store, "Archive")?)?;
+//! ```
 
 use io_maildir::{
     coroutine::*,
@@ -26,8 +31,7 @@ pub enum MaildirMailboxCreateError {
     InvalidMailbox(#[from] InvalidMailboxName),
 }
 
-/// I/O-free coroutine creating a Maildir mailbox under the configured
-/// store.
+/// I/O-free coroutine creating a Maildir mailbox under the store.
 pub struct MaildirMailboxCreate {
     inner: InnerMaildirCreate,
 }

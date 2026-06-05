@@ -1,6 +1,14 @@
-//! Maildir message-copy coroutine: copies every id from one Maildir to
-//! another by chaining [`io_maildir::entry::copy::MaildirEntryCopy`]
-//! per id. Target subdir reuses the source subdir.
+//! Maildir message-copy coroutine: chains one
+//! [`io_maildir::entry::copy::MaildirEntryCopy`] per id between
+//! Maildirs; target subdir mirrors the source subdir.
+//!
+//! # Example
+//!
+//! ```rust,ignore
+//! use io_email::maildir::message_copy::MaildirMessageCopy;
+//!
+//! client.run(MaildirMessageCopy::new(&client.store, "INBOX", "Archive", &["msg-id"])?)?;
+//! ```
 
 use alloc::{collections::VecDeque, string::String};
 

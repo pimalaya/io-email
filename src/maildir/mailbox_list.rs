@@ -1,19 +1,17 @@
-//! Maildir list-mailboxes coroutine.
+//! Maildir list-mailboxes coroutine wrapping
+//! [`io_maildir::maildir::list::MaildirList`].
 //!
-//! Wraps [`io_maildir::maildir::list::MaildirList`]: scans the store
-//! root and probes each candidate child for the `cur/` + `new/` +
-//! `tmp/` triad. The layout (fs vs Maildir++) is read from the
-//! [`MaildirStore`] passed at construction time.
+//! Scans the store root for the cur/new/tmp triad; layout (fs vs
+//! Maildir++) is read from the [`MaildirStore`]. `with_counts` is
+//! currently a no-op (TODO: chain a MaildirMailboxStatus stage).
 //!
-//! `with_counts` is currently a no-op: surfacing totals/unread would
-//! need a follow-up directory walk over each maildir's `cur/` + `new/`
-//! plus filename-flag parsing. Wire that in once io-email grows a
-//! dedicated MaildirMailboxStatus coroutine and add it as a chained
-//! stage here.
+//! # Example
 //!
-//! Emits the shared [`Mailbox`] shape directly; Maildir-specific data
-//! (root path metadata, subdirectory layout) is dropped on purpose to
-//! stay LCD.
+//! ```rust,ignore
+//! use io_email::maildir::mailbox_list::MaildirMailboxList;
+//!
+//! let mailboxes = client.run(MaildirMailboxList::new(&client.store, false))?;
+//! ```
 
 use alloc::{string::ToString, vec::Vec};
 
@@ -43,11 +41,7 @@ pub struct MaildirMailboxList {
 }
 
 impl MaildirMailboxList {
-    /// `MaildirList` against `store`'s configured layout.
-    ///
-    /// `_with_counts` is accepted for symmetry with the other backends
-    /// but currently ignored; see the module doc for the path to
-    /// surfacing counts.
+    /// `_with_counts` is accepted for shared-API symmetry but ignored.
     pub fn new(store: &MaildirStore, _with_counts: bool) -> Self {
         trace!(
             "prepare Maildir mailbox listing (maildirpp={})",
@@ -82,12 +76,7 @@ impl MaildirCoroutine for MaildirMailboxList {
 }
 
 /// Converts one [`Maildir`] into the shared [`Mailbox`] shape.
-///
-/// `id` is the on-disk path so downstream ops can locate the maildir;
-/// `name` is the last path segment (Maildir++ dotted names are kept
-/// verbatim: decoding is the caller's responsibility for now).
-/// Counts default to `None`; populating them needs the follow-up walk
-/// described in the module doc.
+/// `id` is the on-disk path; `name` is the last path segment.
 fn mailbox_from(maildir: Maildir) -> Mailbox {
     let name = maildir.name().unwrap_or("").to_string();
     let id = maildir.path().to_string();

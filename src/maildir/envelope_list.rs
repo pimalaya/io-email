@@ -1,15 +1,15 @@
-//! Maildir envelope-listing coroutine.
+//! Maildir envelope-list coroutine: MaildirEntryList over cur/new
+//! then a batched WantsFileRead pass parses RFC 5322 headers.
 //!
-//! Composes two io-maildir state machines:
-//! 1. [`MaildirEntryList`] walks `cur/` + `new/` and returns one
-//!    [`MaildirEntry`] per file.
-//! 2. A second pass batches the entry paths through
-//!    [`MaildirYield::WantsFileRead`]; the driver reads each file and
-//!    feeds the bytes back so the coroutine can parse RFC 5322 headers
-//!    (subject, from, to, date, message-id) via [`mail_parser::Message`].
+//! Sorted by Date: header descending, paginated 1-indexed.
 //!
-//! Sorting is by `Date:` header descending; pagination is 1-indexed
-//! on the in-memory result.
+//! # Example
+//!
+//! ```rust,ignore
+//! use io_email::maildir::envelope_list::MaildirEnvelopeList;
+//!
+//! let envs = client.run(MaildirEnvelopeList::new(&client.store, "INBOX", Some(1), Some(50))?)?;
+//! ```
 
 use alloc::{collections::BTreeSet, string::ToString, vec::Vec};
 use core::mem;
@@ -49,8 +49,8 @@ pub enum MaildirEnvelopeListError {
     ResumedAfterDone,
 }
 
-/// I/O-free coroutine listing every message inside a single Maildir,
-/// sorted by date descending then paginated.
+/// I/O-free coroutine listing every message in a Maildir, sorted by
+/// Date: descending then paginated.
 pub struct MaildirEnvelopeList {
     state: State,
     page: Option<u32>,
@@ -129,8 +129,6 @@ impl MaildirCoroutine for MaildirEnvelopeList {
     }
 }
 
-/// Two-phase state: list entries, then read their bytes for header
-/// parsing.
 enum State {
     Listing(InnerList),
     Reading(BTreeSet<MaildirEntry>),
@@ -186,8 +184,7 @@ fn envelope_from_entry(entry: &MaildirFullEntry) -> Envelope {
     }
 }
 
-/// Extracts the IANA flag set from a Maildir filename's info section.
-/// Letters outside the standard six are silently dropped.
+/// IANA flags from a Maildir filename's info section.
 fn parse_filename_flags(path: &FsPath) -> BTreeSet<Flag> {
     let Some(name) = path.file_name() else {
         return BTreeSet::new();
@@ -198,8 +195,7 @@ fn parse_filename_flags(path: &FsPath) -> BTreeSet<Flag> {
     letters.chars().filter_map(flag_from_char).collect()
 }
 
-/// Converts mail-parser's address group into the shared LCD shape.
-/// Empty `email` addresses are dropped.
+/// mail-parser address group to shared [`Address`] list.
 fn addresses_from(addrs: &MailParserAddress<'_>) -> Vec<Address> {
     addrs
         .clone()

@@ -1,8 +1,13 @@
-//! JMAP message-move coroutine.
+//! JMAP message-move coroutine wrapping Email/set with paired
+//! AddToMailbox + RemoveFromMailbox patches per id.
 //!
-//! Single-stage state machine:
-//! `Email/set { update: AddToMailbox(to_id) + RemoveFromMailbox(from_id)
-//! per id }` rewires the message in a single round-trip.
+//! # Example
+//!
+//! ```rust,ignore
+//! use io_email::jmap::message_move::JmapMessageMove;
+//!
+//! client.run(JmapMessageMove::new(&session, &auth, "src-id", "dst-id", &["email-id"])?)?;
+//! ```
 
 use alloc::{string::String, vec::Vec};
 use core::mem;
@@ -29,8 +34,7 @@ pub enum JmapMessageMoveError {
     ResumedAfterDone,
 }
 
-/// I/O-free coroutine moving every id from `from` to `to`. Both are
-/// JMAP mailbox ids.
+/// I/O-free coroutine moving every id from `from` to `to` (mailbox ids).
 pub struct JmapMessageMove {
     state: State,
 }

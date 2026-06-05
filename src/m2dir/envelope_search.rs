@@ -1,16 +1,16 @@
-//! m2dir envelope-search coroutine.
+//! m2dir envelope-search coroutine: same shape as
+//! [`crate::m2dir::envelope_list::M2dirEnvelopeList`], with shared
+//! filter + sort + paginate applied client-side.
 //!
-//! Same shape as [`crate::m2dir::envelope_list::M2dirEnvelopeList`]:
+//! Body matching reuses the already-loaded message bytes.
 //!
-//! 1. [`M2dirMessageList`] walks the entry directory and emits one
-//!    [`M2dirEntry`] per file.
-//! 2. A `WantsFileRead` batch fetches the message bytes and each
-//!    `.meta/<id>.flags` sidecar in one round.
-//! 3. The coroutine parses RFC 5322 headers via [`mail_parser`],
-//!    folds in the sidecar flags, evaluates the shared filter (body
-//!    matching reuses the in-memory bytes), sorts, paginates.
+//! # Example
 //!
-//! [`M2dirEntryList`]: io_m2dir::entry::list::M2dirEntryList
+//! ```rust,ignore
+//! use io_email::m2dir::envelope_search::M2dirEnvelopeSearch;
+//!
+//! let envs = client.run(M2dirEnvelopeSearch::new(&client.root, "INBOX", Some(&query), None, None, false)?)?;
+//! ```
 
 use alloc::{collections::BTreeSet, string::String, vec::Vec};
 use core::{cmp::Ordering, mem};
@@ -60,10 +60,8 @@ pub enum M2dirEnvelopeSearchError {
     Parse(M2dirPath),
 }
 
-/// I/O-free coroutine listing every message inside a single m2dir,
-/// then applying the shared filter + sort + paginate client-side.
-/// `page = None` is treated as page 1; `page_size = None` keeps the
-/// whole match.
+/// I/O-free coroutine listing then client-side filtering + sorting +
+/// paginating an m2dir's messages.
 pub struct M2dirEnvelopeSearch {
     state: State,
     m2dir: M2dir,
@@ -104,8 +102,7 @@ enum State {
     Done,
 }
 
-/// Parses `.meta/<id>.flags` lines into [`M2dirFlags`]. Matches the
-/// implementation in [`crate::m2dir::envelope_list`].
+/// Reads a .meta/<id>.flags file (one flag per non-empty trimmed line).
 fn parse_meta_flags(bytes: &[u8]) -> M2dirFlags {
     let Ok(text) = core::str::from_utf8(bytes) else {
         return M2dirFlags::default();
@@ -116,8 +113,7 @@ fn parse_meta_flags(bytes: &[u8]) -> M2dirFlags {
         .collect()
 }
 
-/// Evaluates `filter` against `envelope`. `body` clauses scan the
-/// message bytes directly.
+/// Evaluates `filter` against `envelope`; `body` scans `raw`.
 fn matches_filter(envelope: &Envelope, raw: &[u8], filter: &SearchEmailsFilterQuery) -> bool {
     use SearchEmailsFilterQuery as Q;
 

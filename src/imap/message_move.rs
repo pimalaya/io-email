@@ -1,7 +1,13 @@
-//! IMAP message-move coroutine.
+//! IMAP message-move coroutine: optional SELECT then UID MOVE (RFC
+//! 6851).
 //!
-//! Optional `SELECT <from>` (gated on `auto_select`) followed by
-//! `UID MOVE <ids> <to>` (RFC 6851).
+//! # Example
+//!
+//! ```rust,ignore
+//! use io_email::imap::message_move::ImapMessageMove;
+//!
+//! client.run(ImapMessageMove::new("INBOX", "Archive", &["12"], true)?)?;
+//! ```
 
 use alloc::string::String;
 use core::mem;

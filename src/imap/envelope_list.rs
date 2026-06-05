@@ -1,13 +1,15 @@
-//! IMAP list-envelopes coroutine.
+//! IMAP list-envelopes coroutine: SELECT then a windowed FETCH (UID
+//! FLAGS ENVELOPE RFC822.SIZE, plus BODYSTRUCTURE when
+//! `with_attachment`). Page 1 is the most recent window (RFC 3501
+//! §6.4.5).
 //!
-//! Composes `SELECT <mailbox>` with a windowed `FETCH <window> (UID
-//! FLAGS ENVELOPE RFC822.SIZE [BODYSTRUCTURE])` (RFC 3501 §6.4.5).
-//! Page 1 is the most recent window (highest sequence numbers).
+//! # Example
 //!
-//! `with_attachment` enables `BODYSTRUCTURE` so [`Envelope::has_attachment`]
-//! populates. `INTERNALDATE` is not requested: server-arrival time is
-//! not consistent across backends, and the `Date:` header (decoded
-//! from `ENVELOPE.date`) is the only timestamp that round-trips.
+//! ```rust,ignore
+//! use io_email::imap::envelope_list::ImapEnvelopeList;
+//!
+//! let envs = client.run(ImapEnvelopeList::new("INBOX", Some(1), Some(50), false)?)?;
+//! ```
 
 use alloc::{
     collections::BTreeSet,
@@ -72,8 +74,7 @@ pub struct ImapEnvelopeList {
 
 impl ImapEnvelopeList {
     /// `page_size = None` fetches the whole mailbox; `page = None` is
-    /// treated as page 1. `with_attachment = true` additionally fetches
-    /// `BODYSTRUCTURE` to populate [`Envelope::has_attachment`].
+    /// page 1.
     pub fn new(
         mailbox: &str,
         page: Option<u32>,
@@ -104,9 +105,8 @@ enum State {
     Done,
 }
 
-/// Builds the FETCH item-name list. Always requests UID + FLAGS +
-/// ENVELOPE + RFC822.SIZE; appends BODYSTRUCTURE for attachment
-/// detection.
+/// FETCH item-name list: UID + FLAGS + ENVELOPE + RFC822.SIZE, plus
+/// BODYSTRUCTURE when `with_attachment` is set.
 pub(crate) fn build_item_names(with_attachment: bool) -> MacroOrMessageDataItemNames<'static> {
     let mut names = vec![
         MessageDataItemName::Uid,
@@ -120,8 +120,8 @@ pub(crate) fn build_item_names(with_attachment: bool) -> MacroOrMessageDataItemN
     MacroOrMessageDataItemNames::MessageDataItemNames(names)
 }
 
-/// Computes the IMAP sequence-set string for `(page, page_size)`
-/// against `exists`. `None` means an empty window.
+/// Sequence-set string for `(page, page_size)` against `exists`,
+/// or `None` for an empty window.
 pub(crate) fn compute_window(
     exists: u32,
     page: Option<u32>,
@@ -146,7 +146,7 @@ pub(crate) fn compute_window(
     Some(format!("{start}:{end}"))
 }
 
-/// Folds one FETCH row into the shared [`Envelope`] shape.
+/// Folds one FETCH row into a shared [`Envelope`].
 pub(crate) fn envelope_from(seq: u32, items: Vec<MessageDataItem<'static>>) -> Envelope {
     let mut id = String::new();
     let mut message_id: Option<String> = None;
@@ -292,10 +292,8 @@ fn bytes_to_string(bytes: &[u8]) -> String {
         })
 }
 
-/// Decodes RFC 2047 MIME-encoded words (e.g. `=?utf-8?B?...?=`) that
-/// commonly appear in IMAP `ENVELOPE` subjects and address display
-/// names. Falls back to [`bytes_to_string`] when the input is not a
-/// well-formed encoded-word sequence.
+/// Decodes RFC 2047 MIME-encoded words from IMAP ENVELOPE strings;
+/// falls back to [`bytes_to_string`] on malformed input.
 fn decode_mime_bytes(bytes: &[u8]) -> String {
     let decoder = Decoder::new().too_long_encoded_word_strategy(RecoverStrategy::Decode);
     match decoder.decode(bytes) {

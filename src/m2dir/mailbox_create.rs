@@ -1,8 +1,14 @@
-//! m2dir mailbox-create coroutine.
+//! m2dir mailbox-create coroutine wrapping
+//! [`io_m2dir::m2dir::create::M2dirCreate`]: creates the mailbox
+//! directory plus the .m2dir marker and .meta/ sidecar.
 //!
-//! Wraps [`io_m2dir::mailbox::create::M2dirMailboxCreate`]:
-//! creates `<root>/<name>/` plus the `.m2dir` marker and `.meta/`
-//! subdirectory.
+//! # Example
+//!
+//! ```rust,ignore
+//! use io_email::m2dir::mailbox_create::M2dirMailboxCreate;
+//!
+//! client.run(M2dirMailboxCreate::new(&client.root, "Archive")?)?;
+//! ```
 
 use std::path::PathBuf;
 
@@ -27,7 +33,7 @@ pub enum M2dirMailboxCreateError {
     InvalidMailbox(#[from] M2dirStoreError),
 }
 
-/// I/O-free coroutine creating an m2dir mailbox under the m2store root.
+/// I/O-free coroutine creating an m2dir mailbox under the store root.
 pub struct M2dirMailboxCreate {
     inner: InnerCreate,
 }

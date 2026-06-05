@@ -1,6 +1,5 @@
-//! Shared helpers for the JMAP coroutines: keyword translation,
-//! pagination, account id extraction, and the `Email` → [`Envelope`]
-//! conversion used by `envelope_list` and `message_*`.
+//! Shared helpers for the JMAP coroutines: keywords, pagination,
+//! account id, and JMAP email to shared [`Envelope`] conversion.
 
 use alloc::{
     string::{String, ToString},
@@ -24,8 +23,6 @@ use crate::{
 };
 
 /// Maps a shared [`Flag`] to its JMAP keyword (RFC 8621 §4.1.1).
-/// IANA-classified flags use the lowercase canonical form; custom
-/// keywords pass through their raw wire spelling.
 pub(crate) fn keyword_from(flag: &Flag) -> String {
     match flag.iana() {
         Some(IanaFlag::Seen) => "$seen".into(),
@@ -43,9 +40,7 @@ pub(crate) fn keyword_from(flag: &Flag) -> String {
     }
 }
 
-/// Translates 1-indexed `(page, page_size)` into JMAP
-/// `(position, limit)`. Both stay `None` when no page size is
-/// requested.
+/// Translates 1-indexed `(page, page_size)` to JMAP `(position, limit)`.
 pub(crate) fn compute_position_limit(
     page: Option<u32>,
     page_size: Option<u32>,
@@ -58,9 +53,7 @@ pub(crate) fn compute_position_limit(
     (Some(position), Some(size as u64))
 }
 
-/// Extracts the primary mail account id from a JMAP session, falling
-/// back to an empty string when the session advertises no mail
-/// account (mostly a defensive default).
+/// Primary mail account id; empty when the session has none.
 pub(crate) fn account_id_of(session: &JmapSession) -> String {
     session
         .primary_accounts
@@ -69,9 +62,8 @@ pub(crate) fn account_id_of(session: &JmapSession) -> String {
         .unwrap_or_default()
 }
 
-/// Properties requested from `Email/get` to populate an [`Envelope`].
-/// Uses `sentAt` (author-claimed `Date:`) rather than `receivedAt` for
-/// cross-backend consistency.
+/// Email/get properties for an [`Envelope`]. Uses sentAt
+/// (author-claimed Date:) for cross-backend consistency.
 pub(crate) fn envelope_properties() -> Vec<JmapEmailProperty> {
     vec![
         JmapEmailProperty::Id,
@@ -111,9 +103,8 @@ pub(crate) fn envelope_from(email: JmapEmail) -> Envelope {
     let date = email.sent_at.as_deref().and_then(parse_rfc3339);
     let size = email.size.unwrap_or(0);
     let has_attachment = email.has_attachment;
-    // JMAP returns `messageId` as a list (RFC 5322 allows multiple
-    // header instances). The first non-empty entry is the canonical
-    // value.
+    // NOTE: JMAP returns messageId as a list (RFC 5322 allows multiple
+    // header instances); first non-empty entry is canonical.
     let message_id = email
         .message_id
         .and_then(|ids| ids.into_iter().find_map(|s| normalize_message_id(&s)));

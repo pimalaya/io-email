@@ -1,7 +1,14 @@
-//! m2dir mailbox-delete coroutine.
+//! m2dir mailbox-delete coroutine wrapping
+//! [`io_m2dir::m2dir::delete::M2dirDelete`]: recursively removes the
+//! mailbox directory.
 //!
-//! Wraps [`io_m2dir::m2dir::delete::M2dirDelete`]: recursively removes
-//! the on-disk directory for the named mailbox.
+//! # Example
+//!
+//! ```rust,ignore
+//! use io_email::m2dir::mailbox_delete::M2dirMailboxDelete;
+//!
+//! client.run(M2dirMailboxDelete::new(&client.root, "Archive")?)?;
+//! ```
 
 use std::path::PathBuf;
 
@@ -25,7 +32,7 @@ pub enum M2dirMailboxDeleteError {
     InvalidMailbox(#[from] InvalidMailboxName),
 }
 
-/// I/O-free coroutine deleting an m2dir mailbox under the m2store root.
+/// I/O-free coroutine deleting an m2dir mailbox under the store root.
 pub struct M2dirMailboxDelete {
     inner: InnerDelete,
 }

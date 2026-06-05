@@ -1,8 +1,13 @@
-//! IMAP message-get coroutine.
+//! IMAP message-get coroutine: optional SELECT then UID FETCH
+//! BODY.PEEK[], returning raw RFC 5322 bytes without flipping \\Seen.
 //!
-//! Optional `SELECT <mailbox>` (gated on `auto_select`) followed by
-//! `UID FETCH <id> (BODY.PEEK[])`. Returns the raw RFC 5322 bytes
-//! without flipping the \Seen flag.
+//! # Example
+//!
+//! ```rust,ignore
+//! use io_email::imap::message_get::ImapMessageGet;
+//!
+//! let raw = client.run(ImapMessageGet::new("INBOX", "12", true)?)?;
+//! ```
 
 use alloc::{string::String, vec, vec::Vec};
 use core::mem;

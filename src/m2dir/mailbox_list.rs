@@ -1,18 +1,17 @@
-//! m2dir list-mailboxes coroutine.
+//! m2dir list-mailboxes coroutine wrapping
+//! [`io_m2dir::m2dir::list::M2dirList`]: walks the store depth-first
+//! reporting every directory with the .m2dir marker.
 //!
-//! Wraps [`io_m2dir::m2dir::list::M2dirList`]: walks the m2store
-//! depth-first and reports every directory carrying the `.m2dir`
-//! marker as a mailbox. Hidden entries (`.`-prefixed) are skipped;
-//! m2dirs can nest, so children are still walked after a match.
+//! `with_counts` is currently a no-op (TODO: chain an
+//! M2dirMailboxStatus stage).
 //!
-//! `with_counts` is currently a no-op for the same reason it's a
-//! no-op on Maildir: surfacing totals/unread needs a follow-up walk
-//! over each m2dir's entry directory. Wire that in once a
-//! dedicated M2dirMailboxStatus coroutine lands.
+//! # Example
 //!
-//! Emits the shared [`Mailbox`] shape directly; m2dir-specific data
-//! (marker path, `.meta` directory layout) is dropped on purpose to
-//! stay LCD.
+//! ```rust,ignore
+//! use io_email::m2dir::mailbox_list::M2dirMailboxList;
+//!
+//! let mailboxes = client.run(M2dirMailboxList::new(&client.root, false))?;
+//! ```
 
 use alloc::{string::ToString, vec::Vec};
 use std::path::PathBuf;
@@ -41,16 +40,13 @@ pub enum M2dirMailboxListError {
     List(#[from] InnerM2dirMailboxListError),
 }
 
-/// I/O-free coroutine listing every m2dir under an m2store root.
+/// I/O-free coroutine listing every m2dir under a store root.
 pub struct M2dirMailboxList {
     inner: InnerM2dirMailboxList,
 }
 
 impl M2dirMailboxList {
-    /// Builds an [`M2store`] from `root` and constructs the inner
-    /// [`InnerM2dirMailboxList`] against it. `_with_counts` is
-    /// accepted for symmetry with the other backends but currently
-    /// ignored; see the module doc for the path to surfacing counts.
+    /// `_with_counts` is accepted for shared-API symmetry but ignored.
     pub fn new(root: impl Into<PathBuf>, _with_counts: bool) -> Self {
         trace!("prepare m2dir mailbox listing");
         let path: M2dirPath = root.into().into();
@@ -62,11 +58,6 @@ impl M2dirMailboxList {
 }
 
 /// Converts one [`M2dir`] into the shared [`Mailbox`] shape.
-///
-/// `id` is the on-disk path so downstream ops can locate the m2dir;
-/// `name` is the last path segment. Counts default to `None`;
-/// populating them needs the follow-up walk described in the module
-/// doc.
 fn mailbox_from(m2dir: M2dir) -> Mailbox {
     let path = m2dir.path();
     let name = path.file_name().unwrap_or("").to_string();

@@ -1,13 +1,16 @@
-//! Maildir message-add coroutine.
+//! Maildir message-add coroutine wrapping
+//! [`io_maildir::entry::store::MaildirEntryStore`]: writes raw bytes
+//! to tmp/, then renames into cur/ with info-section letters.
 //!
-//! Wraps [`io_maildir::entry::store::MaildirEntryStore`]: writes the
-//! raw bytes to `tmp/`, then renames into `cur/` with the info-section
-//! letters derived from `flags`. The yielded id is the Maildir filename
-//! minus the `:2,FLAGS` suffix.
+//! Returns the Maildir filename minus the `:2,FLAGS` suffix.
 //!
-//! `MaildirEntryStore` itself probes time / pid / hostname to mint the
-//! message identifier (RFC's `time.usec.hostname` convention), so this
-//! coroutine relays those `Wants*` variants through.
+//! # Example
+//!
+//! ```rust,ignore
+//! use io_email::maildir::message_add::MaildirMessageAdd;
+//!
+//! let id = client.run(MaildirMessageAdd::new(&client.store, "INBOX", &flags, raw)?)?;
+//! ```
 
 use alloc::{string::String, vec::Vec};
 
@@ -34,7 +37,7 @@ pub enum MaildirMessageAddError {
     InvalidMailbox(#[from] InvalidMailboxName),
 }
 
-/// I/O-free coroutine appending a raw message to a Maildir under `cur/`.
+/// I/O-free coroutine appending a raw message to a Maildir cur/.
 pub struct MaildirMessageAdd {
     inner: InnerStore,
 }

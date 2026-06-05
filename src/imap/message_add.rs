@@ -1,15 +1,19 @@
-//! IMAP message-add coroutine.
+//! IMAP message-add coroutine wrapping APPEND (RFC 3501 §6.3.11).
 //!
-//! `APPEND <mailbox> [flags] <message>` (RFC 3501 §6.3.11) with two
-//! Message-ID safety nets:
+//! Two Message-ID safety nets:
 //!
-//! 1. Before sending, the body is parsed for a `Message-ID:` header;
-//!    when missing, a synthetic `<uuid@io-email.invalid>` is injected
-//!    so the message stays addressable later.
-//! 2. When the server does not advertise UIDPLUS (no `APPENDUID`
-//!    response code per RFC 4315), the coroutine falls back to
-//!    `SELECT <mailbox>` + `UID SEARCH HEADER Message-ID <id>` and
-//!    takes the highest matching UID.
+//! 1. A missing Message-ID: header is replaced by a synthetic
+//!    <uuid@io-email.invalid> so the message stays addressable.
+//! 2. When UIDPLUS (RFC 4315) is missing, falls back to SELECT +
+//!    UID SEARCH HEADER Message-ID and takes the highest UID.
+//!
+//! # Example
+//!
+//! ```rust,ignore
+//! use io_email::imap::message_add::ImapMessageAdd;
+//!
+//! let uid = client.run(ImapMessageAdd::new("INBOX", &flags, raw)?)?;
+//! ```
 
 use alloc::{
     format,
@@ -68,7 +72,7 @@ impl From<InvalidMailboxName> for ImapMessageAddError {
 }
 
 /// I/O-free coroutine appending a raw RFC 5322 message and resolving
-/// the appended UID (UIDPLUS fast path or SEARCH fallback).
+/// the appended UID.
 pub struct ImapMessageAdd {
     state: State,
     mailbox: String,
@@ -76,9 +80,8 @@ pub struct ImapMessageAdd {
 }
 
 impl ImapMessageAdd {
-    /// `flags` are applied to the appended message; pass an empty
-    /// slice for none. `raw` must be a syntactically valid RFC 5322
-    /// message; framing-level escaping is the server's job.
+    /// `flags` apply to the appended message; pass an empty slice for
+    /// none. `raw` must be a valid RFC 5322 message.
     pub fn new(
         mailbox: &str,
         flags: &[Flag],
@@ -86,9 +89,8 @@ impl ImapMessageAdd {
     ) -> Result<Self, ImapMessageAddError> {
         trace!("prepare IMAP message add");
 
-        // Extract or synthesize a Message-ID up front: needed as a
-        // fallback to recover the UID on servers that don't advertise
-        // UIDPLUS (no APPENDUID response code, RFC 4315).
+        // NOTE: extract or synthesize Message-ID up front; needed as a
+        // fallback to recover the UID when UIDPLUS is missing.
         let parsed_id = MessageParser::default()
             .parse_headers(&raw)
             .and_then(|m| m.message_id().map(ToString::to_string))

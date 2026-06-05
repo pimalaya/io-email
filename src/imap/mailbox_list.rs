@@ -1,13 +1,16 @@
-//! IMAP list-mailboxes coroutine.
+//! IMAP list-mailboxes coroutine: LIST "" "*" with optional per-row
+//! STATUS for counts (RFC 3501 §6.3.10).
 //!
-//! Composes `LIST "" "*"` with, when counts are requested, one
-//! `STATUS <mailbox> (MESSAGES UNSEEN)` per row (RFC 3501 §6.3.10).
-//! `LIST` does not carry counts; STATUS is the standard way to surface
-//! them per mailbox.
+//! Non-selectable rows (\\Noselect) are filtered out; delimiter and
+//! SPECIAL-USE attributes are dropped to stay LCD.
 //!
-//! Emits the shared [`Mailbox`] shape directly; IMAP-specific data
-//! (delimiter and SPECIAL-USE attributes) is dropped on purpose to
-//! stay LCD.
+//! # Example
+//!
+//! ```rust,ignore
+//! use io_email::imap::mailbox_list::ImapMailboxList;
+//!
+//! let mailboxes = client.run(ImapMailboxList::new(true))?;
+//! ```
 
 use alloc::{
     string::{String, ToString},
@@ -51,20 +54,17 @@ pub enum ImapMailboxListError {
     ResumedAfterDone,
 }
 
-/// I/O-free coroutine listing every IMAP mailbox visible to the
-/// session, optionally enriched with per-mailbox total / unread counts.
+/// I/O-free coroutine listing every IMAP mailbox visible to the session.
 pub struct ImapMailboxList {
     state: State,
     with_counts: bool,
-    /// Filled by the LIST stage, then walked one row at a time by the
-    /// optional STATUS stage.
+    /// Filled by LIST, then walked one row at a time by STATUS.
     mailboxes: Vec<Mailbox>,
 }
 
 impl ImapMailboxList {
-    /// `LIST "" "*"` runs first; when `with_counts` is set, one
-    /// `STATUS <mailbox> (MESSAGES UNSEEN)` per row follows and
-    /// populates [`Mailbox::total`] / [`Mailbox::unread`].
+    /// When `with_counts` is set, each LIST row is followed by a
+    /// STATUS (MESSAGES UNSEEN) call.
     pub fn new(with_counts: bool) -> Self {
         trace!("prepare IMAP mailbox listing (with_counts={with_counts})");
         // SAFETY: empty reference and "*" pattern are valid IMAP tokens.
@@ -83,16 +83,14 @@ enum State {
     Listing(InnerImapMailboxList),
     StatusOne {
         status: ImapMailboxStatus,
-        /// Index into `mailboxes` of the row this STATUS targets.
+        /// Row index this STATUS targets.
         cursor: usize,
     },
     Done,
 }
 
-/// Keeps only LIST rows that can actually be SELECTed. Containers
-/// flagged `\Noselect` (RFC 3501 §6.3.8) cannot hold messages and
-/// would error out on any subsequent shared-API op, so they're
-/// dropped before they reach the caller.
+/// Drops \\Noselect containers (RFC 3501 §6.3.8): they cannot hold
+/// messages and would error out on any later shared-API op.
 fn is_selectable(
     row: &(
         ImapMailbox<'static>,
@@ -108,10 +106,7 @@ fn is_selectable(
     true
 }
 
-/// Converts one IMAP `LIST` row into the shared [`Mailbox`] shape.
-///
-/// Delimiter and attribute flags are dropped on purpose: they're
-/// IMAP-specific and not part of the LCD surface.
+/// Converts one IMAP LIST row into the shared [`Mailbox`] shape.
 fn mailbox_from(
     row: (
         ImapMailbox<'static>,
@@ -133,8 +128,7 @@ fn mailbox_from(
     }
 }
 
-/// Spins up the STATUS coroutine for `mailbox` and returns the next
-/// [`State`]. Reuses the LIST-derived id as the STATUS target.
+/// Starts the STATUS coroutine for `mailbox`.
 fn start_status(mailbox: &Mailbox, cursor: usize) -> Result<State, ImapMailboxListError> {
     let mbox: ImapMailbox<'static> = mailbox
         .id

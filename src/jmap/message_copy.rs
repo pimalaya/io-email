@@ -1,14 +1,16 @@
-//! JMAP message-copy coroutine.
+//! JMAP message-copy coroutine wrapping Email/set with an
+//! AddToMailbox patch per id.
 //!
-//! Single-stage state machine:
-//! `Email/set { update: AddToMailbox(target_id) per id }` adds the
-//! target mailbox reference to every requested email while leaving
-//! the existing mailboxIds intact (JMAP's "copy" is conceptually
-//! "an email referenced from N mailboxes").
+//! JMAP copy is "an email referenced from N mailboxes"; the source
+//! `from` is unused (only there for shared-API symmetry).
 //!
-//! The shared `from` parameter is only used for symmetry with
-//! Maildir / m2dir: JMAP doesn't need it because the existing
-//! mailboxIds carry the source reference automatically.
+//! # Example
+//!
+//! ```rust,ignore
+//! use io_email::jmap::message_copy::JmapMessageCopy;
+//!
+//! client.run(JmapMessageCopy::new(&session, &auth, "_", "dst-id", &["email-id"])?)?;
+//! ```
 
 use alloc::{string::String, vec::Vec};
 use core::mem;
@@ -35,8 +37,7 @@ pub enum JmapMessageCopyError {
     ResumedAfterDone,
 }
 
-/// I/O-free coroutine adding `to` (a JMAP mailbox id) to the
-/// mailboxIds of every email id.
+/// I/O-free coroutine adding `to` to the mailboxIds of every email id.
 pub struct JmapMessageCopy {
     state: State,
 }

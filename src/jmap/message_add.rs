@@ -1,10 +1,12 @@
-//! JMAP message-add coroutine.
+//! JMAP message-add coroutine: Blob/upload then Email/import.
 //!
-//! Two-stage state machine:
-//! 1. `Blob/upload` posts the raw RFC 5322 bytes to the session
-//!    `upload_url` and yields a blob id.
-//! 2. `Email/import` materialises the blob into the supplied mailbox
-//!    id with the requested keywords.
+//! # Example
+//!
+//! ```rust,ignore
+//! use io_email::jmap::message_add::JmapMessageAdd;
+//!
+//! let id = client.run(JmapMessageAdd::new(&session, &auth, "mailbox-id", &flags, raw)?)?;
+//! ```
 
 use alloc::{collections::BTreeMap, string::String, vec::Vec};
 use core::mem;
@@ -48,8 +50,7 @@ pub enum JmapMessageAddError {
     ResumedAfterDone,
 }
 
-/// I/O-free coroutine appending a raw RFC 5322 message to a JMAP
-/// mailbox.
+/// I/O-free coroutine appending a raw RFC 5322 message into a mailbox.
 pub struct JmapMessageAdd {
     state: State,
     mailbox_id: String,
@@ -159,8 +160,8 @@ impl JmapCoroutine for JmapMessageAdd {
     }
 }
 
-/// Resolves the RFC 8620 upload URL template against the live
-/// `{accountId}` substitution; returns the parsed [`Url`].
+/// Resolves the RFC 8620 upload URL template by substituting
+/// `{accountId}`.
 fn resolve_upload_url(session: &JmapSession) -> Result<Url, JmapMessageAddError> {
     let account_id = session
         .primary_accounts

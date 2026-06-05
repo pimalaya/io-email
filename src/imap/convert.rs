@@ -1,8 +1,7 @@
 //! Conversions between IMAP wire types and the shared LCD types.
 //!
 //! Each helper returns a typed "invalid input" marker so each
-//! coroutine can fold it into its own error enum without coupling to
-//! [`crate::client::EmailClientStdError`].
+//! coroutine can fold it into its own error enum.
 
 use alloc::{
     string::{String, ToString},
@@ -54,11 +53,9 @@ pub fn parse_uids(ids: &[&str]) -> Result<SequenceSet, InvalidUidSet> {
 
 /// Maps a shared [`Flag`] to its IMAP wire counterpart.
 ///
-/// IANA-classified flags become the matching system flag at their
-/// canonical wire spelling; custom user keywords pass through as IMAP
-/// `Keyword` atoms when atom-safe, with a sanitised fallback otherwise
-/// (lossy by design; the original spelling lives on the round-trip
-/// side: m2dir sidecar / JMAP wire keyword).
+/// IANA flags become the matching system flag; custom keywords pass
+/// through as Keyword atoms, with a sanitised fallback when the raw
+/// spelling is not atom-safe.
 pub fn flag_from(flag: &Flag) -> ImapFlag<'static> {
     match flag.iana() {
         Some(IanaFlag::Seen) => ImapFlag::Seen,
@@ -80,9 +77,8 @@ pub fn flag_from(flag: &Flag) -> ImapFlag<'static> {
     }
 }
 
-/// Replaces every non-atom-safe byte with `_` so a custom keyword that
-/// contains spaces, control bytes or `()<>{}` survives round-tripping
-/// through `IMAP STORE`.
+/// Replaces every non-atom-safe byte with `_` so a keyword with
+/// spaces, controls or `()<>{}` survives IMAP STORE.
 fn sanitise_atom(raw: &str) -> String {
     raw.chars()
         .map(|c| {

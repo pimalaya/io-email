@@ -1,17 +1,17 @@
-//! JMAP message-send coroutine.
+//! JMAP message-send coroutine: Blob/upload, Email/import into the
+//! drafts mailbox with `$draft`, then EmailSubmission/set against the
+//! configured identity.
 //!
-//! Three-stage state machine:
-//! 1. `Blob/upload` posts the raw RFC 5322 bytes to the session
-//!    `upload_url` and yields a blob id.
-//! 2. `Email/import` materialises the blob into the configured
-//!    drafts mailbox with the `$draft` keyword.
-//! 3. `EmailSubmission/set` queues the resulting email for delivery
-//!    under the configured identity. JMAP picks the SMTP envelope
-//!    from the email headers (`envelope: None`).
+//! `identity_id` and `drafts_mailbox_id` come from the [`JmapContext`]
+//! and must be set before [`EmailClientStd::send_message`] is called.
 //!
-//! `identity_id` and `drafts_mailbox_id` come from the
-//! [`JmapContext`] and must be populated before
-//! [`EmailClientStd::send_message`] is called.
+//! # Example
+//!
+//! ```rust,ignore
+//! use io_email::jmap::message_send::JmapMessageSend;
+//!
+//! client.run(JmapMessageSend::new(&session, &auth, "identity-id", "drafts-id", raw)?)?;
+//! ```
 //!
 //! [`JmapContext`]: crate::client::JmapContext
 //! [`EmailClientStd::send_message`]: crate::client::EmailClientStd::send_message
@@ -221,8 +221,7 @@ impl JmapCoroutine for JmapMessageSend {
     }
 }
 
-/// Resolves the RFC 8620 upload URL template against the live
-/// `{accountId}` substitution.
+/// Substitutes `{accountId}` in the upload URL template.
 fn resolve_upload_url(session: &JmapSession) -> Result<Url, JmapMessageSendError> {
     let account_id = account_id_of(session);
     let url_str = session.upload_url.replace("{accountId}", &account_id);

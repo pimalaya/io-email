@@ -1,13 +1,16 @@
-//! m2dir message-copy coroutine: per id, fetches the source bytes via
-//! [`M2dirEntryGet`] then writes them to the target via
-//! [`M2dirEntryStore`].
+//! m2dir message-copy coroutine: per id chains [`M2dirEntryGet`] then
+//! [`M2dirEntryStore`] between m2dirs.
 //!
-//! Flags are not propagated across the copy: the m2dir flag layout
-//! lives in a separate `.meta/<id>.flags` sidecar whose payload is
-//! reread under different ids on the target side. Callers needing
-//! flag-preserving copies should add them via
-//! [`crate::client::EmailClientStd::add_flags`] after the copy
-//! completes.
+//! Flags are not propagated; callers needing flag-preserving copies
+//! must follow up with [`crate::client::EmailClientStd::add_flags`].
+//!
+//! # Example
+//!
+//! ```rust,ignore
+//! use io_email::m2dir::message_copy::M2dirMessageCopy;
+//!
+//! client.run(M2dirMessageCopy::new(&client.root, "INBOX", "Archive", &["msg-id"])?)?;
+//! ```
 //!
 //! [`M2dirEntryGet`]: io_m2dir::entry::get::M2dirEntryGet
 //! [`M2dirEntryStore`]: io_m2dir::entry::store::M2dirEntryStore
@@ -118,7 +121,7 @@ impl M2dirCoroutine for M2dirMessageCopy {
                         return M2dirCoroutineState::Yielded(y);
                     }
                     M2dirCoroutineState::Complete(Ok(_entry)) => {
-                        // NOTE: loop back to pull the next id or finish.
+                        // NOTE: loop back to the next id or finish.
                     }
                     M2dirCoroutineState::Complete(Err(err)) => {
                         return M2dirCoroutineState::Complete(Err(err.into()));

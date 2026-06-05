@@ -1,12 +1,16 @@
-//! JMAP message-get coroutine.
+//! JMAP message-get coroutine: Email/get(blobId) then Blob/download
+//! to return raw RFC 5322 bytes.
 //!
-//! Two-stage state machine:
-//! 1. `Email/get(properties: [blobId])` resolves the email id to a
-//!    download blob id.
-//! 2. `Blob/download` against `{accountId, blobId}` returns the raw
-//!    RFC 5322 bytes. Redirects (RFC 8620 §6.2 allows servers to
-//!    relocate the blob) are not followed: the coroutine surfaces
-//!    them as an error, matching the dead-code behaviour.
+//! Redirects (RFC 8620 §6.2) surface as an error rather than being
+//! followed.
+//!
+//! # Example
+//!
+//! ```rust,ignore
+//! use io_email::jmap::message_get::JmapMessageGet;
+//!
+//! let raw = client.run(JmapMessageGet::new(&session, &auth, "_", "email-id")?)?;
+//! ```
 
 use alloc::{
     string::{String, ToString},
@@ -152,8 +156,8 @@ impl JmapCoroutine for JmapMessageGet {
     }
 }
 
-/// Resolves the RFC 8620 download URL template against the live
-/// `{accountId, blobId, type, name}` substitutions.
+/// Substitutes `{accountId, blobId, type, name}` in the download URL
+/// template.
 fn resolve_download_url(template: &str, account_id: &str, blob_id: &str) -> String {
     template
         .replace("{accountId}", account_id)

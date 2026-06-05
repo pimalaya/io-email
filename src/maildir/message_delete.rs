@@ -1,11 +1,16 @@
-//! Maildir message-delete coroutine.
+//! Maildir message-delete coroutine: adds the Trashed (T) info-section
+//! letter; expunge is the caller's responsibility.
 //!
-//! Maildir has no atomic "remove this message" primitive; the
-//! conventional approach is to mark the message with the `T`
-//! (Trashed) info-section letter and let a periodic expunge clean it
-//! up. This coroutine wraps [`io_maildir::flag::add::MaildirFlagsAdd`]
-//! with the [`MaildirFlag::Trashed`] flag so a `delete_message` call on
-//! the shared API stays portable.
+//! Wraps [`io_maildir::flag::add::MaildirFlagsAdd`] with
+//! [`MaildirFlag::Trashed`].
+//!
+//! # Example
+//!
+//! ```rust,ignore
+//! use io_email::maildir::message_delete::MaildirMessageDelete;
+//!
+//! client.run(MaildirMessageDelete::new(&client.store, "INBOX", "msg-id")?)?;
+//! ```
 //!
 //! [`MaildirFlag::Trashed`]: io_maildir::flag::types::MaildirFlag::Trashed
 

@@ -1,9 +1,14 @@
-//! m2dir flag-store coroutine.
+//! m2dir flag-store coroutine: walks every id and drives one per-id
+//! inner ([`M2dirFlagAdd`] / [`M2dirFlagSet`] / [`M2dirFlagRemove`])
+//! against the .meta/<id>.flags sidecar.
 //!
-//! Drives the io-m2dir
-//! [`M2dirFlagAdd`] / [`M2dirFlagSet`] / [`M2dirFlagRemove`] triad
-//! per id. Each inner coroutine reads (and/or writes) the
-//! `.meta/<id>.flags` sidecar file.
+//! # Example
+//!
+//! ```rust,ignore
+//! use io_email::{flag::FlagOp, m2dir::flag_store::M2dirFlagStore};
+//!
+//! client.run(M2dirFlagStore::new(&client.root, "INBOX", &["msg-id"], &flags, FlagOp::Add)?)?;
+//! ```
 //!
 //! [`M2dirFlagAdd`]: io_m2dir::flag::add::M2dirFlagAdd
 //! [`M2dirFlagSet`]: io_m2dir::flag::set::M2dirFlagSet

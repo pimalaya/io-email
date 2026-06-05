@@ -1,12 +1,16 @@
-//! JMAP envelope-listing coroutine.
+//! JMAP envelope-list coroutine wrapping Email/query + Email/get
+//! batched in one HTTP round-trip.
 //!
-//! Single-stage state machine:
-//! `Email/query + Email/get` (batched in a single HTTP round-trip)
-//! fetches the envelope properties for messages inside the mailbox.
+//! `page = 1`-indexed pagination is translated to JMAP's
+//! position/limit; sort order comes back from the server.
 //!
-//! `page = 1`-indexed pagination is translated into JMAP's `position`
-//! / `limit`; sorting is left to the server (the JMAP wire result
-//! already comes back position-ordered).
+//! # Example
+//!
+//! ```rust,ignore
+//! use io_email::jmap::envelope_list::JmapEnvelopeList;
+//!
+//! let envs = client.run(JmapEnvelopeList::new(&session, &auth, "mailbox-id", Some(1), Some(50))?)?;
+//! ```
 
 use alloc::vec::Vec;
 use core::mem;

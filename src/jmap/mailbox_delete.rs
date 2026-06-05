@@ -1,10 +1,13 @@
-//! JMAP mailbox-delete coroutine.
+//! JMAP mailbox-delete coroutine wrapping Mailbox/set { destroy }
+//! with onDestroyRemoveEmails to match IMAP semantics.
 //!
-//! Single-stage state machine:
-//! `Mailbox/set { destroy }` removes the supplied id. The
-//! `onDestroyRemoveEmails: true` flag drops every email that lives
-//! only in this mailbox so the resulting state is `delete the
-//! folder and everything in it`, matching the IMAP semantics.
+//! # Example
+//!
+//! ```rust,ignore
+//! use io_email::jmap::mailbox_delete::JmapMailboxDelete;
+//!
+//! client.run(JmapMailboxDelete::new(&session, &auth, "mailbox-id")?)?;
+//! ```
 
 use alloc::{string::String, vec};
 use core::mem;
