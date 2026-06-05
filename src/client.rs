@@ -53,40 +53,32 @@ use crate::{
 
 #[cfg(feature = "imap")]
 use io_imap::types::core::{IString, NString};
-#[cfg(all(
-    feature = "smtp",
-    any(
-        feature = "rustls-ring",
-        feature = "rustls-aws",
-        feature = "native-tls"
-    )
+#[cfg(feature = "smtp")]
+#[cfg(any(
+    feature = "rustls-ring",
+    feature = "rustls-aws",
+    feature = "native-tls"
 ))]
 use io_smtp::rfc5321::types::ehlo_domain::EhloDomain;
-#[cfg(all(
-    feature = "imap",
-    any(
-        feature = "rustls-ring",
-        feature = "rustls-aws",
-        feature = "native-tls"
-    )
+#[cfg(feature = "imap")]
+#[cfg(any(
+    feature = "rustls-ring",
+    feature = "rustls-aws",
+    feature = "native-tls"
 ))]
 use pimalaya_stream::sasl::Sasl as ImapSasl;
-#[cfg(all(
-    feature = "jmap",
-    any(
-        feature = "rustls-ring",
-        feature = "rustls-aws",
-        feature = "native-tls"
-    )
+#[cfg(feature = "jmap")]
+#[cfg(any(
+    feature = "rustls-ring",
+    feature = "rustls-aws",
+    feature = "native-tls"
 ))]
 use secrecy::SecretString;
-#[cfg(all(
-    any(feature = "imap", feature = "jmap", feature = "smtp"),
-    any(
-        feature = "rustls-ring",
-        feature = "rustls-aws",
-        feature = "native-tls"
-    )
+#[cfg(any(feature = "imap", feature = "jmap", feature = "smtp"))]
+#[cfg(any(
+    feature = "rustls-ring",
+    feature = "rustls-aws",
+    feature = "native-tls"
 ))]
 use {pimalaya_stream::tls::Tls, url::Url};
 

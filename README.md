@@ -2,147 +2,155 @@
 
 Email client library, written in Rust.
 
+This library is composed of 2 feature-gated layers:
+
+- Low-level **I/O-free** coroutines: these `no_std`-compatible state machines wrap the underlying [io-imap], [io-jmap], [io-maildir], [io-m2dir] and [io-smtp] coroutines and surface a shared least-common-denominator type on completion
+- Mid-level **std client**: a standard, blocking unified client that dispatches the shared API across every registered backend
+
 ## Table of contents
 
 - [Features](#features)
+- [Backend coverage](#backend-coverage)
 - [Usage](#usage)
-  - [As a no-std coroutine library](#as-a-no-std-coroutine-library)
-  - [As a std client](#as-a-std-client)
-- [Real world usage](#real-world-usage)
-- [License](#license)
+  - [Coroutines](#coroutines)
+  - [Std client](#std-client)
+- [Examples](#examples)
 - [AI disclosure](#ai-disclosure)
+- [License](#license)
 - [Social](#social)
 - [Sponsoring](#sponsoring)
 
 ## Features
 
-- Shared least-common-denominator types (`Mailbox`, `Envelope`, `Address`, `Flag`) that fit IMAP, JMAP, Maildir and SMTP.
-- One I/O-free coroutine per backend / operation, wrapping the underlying [io-imap] / [io-jmap] / [io-maildir] / [io-smtp] state machine and producing shared types on completion.
-- `EmailClientStd` (feature `client`): blocking unified client over all enabled backends.
+- **Shared LCD types**: `Mailbox`, `Envelope`, `Address`, `Flag` that fit IMAP, JMAP, Maildir, m2dir and SMTP.
+- **I/O-free** coroutines: `no_std` state machines per (backend, operation), wrapping the underlying io-* coroutine and producing a shared type on completion.
+- **Unified std client** (`client` feature): blocking dispatcher that routes shared-API calls to the highest-priority registered backend (Maildir → m2dir → JMAP → IMAP for storage, JMAP → SMTP for send).
+- **TLS** for the network backends (gated by the same `rustls-ring` / `rustls-aws` / `native-tls` features as the underlying io-* crates).
+- Optional **search DSL** (`search` feature) and **serde** round-trip on every shared type (`serde` feature).
 
-| Operation         | IMAP | JMAP | Maildir | SMTP |
-|-------------------|:----:|:----:|:-------:|:----:|
-| `list_mailboxes`  |  yes |  yes |   yes   |      |
-| `list_envelopes`  |  yes |  yes |   yes   |      |
-| `get_message`     |  yes |  yes |   yes   |      |
-| `add_message`     |  yes |  yes |   yes   |      |
-| `add_flags`       |  yes |  yes |   yes   |      |
-| `set_flags`       |  yes |  yes |   yes   |      |
-| `delete_flags`    |  yes |  yes |   yes   |      |
-| `copy_messages`   |  yes |  yes |   yes   |      |
-| `move_messages`   |  yes |  yes |   yes   |      |
-| `send_message`    |      |  yes |         |  yes |
-
-*The `io-email` library is written in [Rust](https://www.rust-lang.org/), and relies on [cargo features](https://doc.rust-lang.org/cargo/reference/features.html) to enable or disable functionalities. Default features can be found in the `features` section of the [`Cargo.toml`](https://github.com/pimalaya/io-imap/blob/master/Cargo.toml), or on [docs.rs](https://docs.rs/crate/io-imap/latest/features).*
+> [!TIP]
+> I/O Email is written in [Rust](https://www.rust-lang.org/) and uses [cargo features](https://doc.rust-lang.org/cargo/reference/features.html) to gate backend support. The default feature set is declared in [Cargo.toml](./Cargo.toml) or on [docs.rs](https://docs.rs/crate/io-email/latest/features).
 
 [io-imap]: https://github.com/pimalaya/io-imap
 [io-jmap]: https://github.com/pimalaya/io-jmap
 [io-maildir]: https://github.com/pimalaya/io-maildir
+[io-m2dir]: https://github.com/pimalaya/io-m2dir
 [io-smtp]: https://github.com/pimalaya/io-smtp
+
+## Backend coverage
+
+| Operation                              | IMAP | JMAP | Maildir | m2dir | SMTP |
+|----------------------------------------|:----:|:----:|:-------:|:-----:|:----:|
+| `list_mailboxes`                       |  yes |  yes |   yes   |  yes  |      |
+| `create_mailbox`                       |  yes |  yes |   yes   |  yes  |      |
+| `delete_mailbox`                       |  yes |  yes |   yes   |  yes  |      |
+| `diff_mailboxes`                       |      |  yes |         |       |      |
+| `list_envelopes`                       |  yes |  yes |   yes   |  yes  |      |
+| `search_envelopes` (feature `search`)  |  yes |  yes |   yes   |  yes  |      |
+| `diff_envelopes`                       |  yes |  yes |         |       |      |
+| `watch_mailbox`                        |  yes |  yes |         |       |      |
+| `get_message`                          |  yes |  yes |   yes   |  yes  |      |
+| `add_message`                          |  yes |  yes |   yes   |  yes  |      |
+| `copy_messages`                        |  yes |  yes |   yes   |  yes  |      |
+| `move_messages`                        |  yes |  yes |   yes   |  yes  |      |
+| `delete_message`                       |  yes |  yes |   yes   |  yes  |      |
+| `store_flags`                          |  yes |  yes |   yes   |  yes  |      |
+| `send_message`                         |      |  yes |         |       |  yes |
 
 ## Usage
 
-### As a no-std coroutine library
+I/O Email can be consumed two ways, depending on how much of the I/O stack you want to own. Each mode is gated by cargo features.
 
-```toml,ignore
-[dependencies]
-io-email = "0.0.1"
-```
+Whichever mode you pick, every shared-API coroutine implements the backend trait of the protocol it targets (`ImapCoroutine`, `JmapCoroutine`, `MaildirCoroutine`, `M2dirCoroutine`, `SmtpCoroutine`). The `resume(...)` method returns the matching `<Backend>CoroutineState<Yield, Return>` with two variants:
 
-List IMAP mailboxes over a blocking TCP socket:
+- `Yielded(Y)`: intermediate. `Y` is the backend's standard `<Backend>Yield` (`WantsRead` / `WantsWrite` for the network backends, `WantsDirRead` / `WantsFileCreate` / `WantsRename` etc. for the filesystem ones), plus a dedicated `Event(WatchEvent)` variant on watch coroutines.
+- `Complete(R)`: terminal. By convention `R = Result<Output, Error>` carrying the operation's final value typed against the shared `Mailbox` / `Envelope` / shared payload.
 
-```rust,ignore
-use std::{io::{Read, Write}, net::TcpStream};
+The std client owns the resume loop for you; the I/O-free mode hands it back so you can drive the same coroutine under any blocking, async, or fuzz harness.
 
-use io_email::mailbox::imap::list::*;
-use io_imap::context::ImapContext;
+### Coroutines
 
-let mut stream = TcpStream::connect("imap.example.com:143").unwrap();
-let mut buf = [0u8; 16 * 1024];
+No `client` feature required: every wrapper lives under `<domain>::<protocol>::<op>` (for example `mailbox::imap::list::ImapMailboxList`, `message::jmap::add::JmapMessageAdd`) and is built straight from the shared inputs. You own the loop and the syscalls; the library only produces operations and consumes their results.
 
-let context = ImapContext::new();
-let mut coroutine = ImapMailboxList::new(context);
-let mut arg: Option<&[u8]> = None;
+Create a fresh Maildir mailbox against a blocking caller (the same shape works under async or in-memory replay):
 
-let mailboxes = loop {
-    match coroutine.resume(arg.take()) {
-        ImapMailboxListResult::Ok(mailboxes) => break mailboxes,
-        ImapMailboxListResult::WantsRead => {
-            let n = stream.read(&mut buf).unwrap();
-            arg = Some(&buf[..n]);
-        }
-        ImapMailboxListResult::WantsWrite(bytes) => {
-            stream.write_all(&bytes).unwrap();
-            arg = None;
-        }
-        ImapMailboxListResult::Err(err) => panic!("{err}"),
-    }
+```rust,no_run
+use std::fs;
+
+use io_email::mailbox::maildir::create::MaildirMailboxCreate;
+use io_maildir::{
+    coroutine::*,
+    path::{FsPath, MaildirPath},
+    store::MaildirStore,
 };
 
-for mbox in mailboxes {
-    println!("{}", mbox.name);
+let store = MaildirStore { root: FsPath::new("/path/to/root"), maildirpp: false };
+
+let mut coroutine = MaildirMailboxCreate::new(&store, "Archive").unwrap();
+let mut arg: Option<MaildirReply> = None;
+
+loop {
+    match coroutine.resume(arg.take()) {
+        MaildirCoroutineState::Complete(Ok(())) => break,
+        MaildirCoroutineState::Complete(Err(err)) => panic!("{err}"),
+        MaildirCoroutineState::Yielded(MaildirYield::WantsDirCreate(paths)) => {
+            for path in paths {
+                fs::create_dir_all(path.as_str()).unwrap();
+            }
+            arg = Some(MaildirReply::DirCreate);
+        }
+        MaildirCoroutineState::Yielded(other) => unreachable!("unexpected {other:?}"),
+    }
 }
+
+println!("created Maildir mailbox Archive");
 ```
 
-JMAP coroutines also surface `WantsRedirect { url, .. }`; Maildir coroutines use filesystem variants (`WantsDirRead`, `WantsFileCreate`, `WantsRename`, ...).
+Network backends follow the same pattern but yield `WantsRead` / `WantsWrite(Vec<u8>)` instead; see [io-imap], [io-jmap] and [io-smtp] for the full TCP / TLS / authentication setup that authenticates the stream before the wrapper coroutine runs.
 
-### As a std client
+### Std client
+
+Enable the `client` feature (pulled in by every backend feature) and at least one backend. `EmailClientStd::new()` starts empty; `with_<protocol>(client)` plugs in an already-built per-protocol client, while `connect_<protocol>(url, tls, ...)` opens the connection through the underlying io-* crate and fills the slot in one shot.
 
 ```toml,ignore
 [dependencies]
-io-email = { version = "0.0.1", features = ["client", "imap", "rustls-ring"] }
+io-email = "0.1.0"
 ```
 
-```rust,ignore
-use io_email::client::EmailClientStd;
-use io_imap::client::ImapClientStd;
+```rust,no_run
+use io_email::{client::EmailClientStd, maildir::client::MaildirClient};
 use pimalaya_stream::{sasl::SaslLogin, tls::Tls};
 use secrecy::SecretString;
 use url::Url;
 
-let url = Url::parse("imaps://imap.example.com")?;
+let url = Url::parse("imaps://imap.example.com").unwrap();
 let tls = Tls::default();
 let sasl = SaslLogin {
     username: "alice@example.com".into(),
     password: SecretString::from("hunter2".to_owned()),
 };
 
-let imap = ImapClientStd::connect(&url, &tls, false, Some(sasl))?;
-let mut client = EmailClientStd::from(imap);
+let mut client = EmailClientStd::new()
+    .with_maildir(MaildirClient::new("/home/alice/Maildir"))
+    .connect_imap(&url, &tls, false, Some(sasl), None)
+    .unwrap();
 
-for mbox in client.list_mailboxes(true)? {
+for mbox in client.list_mailboxes(/* with_counts */ true).unwrap() {
     println!("{}: total={:?} unread={:?}", mbox.name, mbox.total, mbox.unread);
 }
 ```
 
-Same call site against Maildir:
+Dispatch priority on storage reads walks the registered backends `Maildir → m2dir → JMAP → IMAP` (local before network, cheap before expensive); send routes `JMAP → SMTP`. Pick which slots to fill based on the workload (local-first sync vs network-first transactional client).
 
-```rust,ignore
-use io_email::client::EmailClientStd;
-use io_maildir::client::MaildirClient;
+## Examples
 
-let maildir = MaildirClient::new("/home/alice/Maildir");
-let mut client = EmailClientStd::from(maildir);
+See complete examples at [./examples](https://github.com/pimalaya/io-email/blob/master/examples).
 
-for mbox in client.list_mailboxes(true)? {
-    println!("{}: total={:?} unread={:?}", mbox.name, mbox.total, mbox.unread);
-}
-```
+Have also a look at real-world projects built on top of this library:
 
-## Real world usage
-
-Have a look at projects built on top of this library:
-
-- [himalaya](https://github.com/pimalaya/himalaya): CLI to manage emails
-
-## License
-
-This project is licensed under either of:
-
-- [MIT license](LICENSE-MIT)
-- [Apache License, Version 2.0](LICENSE-APACHE)
-
-at your option.
+- [Himalaya CLI](https://github.com/pimalaya/himalaya): CLI to manage emails
+- [Himalaya TUI](https://github.com/pimalaya/himalaya-tui): TUI to manage emails
+- [Neverest](https://github.com/pimalaya/neverest): CLI to synchronize emails
 
 ## AI disclosure
 
@@ -154,11 +162,24 @@ This project is developed with AI assistance. This section documents how, so use
 
 - **Not used for**: Engineering, critical code, git manipulation (commit, merge, rebase…), real-world tests.
 
-- **Verification**: Every AI-assisted change is read, compiled, tested, and formatted before commit (`nix develop --command cargo check / cargo test / cargo fmt`). Behavioural correctness is verified against the relevant RFC or upstream spec, not assumed from the model output. Tests are never adjusted to fit AI-generated code; the code is adjusted to fit correct behaviour.
+- **Verification**: Every AI-assisted change is read, compiled, tested, and formatted before commit (`nix develop --command cargo check / cargo test / cargo
+fmt`). Behavioural correctness is verified against the relevant RFC or upstream spec, not assumed from the model output. Tests are never adjusted to fit
+AI-generated code; the code is adjusted to fit correct behaviour.
 
-- **Limitations**: AI models occasionally produce code that compiles and passes tests but is subtly wrong: off-by-one errors, missed edge cases, plausible but nonexistent APIs, stale RFC references. The verification workflow catches most of this; it does not catch all of it. Bug reports are welcome and taken seriously.
+- **Limitations**: AI models occasionally produce code that compiles and passes tests but is subtly wrong: off-by-one errors, missed edge cases, plausible
+but nonexistent APIs, stale RFC references. The verification workflow catches most of this; it does not catch all of it. Bug reports are welcome and taken
+seriously.
 
-- **Last reviewed**: 31/05/2026
+- **Last reviewed**: 06/06/2026
+
+## License
+
+This project is licensed under either of:
+
+- [MIT license](LICENSE-MIT)
+- [Apache License, Version 2.0](LICENSE-APACHE)
+
+at your option.
 
 ## Social
 
