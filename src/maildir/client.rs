@@ -5,9 +5,10 @@
 //! `keywords_header`, `strip_headers`, plus the `MaildirStore`'s
 //! `maildirpp` switch).
 //!
-//! [`Self::run`] pumps io-email Maildir coroutines directly against the
-//! local filesystem; the inner client's own helpers stay reachable
-//! through [`Self::inner`] for ops that the shared API does not cover.
+//! [`MaildirClient::run`] pumps io-email Maildir coroutines directly
+//! against the local filesystem; the inner client's own helpers stay
+//! reachable through [`MaildirClient::inner`] for ops that the shared
+//! API does not cover.
 
 use alloc::{string::String, vec::Vec};
 use std::{
@@ -20,27 +21,35 @@ use io_maildir::{client::MaildirClient as InnerMaildirClient, coroutine::*, path
 use log::trace;
 use thiserror::Error;
 
-use crate::{
-    envelope::Envelope,
-    flag::{Flag, FlagOp},
-    mailbox::Mailbox,
-    maildir::{
-        envelope_list::{MaildirEnvelopeList, MaildirEnvelopeListError},
-        flag_store::{MaildirFlagStore, MaildirFlagStoreError},
-        mailbox_create::{MaildirMailboxCreate, MaildirMailboxCreateError},
-        mailbox_delete::{MaildirMailboxDelete, MaildirMailboxDeleteError},
-        mailbox_list::{MaildirMailboxList, MaildirMailboxListError},
-        message_add::{MaildirMessageAdd, MaildirMessageAddError},
-        message_copy::{MaildirMessageCopy, MaildirMessageCopyError},
-        message_delete::{MaildirMessageDelete, MaildirMessageDeleteError},
-        message_get::{MaildirMessageGet, MaildirMessageGetError},
-        message_move::{MaildirMessageMove, MaildirMessageMoveError},
-    },
-};
 #[cfg(feature = "search")]
 use crate::{
-    maildir::envelope_search::{MaildirEnvelopeSearch, MaildirEnvelopeSearchError},
+    envelope::maildir::search::{MaildirEnvelopeSearch, MaildirEnvelopeSearchError},
     search::query::SearchEmailsQuery,
+};
+use crate::{
+    envelope::{
+        maildir::list::{MaildirEnvelopeList, MaildirEnvelopeListError},
+        types::Envelope,
+    },
+    flag::{
+        maildir::store::{MaildirFlagStore, MaildirFlagStoreError},
+        types::{Flag, FlagOp},
+    },
+    mailbox::{
+        maildir::{
+            create::{MaildirMailboxCreate, MaildirMailboxCreateError},
+            delete::{MaildirMailboxDelete, MaildirMailboxDeleteError},
+            list::{MaildirMailboxList, MaildirMailboxListError},
+        },
+        types::Mailbox,
+    },
+    message::maildir::{
+        add::{MaildirMessageAdd, MaildirMessageAddError},
+        copy::{MaildirMessageCopy, MaildirMessageCopyError},
+        delete::{MaildirMessageDelete, MaildirMessageDeleteError},
+        get::{MaildirMessageGet, MaildirMessageGetError},
+        r#move::{MaildirMessageMove, MaildirMessageMoveError},
+    },
 };
 
 /// Errors surfaced by [`MaildirClient`] while running a coroutine.

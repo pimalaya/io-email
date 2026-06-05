@@ -1,4 +1,4 @@
-//! Tokio example: drive [`io_email::imap::mailbox_list::ImapMailboxList`]
+//! Tokio example: drive [`io_email::mailbox::imap::list::ImapMailboxList`]
 //! across async I/O.
 //!
 //! The point of this example isn't to be a useful client (no TLS, no
@@ -21,7 +21,7 @@
 
 use std::{env, error::Error};
 
-use io_email::imap::mailbox_list::{ImapMailboxList, ImapMailboxListError};
+use io_email::mailbox::imap::list::{ImapMailboxList, ImapMailboxListError};
 use io_imap::{
     codec::fragmentizer::Fragmentizer,
     coroutine::{ImapCoroutine, ImapCoroutineState, ImapYield},

@@ -6,11 +6,11 @@
 //! (JMAP destroys are global) and no separate capability list (the
 //! capabilities live inside [`JmapSession::capabilities`]).
 //!
-//! [`Self::run`] pumps io-email JMAP coroutines directly against the
-//! inner client's stream; the inner client's own request/response
-//! helpers stay reachable through [`Self::inner`] for protocol-specific
-//! paths (`blob_upload`, `event_source`, raw `send_raw`, …) that the
-//! shared API does not cover.
+//! [`JmapClientStd::run`] pumps io-email JMAP coroutines directly
+//! against the inner client's stream; the inner client's own
+//! request/response helpers stay reachable through
+//! [`JmapClientStd::inner`] for protocol-specific paths (blob_upload,
+//! event_source, raw send_raw, ...) that the shared API does not cover.
 //!
 //! [`JmapClientStd`]: io_jmap::client::JmapClientStd
 //! [`JmapSession`]: io_jmap::rfc8620::JmapSession
@@ -45,32 +45,42 @@ use secrecy::SecretString;
 use thiserror::Error;
 use url::Url;
 
-use crate::{
-    envelope::{Envelope, EnvelopeDiff, FlagUpdate},
-    event::WatchEvent,
-    flag::{Flag, FlagOp},
-    jmap::{
-        convert::{envelope_from, envelope_properties},
-        envelope_diff,
-        envelope_list::{JmapEnvelopeList, JmapEnvelopeListError},
-        flag_store::{JmapFlagStore, JmapFlagStoreError},
-        mailbox_create::{JmapMailboxCreate, JmapMailboxCreateError},
-        mailbox_delete::{JmapMailboxDelete, JmapMailboxDeleteError},
-        mailbox_list::{JmapMailboxList, JmapMailboxListError},
-        message_add::{JmapMessageAdd, JmapMessageAddError},
-        message_copy::{JmapMessageCopy, JmapMessageCopyError},
-        message_delete::{JmapMessageDelete, JmapMessageDeleteError},
-        message_get::{JmapMessageGet, JmapMessageGetError},
-        message_move::{JmapMessageMove, JmapMessageMoveError},
-        message_send::{JmapMessageSend, JmapMessageSendError},
-        watch_mailbox::{JmapWatchMailbox, JmapWatchMailboxError, JmapWatchMailboxYield},
-    },
-    mailbox::{Mailbox, MailboxDiff},
-};
 #[cfg(feature = "search")]
 use crate::{
-    jmap::envelope_search::{JmapEnvelopeSearch, JmapEnvelopeSearchError},
+    envelope::jmap::search::{JmapEnvelopeSearch, JmapEnvelopeSearchError},
     search::query::SearchEmailsQuery,
+};
+use crate::{
+    envelope::{
+        event::WatchEvent,
+        jmap::{
+            diff as envelope_diff,
+            list::{JmapEnvelopeList, JmapEnvelopeListError},
+            watch::{JmapWatchMailbox, JmapWatchMailboxError, JmapWatchMailboxYield},
+        },
+        types::{Envelope, EnvelopeDiff, FlagUpdate},
+    },
+    flag::{
+        jmap::store::{JmapFlagStore, JmapFlagStoreError},
+        types::{Flag, FlagOp},
+    },
+    jmap::convert::{envelope_from, envelope_properties},
+    mailbox::{
+        jmap::{
+            create::{JmapMailboxCreate, JmapMailboxCreateError},
+            delete::{JmapMailboxDelete, JmapMailboxDeleteError},
+            list::{JmapMailboxList, JmapMailboxListError},
+        },
+        types::{Mailbox, MailboxDiff},
+    },
+    message::jmap::{
+        add::{JmapMessageAdd, JmapMessageAddError},
+        copy::{JmapMessageCopy, JmapMessageCopyError},
+        delete::{JmapMessageDelete, JmapMessageDeleteError},
+        get::{JmapMessageGet, JmapMessageGetError},
+        r#move::{JmapMessageMove, JmapMessageMoveError},
+        send::{JmapMessageSend, JmapMessageSendError},
+    },
 };
 
 /// Errors surfaced by [`JmapClientStd`] while running a coroutine.

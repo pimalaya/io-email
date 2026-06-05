@@ -7,7 +7,7 @@ use alloc::{boxed::Box, string::String};
 
 use chrono::NaiveDate;
 
-use crate::flag::Flag;
+use crate::flag::types::Flag;
 
 /// The search emails filter query.
 ///

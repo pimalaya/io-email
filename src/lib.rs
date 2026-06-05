@@ -17,18 +17,19 @@ pub mod address;
 ))]
 pub mod client;
 pub mod envelope;
-pub mod event;
 pub mod flag;
+pub mod mailbox;
+pub mod message;
+#[cfg(feature = "search")]
+pub mod search;
+
 #[cfg(feature = "imap")]
 pub mod imap;
 #[cfg(feature = "jmap")]
 pub mod jmap;
 #[cfg(feature = "m2dir")]
 pub mod m2dir;
-pub mod mailbox;
 #[cfg(feature = "maildir")]
 pub mod maildir;
-#[cfg(feature = "search")]
-pub mod search;
 #[cfg(feature = "smtp")]
 pub mod smtp;

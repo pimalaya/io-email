@@ -1,7 +1,9 @@
 //! # Search emails sort query string parser
 //!
-//! Parsers needed to build a [`SearchEmailsSortQuery`] from a string
-//! slice. Based on [`chumsky`].
+//! Parsers needed to build a [`SearchEmailsSorter`] chain from a
+//! string slice. Based on [`chumsky`].
+//!
+//! [`SearchEmailsSorter`]: crate::search::sort::query::SearchEmailsSorter
 
 use alloc::vec::Vec;
 

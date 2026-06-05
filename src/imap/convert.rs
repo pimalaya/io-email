@@ -13,7 +13,7 @@ use io_imap::types::{
     core::Atom, flag::Flag as ImapFlag, mailbox::Mailbox as ImapMailbox, sequence::SequenceSet,
 };
 
-use crate::flag::{Flag, IanaFlag};
+use crate::flag::types::{Flag, IanaFlag};
 
 /// `name` could not be encoded as an IMAP mailbox token.
 #[derive(Debug)]
@@ -27,7 +27,7 @@ pub enum InvalidUidSet {
     Invalid(String),
 }
 
-/// Parses a shared mailbox name into an IMAP [`Mailbox`].
+/// Parses a shared mailbox name into an IMAP Mailbox token.
 pub fn parse_mailbox(name: &str) -> Result<ImapMailbox<'static>, InvalidMailboxName> {
     String::from(name)
         .try_into()

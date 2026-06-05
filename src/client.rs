@@ -1,25 +1,23 @@
 //! Multi-protocol std-blocking email client.
 //!
-//! [`EmailClientStd`] is a thin container holding one optional
-//! per-protocol client per supported backend. The shared-API surface
-//! (`list_mailboxes`, `list_envelopes`, `get_message`, …) lives on
-//! each per-protocol client; this struct gives callers a single typed
-//! bag to pass around the backends they care about, plus a dispatch
-//! layer that picks the highest-priority registered backend.
+//! [`EmailClientStd`] is a thin container holding one optional per-protocol
+//! client per supported backend. The shared-API surface (`list_mailboxes`,
+//! `list_envelopes`, `get_message`, …) lives on each per-protocol client; this
+//! struct gives callers a single typed bag to pass around the backends they
+//! care about, plus a dispatch layer that picks the highest-priority registered
+//! backend.
 //!
 //! Two construction paths:
 //!
-//! - `with_<protocol>(client)`: register a client built externally
-//!   (typically via the per-protocol `new` or `connect`).
-//! - `connect_<protocol>(…)`: TLS-gated convenience that opens the
-//!   connection through the per-protocol `connect` and fills the slot
-//!   in one shot.
+//! - `with_<protocol>(client)`: register a client built externally (typically
+//!   via the per-protocol `new` or `connect`).
+//! - `connect_<protocol>(…)`: TLS-gated convenience that opens the connection
+//!   through the per-protocol `connect` and fills the slot in one shot.
 //!
 //! ## Dispatch priority
 //!
-//! Reads / mutations on storage backends:
-//! `Maildir → M2dir → JMAP → IMAP` (local before network, cheap
-//! before expensive).
+//! Reads / mutations on storage backends: `Maildir → M2dir → JMAP → IMAP`
+//! (local before network, cheap before expensive).
 //!
 //! Sending: `JMAP → SMTP`.
 //!
@@ -47,10 +45,10 @@ use crate::search::query::SearchEmailsQuery;
 #[cfg(feature = "smtp")]
 use crate::smtp::client::{SmtpClientError, SmtpClientStd};
 use crate::{
-    envelope::{Envelope, EnvelopeDiff},
-    event::WatchEvent,
-    flag::{Flag, FlagOp},
-    mailbox::{Mailbox, MailboxDiff},
+    envelope::event::WatchEvent,
+    envelope::types::{Envelope, EnvelopeDiff},
+    flag::types::{Flag, FlagOp},
+    mailbox::types::{Mailbox, MailboxDiff},
 };
 
 #[cfg(feature = "imap")]
@@ -184,13 +182,11 @@ impl EmailClientStd {
     /// Opens an IMAP connection via [`ImapClientStd::connect`] and
     /// registers the resulting client. See [`ImapClientStd::connect`]
     /// for the `auto_id` semantics.
-    #[cfg(all(
-        feature = "imap",
-        any(
-            feature = "rustls-ring",
-            feature = "rustls-aws",
-            feature = "native-tls"
-        )
+    #[cfg(feature = "imap")]
+    #[cfg(any(
+        feature = "rustls-ring",
+        feature = "rustls-aws",
+        feature = "native-tls"
     ))]
     pub fn connect_imap(
         self,
@@ -205,13 +201,11 @@ impl EmailClientStd {
 
     /// Opens a JMAP connection via [`JmapClientStd::connect`] and
     /// registers the resulting client (session already discovered).
-    #[cfg(all(
-        feature = "jmap",
-        any(
-            feature = "rustls-ring",
-            feature = "rustls-aws",
-            feature = "native-tls"
-        )
+    #[cfg(feature = "jmap")]
+    #[cfg(any(
+        feature = "rustls-ring",
+        feature = "rustls-aws",
+        feature = "native-tls"
     ))]
     pub fn connect_jmap(
         self,
@@ -224,13 +218,11 @@ impl EmailClientStd {
 
     /// Opens an SMTP connection via [`SmtpClientStd::connect`] and
     /// registers the resulting client.
-    #[cfg(all(
-        feature = "smtp",
-        any(
-            feature = "rustls-ring",
-            feature = "rustls-aws",
-            feature = "native-tls"
-        )
+    #[cfg(feature = "smtp")]
+    #[cfg(any(
+        feature = "rustls-ring",
+        feature = "rustls-aws",
+        feature = "native-tls"
     ))]
     pub fn connect_smtp(
         self,
@@ -243,12 +235,11 @@ impl EmailClientStd {
         Ok(self.with_smtp(SmtpClientStd::connect(url, tls, starttls, domain, sasl)?))
     }
 
-    /// Pings every registered network backend (IMAP, SMTP) to reset
-    /// the server's inactivity timer on long-idle sessions. Storage
-    /// backends (Maildir, M2dir) and JMAP (HTTP, stateless) have
-    /// nothing to keep alive and are skipped. Returns the first
-    /// error encountered, or `Ok(())` when every registered network
-    /// backend acknowledged the NOOP.
+    /// Pings every registered network backend (IMAP, SMTP) to reset the
+    /// server's inactivity timer on long-idle sessions. Storage backends
+    /// (Maildir, M2dir) and JMAP (HTTP, stateless) have nothing to keep alive
+    /// and are skipped. Returns the first error encountered, or `Ok(())` when
+    /// every registered network backend acknowledged the NOOP.
     pub fn ping(&mut self) -> Result<(), EmailClientStdError> {
         #[cfg(feature = "imap")]
         if let Some(c) = self.imap.as_mut() {
@@ -263,8 +254,8 @@ impl EmailClientStd {
 
     // ---- Shared-API dispatch (storage: Maildir → M2dir → JMAP → IMAP) ----
 
-    /// Lists every visible mailbox via the highest-priority registered
-    /// storage backend.
+    /// Lists every visible mailbox via the highest-priority registered storage
+    /// backend.
     pub fn list_mailboxes(
         &mut self,
         with_counts: bool,
@@ -288,9 +279,9 @@ impl EmailClientStd {
         Err(EmailClientStdError::NoBackendRegistered)
     }
 
-    /// Lists envelopes from `mailbox`. `with_attachment` is honoured
-    /// by IMAP / Maildir / M2dir; JMAP returns the attachment flag
-    /// inline and ignores the parameter.
+    /// Lists envelopes from `mailbox`. `with_attachment` is honoured by IMAP /
+    /// Maildir / M2dir; JMAP returns the attachment flag inline and ignores the
+    /// parameter.
     pub fn list_envelopes(
         &mut self,
         mailbox: &str,
@@ -576,12 +567,11 @@ impl EmailClientStd {
         Err(EmailClientStdError::UnsupportedOperation)
     }
 
-    /// Probes whether the mailbox set has changed since `state`. JMAP
-    /// uses `Mailbox/changes` for a constant-cost "anything changed?"
-    /// answer; backends without an account-global mailbox state token
-    /// (IMAP, Maildir, m2dir) fall through to
-    /// [`EmailClientStdError::UnsupportedOperation`] so the caller can
-    /// drop to a normal [`Self::list_mailboxes`].
+    /// Probes whether the mailbox set has changed since `state`. JMAP uses
+    /// `Mailbox/changes` for a constant-cost "anything changed?"  answer;
+    /// backends without an account-global mailbox state token (IMAP, Maildir,
+    /// m2dir) fall through to [`EmailClientStdError::UnsupportedOperation`] so
+    /// the caller can drop to a normal [`Self::list_mailboxes`].
     pub fn diff_mailboxes(
         &mut self,
         state: Option<&[u8]>,
@@ -617,9 +607,8 @@ impl EmailClientStd {
 
     // ---- Sending (JMAP → SMTP) -------------------------------------
 
-    /// Sends a raw RFC 5322 message. JMAP routes via
-    /// `EmailSubmission/set` when registered; otherwise SMTP runs the
-    /// RFC 5321 mail transaction.
+    /// Sends a raw RFC 5322 message. JMAP routes via `EmailSubmission/set` when
+    /// registered; otherwise SMTP runs the RFC 5321 mail transaction.
     #[cfg(any(feature = "jmap", feature = "smtp"))]
     pub fn send_message(&mut self, raw: Vec<u8>) -> Result<(), EmailClientStdError> {
         #[cfg(feature = "jmap")]

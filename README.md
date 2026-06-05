@@ -54,7 +54,7 @@ List IMAP mailboxes over a blocking TCP socket:
 ```rust,ignore
 use std::{io::{Read, Write}, net::TcpStream};
 
-use io_email::imap::mailbox_list::*;
+use io_email::mailbox::imap::list::*;
 use io_imap::context::ImapContext;
 
 let mut stream = TcpStream::connect("imap.example.com:143").unwrap();

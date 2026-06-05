@@ -18,8 +18,8 @@ use io_jmap::{
 
 use crate::{
     address::Address,
-    envelope::{Envelope, normalize_message_id},
-    flag::{Flag, IanaFlag},
+    envelope::types::{Envelope, normalize_message_id},
+    flag::types::{Flag, IanaFlag},
 };
 
 /// Maps a shared [`Flag`] to its JMAP keyword (RFC 8621 §4.1.1).

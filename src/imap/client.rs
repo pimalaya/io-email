@@ -5,11 +5,11 @@
 //! IMAP methods need: the `auto_select` policy, the optional `auto_id`
 //! payload, and the last-known capability list discovered at login.
 //!
-//! [`Self::run`] pumps io-email IMAP coroutines directly against the
-//! inner client's stream and fragmentizer; the inner client's own
-//! request/response helpers stay reachable through [`Self::inner`] for
-//! protocol-specific paths (`select`, `idle`, `enable`, …) that the
-//! shared API does not cover.
+//! [`ImapClientStd::run`] pumps io-email IMAP coroutines directly
+//! against the inner client's stream and fragmentizer; the inner
+//! client's own request/response helpers stay reachable through
+//! [`ImapClientStd::inner`] for protocol-specific paths (select, idle,
+//! enable, ...) that the shared API does not cover.
 
 use core::{num::NonZeroU32, sync::atomic::AtomicBool};
 
@@ -50,34 +50,44 @@ use thiserror::Error;
 ))]
 use url::Url;
 
-use crate::{
-    envelope::{Envelope, EnvelopeDiff, FlagUpdate},
-    event::WatchEvent,
-    flag::{Flag, FlagOp},
-    imap::{
-        convert::parse_mailbox,
-        envelope_diff::{
-            ImapState, envelope_from_items, flag_update_from_items, new_message_item_names,
-            new_message_window,
-        },
-        envelope_list::{ImapEnvelopeList, ImapEnvelopeListError},
-        flag_store::{ImapFlagStore, ImapFlagStoreError},
-        mailbox_create::{ImapMailboxCreate, ImapMailboxCreateError},
-        mailbox_delete::{ImapMailboxDelete, ImapMailboxDeleteError},
-        mailbox_list::{ImapMailboxList, ImapMailboxListError},
-        message_add::{ImapMessageAdd, ImapMessageAddError},
-        message_copy::{ImapMessageCopy, ImapMessageCopyError},
-        message_delete::{ImapMessageDelete, ImapMessageDeleteError},
-        message_get::{ImapMessageGet, ImapMessageGetError},
-        message_move::{ImapMessageMove, ImapMessageMoveError},
-        watch_mailbox::{ImapWatchMailbox, ImapWatchMailboxError, ImapWatchMailboxYield},
-    },
-    mailbox::Mailbox,
-};
 #[cfg(feature = "search")]
 use crate::{
-    imap::envelope_search::{ImapEnvelopeSearch, ImapEnvelopeSearchError},
+    envelope::imap::search::{ImapEnvelopeSearch, ImapEnvelopeSearchError},
     search::query::SearchEmailsQuery,
+};
+use crate::{
+    envelope::{
+        event::WatchEvent,
+        imap::{
+            diff::{
+                ImapState, envelope_from_items, flag_update_from_items, new_message_item_names,
+                new_message_window,
+            },
+            list::{ImapEnvelopeList, ImapEnvelopeListError},
+            watch::{ImapWatchMailbox, ImapWatchMailboxError, ImapWatchMailboxYield},
+        },
+        types::{Envelope, EnvelopeDiff, FlagUpdate},
+    },
+    flag::{
+        imap::store::{ImapFlagStore, ImapFlagStoreError},
+        types::{Flag, FlagOp},
+    },
+    imap::convert::parse_mailbox,
+    mailbox::{
+        imap::{
+            create::{ImapMailboxCreate, ImapMailboxCreateError},
+            delete::{ImapMailboxDelete, ImapMailboxDeleteError},
+            list::{ImapMailboxList, ImapMailboxListError},
+        },
+        types::Mailbox,
+    },
+    message::imap::{
+        add::{ImapMessageAdd, ImapMessageAddError},
+        copy::{ImapMessageCopy, ImapMessageCopyError},
+        delete::{ImapMessageDelete, ImapMessageDeleteError},
+        get::{ImapMessageGet, ImapMessageGetError},
+        r#move::{ImapMessageMove, ImapMessageMoveError},
+    },
 };
 
 /// Errors surfaced by [`ImapClientStd`] while running a coroutine.

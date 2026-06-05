@@ -12,7 +12,7 @@ use chrono::NaiveDate;
 use chumsky::prelude::*;
 
 use crate::{
-    flag::Flag,
+    flag::types::Flag,
     search::{filter::query::SearchEmailsFilterQuery, parser::ParserError},
 };
 

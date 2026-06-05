@@ -12,9 +12,9 @@ use io_maildir::{
 };
 use thiserror::Error;
 
-use crate::flag::{Flag, IanaFlag};
+use crate::flag::types::{Flag, IanaFlag};
 
-/// Errors produced by [`mailbox_path`].
+/// Errors produced by the mailbox-name validator.
 #[derive(Clone, Debug, Error)]
 #[error("invalid Maildir mailbox `{0}`")]
 pub struct InvalidMailboxName(pub String);

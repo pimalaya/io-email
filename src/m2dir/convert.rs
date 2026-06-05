@@ -20,11 +20,11 @@ use thiserror::Error;
 
 use crate::{
     address::Address,
-    envelope::{Envelope, normalize_message_id},
-    flag::Flag,
+    envelope::types::{Envelope, normalize_message_id},
+    flag::types::Flag,
 };
 
-/// Errors produced by [`resolve_mailbox`].
+/// Errors produced by the mailbox-path resolver.
 #[derive(Debug, Error)]
 pub enum InvalidMailboxName {
     #[error(transparent)]

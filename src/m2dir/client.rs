@@ -22,27 +22,35 @@ use io_m2dir::{client::M2dirClient as InnerM2dirClient, coroutine::*, path::M2di
 use log::trace;
 use thiserror::Error;
 
-use crate::{
-    envelope::Envelope,
-    flag::{Flag, FlagOp},
-    m2dir::{
-        envelope_list::{M2dirEnvelopeList, M2dirEnvelopeListError},
-        flag_store::{M2dirFlagStore, M2dirFlagStoreError},
-        mailbox_create::{M2dirMailboxCreate, M2dirMailboxCreateError},
-        mailbox_delete::{M2dirMailboxDelete, M2dirMailboxDeleteError},
-        mailbox_list::{M2dirMailboxList, M2dirMailboxListError},
-        message_add::{M2dirMessageAdd, M2dirMessageAddError},
-        message_copy::{M2dirMessageCopy, M2dirMessageCopyError},
-        message_delete::{M2dirMessageDelete, M2dirMessageDeleteError},
-        message_get::{M2dirMessageGet, M2dirMessageGetError},
-        message_move::{M2dirMessageMove, M2dirMessageMoveError},
-    },
-    mailbox::Mailbox,
-};
 #[cfg(feature = "search")]
 use crate::{
-    m2dir::envelope_search::{M2dirEnvelopeSearch, M2dirEnvelopeSearchError},
+    envelope::m2dir::search::{M2dirEnvelopeSearch, M2dirEnvelopeSearchError},
     search::query::SearchEmailsQuery,
+};
+use crate::{
+    envelope::{
+        m2dir::list::{M2dirEnvelopeList, M2dirEnvelopeListError},
+        types::Envelope,
+    },
+    flag::{
+        m2dir::store::{M2dirFlagStore, M2dirFlagStoreError},
+        types::{Flag, FlagOp},
+    },
+    mailbox::{
+        m2dir::{
+            create::{M2dirMailboxCreate, M2dirMailboxCreateError},
+            delete::{M2dirMailboxDelete, M2dirMailboxDeleteError},
+            list::{M2dirMailboxList, M2dirMailboxListError},
+        },
+        types::Mailbox,
+    },
+    message::m2dir::{
+        add::{M2dirMessageAdd, M2dirMessageAddError},
+        copy::{M2dirMessageCopy, M2dirMessageCopyError},
+        delete::{M2dirMessageDelete, M2dirMessageDeleteError},
+        get::{M2dirMessageGet, M2dirMessageGetError},
+        r#move::{M2dirMessageMove, M2dirMessageMoveError},
+    },
 };
 
 /// Errors surfaced by [`M2dirClient`] while running a coroutine.

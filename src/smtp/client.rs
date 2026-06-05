@@ -5,12 +5,12 @@
 //! `default_reverse_path` knob (envelope-sender override used by
 //! alias accounts and DKIM-aligned bounce-address rewriting).
 //!
-//! [`Self::send_message`] runs the RFC 5321 mail transaction
-//! (MAIL FROM → RCPT TO → DATA) extracting reverse / forward paths
-//! from the raw RFC 5322 bytes. The inner client's command helpers
-//! (`greeting`, `ehlo`, `mail`, `rcpt`, `data`, …) stay reachable
-//! through [`Self::inner`] for protocol-specific paths the shared
-//! API does not cover.
+//! [`SmtpClientStd::send_message`] runs the RFC 5321 mail
+//! transaction (MAIL FROM, RCPT TO, DATA) extracting reverse and
+//! forward paths from the raw RFC 5322 bytes. The inner client's
+//! command helpers (greeting, ehlo, mail, rcpt, data, ...) stay
+//! reachable through [`SmtpClientStd::inner`] for protocol-specific
+//! paths the shared API does not cover.
 //!
 //! [`SmtpClientStd`]: io_smtp::client::SmtpClientStd
 
@@ -41,7 +41,7 @@ use thiserror::Error;
 ))]
 use url::Url;
 
-use crate::smtp::message_send::{SmtpMessageSend, SmtpMessageSendError};
+use crate::message::smtp::send::{SmtpMessageSend, SmtpMessageSendError};
 
 /// Errors surfaced by [`SmtpClientStd`] while running a coroutine.
 #[derive(Debug, Error)]
