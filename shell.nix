@@ -7,7 +7,7 @@
 }:
 
 let
-  inherit (pkgs) cargo-deny dbus pkg-config;
+  inherit (pkgs) cargo-deny pkg-config openssl;
 
   shell = pimalaya.mkShell {
     inherit
@@ -21,7 +21,7 @@ let
 in
 shell.overrideAttrs (prev: {
   LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
-    dbus
+    openssl
   ];
 
   nativeBuildInputs = (prev.nativeBuildInputs or [ ]) ++ [
@@ -30,6 +30,6 @@ shell.overrideAttrs (prev: {
 
   buildInputs = (prev.buildInputs or [ ]) ++ [
     cargo-deny
-    dbus
+    openssl
   ];
 })
