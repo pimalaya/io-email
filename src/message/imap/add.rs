@@ -31,8 +31,7 @@ use io_imap::{
         select::{ImapMailboxSelect, ImapMailboxSelectError, ImapMailboxSelectOptions},
     },
     types::{
-        core::{AString, Literal, Vec1},
-        extensions::binary::LiteralOrLiteral8,
+        core::{AString, Vec1},
         search::SearchKey,
     },
 };
@@ -109,15 +108,13 @@ impl ImapMessageAdd {
 
         let mbox = parse_mailbox(mailbox)?;
         let imap_flags: Vec<_> = flags.iter().map(flag_from).collect();
-        let literal = Literal::try_from(raw)
-            .map_err(|err| ImapMessageAddError::InvalidContent(err.to_string()))?;
-        let message = LiteralOrLiteral8::Literal(literal);
         let append = ImapMessageAppend::new(
             mbox,
-            message,
+            raw,
             ImapMessageAppendOptions {
                 flags: imap_flags,
                 date: None,
+                non_sync: false,
             },
         );
 

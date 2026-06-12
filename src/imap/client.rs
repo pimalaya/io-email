@@ -28,6 +28,8 @@ use std::{
 use io_imap::{
     client::{ImapClientStd as InnerImapClientStd, ImapClientStdError as InnerImapClientStdError},
     coroutine::*,
+    has_imap_capability,
+    rfc3501::{fetch::ImapMessageFetchOptions, select::ImapMailboxSelectOptions},
     types::{
         core::{IString, NString},
         fetch::{MacroOrMessageDataItemNames, MessageDataItem, MessageDataItemName},
@@ -144,6 +146,10 @@ pub struct ImapClientStd {
     pub inner: InnerImapClientStd,
     pub auto_select: bool,
     pub capabilities: Vec<Capability<'static>>,
+    /// SORT fallback policy for envelope search. `None` (default) enables the
+    /// client-side SEARCH + FETCH fallback only when [`Self::capabilities`]
+    /// lacks `SORT`; `Some` overrides that, forcing the fallback on or off.
+    pub sort_fallback: Option<bool>,
 }
 
 impl ImapClientStd {
@@ -156,6 +162,7 @@ impl ImapClientStd {
             inner: InnerImapClientStd::new(stream),
             auto_select: true,
             capabilities: Vec::new(),
+            sort_fallback: None,
         }
     }
 
@@ -233,12 +240,16 @@ impl ImapClientStd {
         page_size: Option<u32>,
         with_attachment: bool,
     ) -> Result<Vec<Envelope>, ImapClientError> {
+        let sort_fallback = self
+            .sort_fallback
+            .unwrap_or_else(|| !has_imap_capability!(self.capabilities, Sort(_)));
         self.run(ImapEnvelopeSearch::new(
             mailbox,
             query,
             page,
             page_size,
             with_attachment,
+            sort_fallback,
         )?)
     }
 
@@ -437,9 +448,14 @@ impl ImapClientStd {
         let mut new_envelopes: Vec<Envelope> = Vec::new();
         if let Some(window) = new_message_window(cached.highest_uid) {
             if let Ok(sequence_set) = SequenceSet::try_from(window.as_str()) {
-                let data = self
-                    .inner
-                    .fetch(sequence_set, new_message_item_names(), true)?;
+                let data = self.inner.fetch(
+                    sequence_set,
+                    new_message_item_names(),
+                    ImapMessageFetchOptions {
+                        uid: true,
+                        modifiers: Vec::new(),
+                    },
+                )?;
                 new_envelopes = data
                     .into_iter()
                     .map(|(_, items)| envelope_from_items(items.into_inner()))
@@ -479,7 +495,9 @@ impl ImapClientStd {
         &mut self,
         mbox: ImapMailbox<'static>,
     ) -> Result<EnvelopeDiff, ImapClientError> {
-        let select = self.inner.select(mbox)?;
+        let select = self
+            .inner
+            .select(mbox, ImapMailboxSelectOptions::default())?;
         let Some(uid_validity) = select.uid_validity.map(NonZeroU32::get) else {
             return Ok(EnvelopeDiff::FullListRequired { new_state: None });
         };
@@ -492,7 +510,14 @@ impl ImapClientStd {
                 .expect("`*` is a valid sequence set spelling");
             let item_names =
                 MacroOrMessageDataItemNames::MessageDataItemNames(vec![MessageDataItemName::Uid]);
-            let data = self.inner.fetch(sequence_set, item_names, false)?;
+            let data = self.inner.fetch(
+                sequence_set,
+                item_names,
+                ImapMessageFetchOptions {
+                    uid: false,
+                    modifiers: Vec::new(),
+                },
+            )?;
             highest_uid = data
                 .into_values()
                 .flat_map(|items| items.into_inner().into_iter())
@@ -548,6 +573,7 @@ impl ImapClientStd {
             inner,
             auto_select: true,
             capabilities,
+            sort_fallback: None,
         })
     }
 }

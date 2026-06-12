@@ -11,7 +11,7 @@
 //! ```rust,ignore
 //! use io_email::envelope::imap::search::ImapEnvelopeSearch;
 //!
-//! let envs = client.run(ImapEnvelopeSearch::new("INBOX", query, None, None, false)?)?;
+//! let envs = client.run(ImapEnvelopeSearch::new("INBOX", query, None, None, false, false)?)?;
 //! ```
 
 use alloc::{
@@ -30,7 +30,7 @@ use io_imap::{
         fetch::{ImapMessageFetch, ImapMessageFetchError, ImapMessageFetchOptions},
         select::{ImapMailboxSelect, ImapMailboxSelectError, ImapMailboxSelectOptions},
     },
-    rfc5256::sort::{ImapMailboxSort, ImapMailboxSortError, ImapMailboxSortOptions},
+    rfc5256::sort::{ImapMessageSort, ImapMessageSortError, ImapMessageSortOptions},
     types::{
         core::{AString, Atom, Vec1},
         datetime::NaiveDate as ImapNaiveDate,
@@ -63,7 +63,7 @@ pub enum ImapEnvelopeSearchError {
     #[error(transparent)]
     Select(#[from] ImapMailboxSelectError),
     #[error(transparent)]
-    Sort(#[from] ImapMailboxSortError),
+    Sort(#[from] ImapMessageSortError),
     #[error(transparent)]
     Fetch(#[from] ImapMessageFetchError),
     #[error("invalid IMAP mailbox `{0}`")]
@@ -100,6 +100,7 @@ impl ImapEnvelopeSearch {
         page: Option<u32>,
         page_size: Option<u32>,
         with_attachment: bool,
+        sort_fallback: bool,
     ) -> Result<Self, ImapEnvelopeSearchError> {
         trace!("prepare IMAP envelope search");
         let mbox = parse_mailbox(mailbox)?;
@@ -115,6 +116,7 @@ impl ImapEnvelopeSearch {
                 item_names,
                 search_criteria,
                 sort_criteria,
+                sort_fallback,
             },
         })
     }
@@ -128,9 +130,10 @@ enum State {
         item_names: MacroOrMessageDataItemNames<'static>,
         search_criteria: Vec1<SearchKey<'static>>,
         sort_criteria: Vec1<SortCriterion>,
+        sort_fallback: bool,
     },
     Sorting {
-        sort: ImapMailboxSort,
+        sort: ImapMessageSort,
         page: Option<u32>,
         page_size: Option<u32>,
         item_names: MacroOrMessageDataItemNames<'static>,
@@ -302,6 +305,7 @@ impl ImapCoroutine for ImapEnvelopeSearch {
                     item_names,
                     search_criteria,
                     sort_criteria,
+                    sort_fallback,
                 } => match select.resume(fragmentizer, bytes.take()) {
                     ImapCoroutineState::Yielded(yielded) => {
                         self.state = State::Selecting {
@@ -311,6 +315,7 @@ impl ImapCoroutine for ImapEnvelopeSearch {
                             item_names,
                             search_criteria,
                             sort_criteria,
+                            sort_fallback,
                         };
                         return ImapCoroutineState::Yielded(yielded);
                     }
@@ -318,10 +323,13 @@ impl ImapCoroutine for ImapEnvelopeSearch {
                         if data.exists.unwrap_or(0) == 0 {
                             return ImapCoroutineState::Complete(Ok(Vec::new()));
                         }
-                        let sort = ImapMailboxSort::new(
+                        let sort = ImapMessageSort::new(
                             sort_criteria,
                             search_criteria,
-                            ImapMailboxSortOptions { uid: true },
+                            ImapMessageSortOptions {
+                                uid: true,
+                                fallback: sort_fallback,
+                            },
                         );
                         self.state = State::Sorting {
                             sort,
