@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Added the Gmail REST backend (`gmail` cargo feature) built on the io-gmail crate.
+
+  Maps Gmail labels onto the shared mailbox API and Gmail system labels onto the shared flags (`\Seen` is the absence of `UNREAD`). Implements `list_mailboxes`, `create_mailbox`, `delete_mailbox`, `list_envelopes`, `store_flags`, `get_message`, `delete_message`, `copy_messages`, `move_messages` and `send_message`; `EmailClientStd` gains `with_gmail` plus the TLS-gated `connect_gmail`. Operations Gmail has no primitive for (message add, search, envelope/mailbox diff, watch) are intentionally left unimplemented.
+
 ## [0.1.0] - 2026-06-06
 
 ### Added

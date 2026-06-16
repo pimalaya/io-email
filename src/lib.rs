@@ -11,6 +11,7 @@ pub mod address;
 #[cfg(any(
     feature = "imap",
     feature = "jmap",
+    feature = "gmail",
     feature = "maildir",
     feature = "m2dir",
     feature = "smtp"
@@ -23,6 +24,8 @@ pub mod message;
 #[cfg(feature = "search")]
 pub mod search;
 
+#[cfg(feature = "gmail")]
+pub mod gmail;
 #[cfg(feature = "imap")]
 pub mod imap;
 #[cfg(feature = "jmap")]

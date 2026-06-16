@@ -24,14 +24,25 @@
 //! When no registered backend supports the op, the dispatch returns
 //! [`EmailClientStdError::NoBackendRegistered`].
 
+#[cfg(any(feature = "imap", feature = "jmap", feature = "gmail"))]
 use core::sync::atomic::AtomicBool;
 
-use alloc::{string::String, sync::Arc, vec::Vec};
+#[cfg(any(feature = "imap", feature = "jmap", feature = "gmail"))]
+use alloc::sync::Arc;
+use alloc::{
+    string::{String, ToString},
+    vec::Vec,
+};
 
+#[cfg(any(feature = "imap", feature = "jmap", feature = "gmail"))]
 use std::sync::mpsc::Sender;
 
 use thiserror::Error;
 
+#[cfg(any(feature = "imap", feature = "jmap", feature = "gmail"))]
+use crate::envelope::event::WatchEvent;
+#[cfg(feature = "gmail")]
+use crate::gmail::client::{GmailClientError, GmailClientStd};
 #[cfg(feature = "imap")]
 use crate::imap::client::{ImapClientError, ImapClientStd};
 #[cfg(feature = "jmap")]
@@ -45,7 +56,6 @@ use crate::search::query::SearchEmailsQuery;
 #[cfg(feature = "smtp")]
 use crate::smtp::client::{SmtpClientError, SmtpClientStd};
 use crate::{
-    envelope::event::WatchEvent,
     envelope::types::{Envelope, EnvelopeDiff},
     flag::types::{Flag, FlagOp},
     mailbox::types::{Mailbox, MailboxDiff},
@@ -67,7 +77,19 @@ use io_smtp::rfc5321::types::ehlo_domain::EhloDomain;
     feature = "native-tls"
 ))]
 use pimalaya_stream::sasl::Sasl as ImapSasl;
-#[cfg(feature = "jmap")]
+#[cfg(any(
+    feature = "imap",
+    feature = "jmap",
+    feature = "gmail",
+    feature = "smtp"
+))]
+#[cfg(any(
+    feature = "rustls-ring",
+    feature = "rustls-aws",
+    feature = "native-tls"
+))]
+use pimalaya_stream::tls::Tls;
+#[cfg(any(feature = "jmap", feature = "gmail"))]
 #[cfg(any(
     feature = "rustls-ring",
     feature = "rustls-aws",
@@ -80,7 +102,7 @@ use secrecy::SecretString;
     feature = "rustls-aws",
     feature = "native-tls"
 ))]
-use {pimalaya_stream::tls::Tls, url::Url};
+use url::Url;
 
 /// Errors surfaced by [`EmailClientStd`].
 ///
@@ -94,6 +116,9 @@ pub enum EmailClientStdError {
     #[cfg(feature = "jmap")]
     #[error(transparent)]
     Jmap(#[from] JmapClientError),
+    #[cfg(feature = "gmail")]
+    #[error(transparent)]
+    Gmail(#[from] GmailClientError),
     #[cfg(feature = "smtp")]
     #[error(transparent)]
     Smtp(#[from] SmtpClientError),
@@ -122,6 +147,8 @@ pub struct EmailClientStd {
     pub imap: Option<ImapClientStd>,
     #[cfg(feature = "jmap")]
     pub jmap: Option<JmapClientStd>,
+    #[cfg(feature = "gmail")]
+    pub gmail: Option<GmailClientStd>,
     #[cfg(feature = "smtp")]
     pub smtp: Option<SmtpClientStd>,
     #[cfg(feature = "maildir")]
@@ -147,6 +174,13 @@ impl EmailClientStd {
     #[cfg(feature = "jmap")]
     pub fn with_jmap(mut self, client: JmapClientStd) -> Self {
         self.jmap = Some(client);
+        self
+    }
+
+    /// Registers the Gmail backend.
+    #[cfg(feature = "gmail")]
+    pub fn with_gmail(mut self, client: GmailClientStd) -> Self {
+        self.gmail = Some(client);
         self
     }
 
@@ -208,6 +242,25 @@ impl EmailClientStd {
         Ok(self.with_jmap(JmapClientStd::connect(url, tls, http_auth)?))
     }
 
+    /// Opens a TLS connection to the Gmail REST API via
+    /// [`GmailClientStd::connect`] and registers the resulting client.
+    /// `token` is the bare OAuth2 bearer token; `user_id` is the mailbox
+    /// owner (usually `me`).
+    #[cfg(feature = "gmail")]
+    #[cfg(any(
+        feature = "rustls-ring",
+        feature = "rustls-aws",
+        feature = "native-tls"
+    ))]
+    pub fn connect_gmail(
+        self,
+        tls: &Tls,
+        token: impl ToString,
+        user_id: impl Into<String>,
+    ) -> Result<Self, EmailClientStdError> {
+        Ok(self.with_gmail(GmailClientStd::connect(tls, token, user_id)?))
+    }
+
     /// Opens an SMTP connection via [`SmtpClientStd::connect`] and
     /// registers the resulting client.
     #[cfg(feature = "smtp")]
@@ -264,6 +317,10 @@ impl EmailClientStd {
         if let Some(c) = self.jmap.as_mut() {
             return Ok(c.list_mailboxes(with_counts)?);
         }
+        #[cfg(feature = "gmail")]
+        if let Some(c) = self.gmail.as_mut() {
+            return Ok(c.list_mailboxes(with_counts)?);
+        }
         #[cfg(feature = "imap")]
         if let Some(c) = self.imap.as_mut() {
             return Ok(c.list_mailboxes(with_counts)?);
@@ -291,6 +348,10 @@ impl EmailClientStd {
         }
         #[cfg(feature = "jmap")]
         if let Some(c) = self.jmap.as_mut() {
+            return Ok(c.list_envelopes(mailbox, page, page_size)?);
+        }
+        #[cfg(feature = "gmail")]
+        if let Some(c) = self.gmail.as_mut() {
             return Ok(c.list_envelopes(mailbox, page, page_size)?);
         }
         #[cfg(feature = "imap")]
@@ -351,6 +412,10 @@ impl EmailClientStd {
         if let Some(c) = self.jmap.as_mut() {
             return Ok(c.store_flags(mailbox, ids, flags, op)?);
         }
+        #[cfg(feature = "gmail")]
+        if let Some(c) = self.gmail.as_mut() {
+            return Ok(c.store_flags(mailbox, ids, flags, op)?);
+        }
         #[cfg(feature = "imap")]
         if let Some(c) = self.imap.as_mut() {
             return Ok(c.store_flags(mailbox, ids, flags, op)?);
@@ -371,6 +436,10 @@ impl EmailClientStd {
         }
         #[cfg(feature = "jmap")]
         if let Some(c) = self.jmap.as_mut() {
+            return Ok(c.get_message(mailbox, id)?);
+        }
+        #[cfg(feature = "gmail")]
+        if let Some(c) = self.gmail.as_mut() {
             return Ok(c.get_message(mailbox, id)?);
         }
         #[cfg(feature = "imap")]
@@ -423,6 +492,10 @@ impl EmailClientStd {
         if let Some(c) = self.jmap.as_mut() {
             return Ok(c.create_mailbox(name)?);
         }
+        #[cfg(feature = "gmail")]
+        if let Some(c) = self.gmail.as_mut() {
+            return Ok(c.create_mailbox(name)?);
+        }
         #[cfg(feature = "imap")]
         if let Some(c) = self.imap.as_mut() {
             return Ok(c.create_mailbox(name)?);
@@ -445,6 +518,10 @@ impl EmailClientStd {
         if let Some(c) = self.jmap.as_mut() {
             return Ok(c.delete_mailbox(name)?);
         }
+        #[cfg(feature = "gmail")]
+        if let Some(c) = self.gmail.as_mut() {
+            return Ok(c.delete_mailbox(name)?);
+        }
         #[cfg(feature = "imap")]
         if let Some(c) = self.imap.as_mut() {
             return Ok(c.delete_mailbox(name)?);
@@ -465,6 +542,10 @@ impl EmailClientStd {
         }
         #[cfg(feature = "jmap")]
         if let Some(c) = self.jmap.as_mut() {
+            return Ok(c.delete_message(mailbox, id)?);
+        }
+        #[cfg(feature = "gmail")]
+        if let Some(c) = self.gmail.as_mut() {
             return Ok(c.delete_message(mailbox, id)?);
         }
         #[cfg(feature = "imap")]
@@ -494,6 +575,10 @@ impl EmailClientStd {
         if let Some(c) = self.jmap.as_mut() {
             return Ok(c.copy_messages(from, to, ids)?);
         }
+        #[cfg(feature = "gmail")]
+        if let Some(c) = self.gmail.as_mut() {
+            return Ok(c.copy_messages(from, to, ids)?);
+        }
         #[cfg(feature = "imap")]
         if let Some(c) = self.imap.as_mut() {
             return Ok(c.copy_messages(from, to, ids)?);
@@ -519,6 +604,10 @@ impl EmailClientStd {
         }
         #[cfg(feature = "jmap")]
         if let Some(c) = self.jmap.as_mut() {
+            return Ok(c.move_messages(from, to, ids)?);
+        }
+        #[cfg(feature = "gmail")]
+        if let Some(c) = self.gmail.as_mut() {
             return Ok(c.move_messages(from, to, ids)?);
         }
         #[cfg(feature = "imap")]
@@ -578,7 +667,7 @@ impl EmailClientStd {
 
     /// Watches `mailbox` for envelope-level deltas, forwarding events
     /// through `tx`. Priority: JMAP → IMAP (no filesystem watch yet).
-    #[cfg(any(feature = "imap", feature = "jmap"))]
+    #[cfg(any(feature = "imap", feature = "jmap", feature = "gmail"))]
     pub fn watch_mailbox(
         &mut self,
         mailbox: &str,
@@ -587,6 +676,10 @@ impl EmailClientStd {
     ) -> Result<(), EmailClientStdError> {
         #[cfg(feature = "jmap")]
         if let Some(c) = self.jmap.as_mut() {
+            return Ok(c.watch_mailbox(mailbox, shutdown, tx)?);
+        }
+        #[cfg(feature = "gmail")]
+        if let Some(c) = self.gmail.as_mut() {
             return Ok(c.watch_mailbox(mailbox, shutdown, tx)?);
         }
         #[cfg(feature = "imap")]
@@ -601,10 +694,14 @@ impl EmailClientStd {
 
     /// Sends a raw RFC 5322 message. JMAP routes via `EmailSubmission/set` when
     /// registered; otherwise SMTP runs the RFC 5321 mail transaction.
-    #[cfg(any(feature = "jmap", feature = "smtp"))]
+    #[cfg(any(feature = "jmap", feature = "gmail", feature = "smtp"))]
     pub fn send_message(&mut self, raw: Vec<u8>) -> Result<(), EmailClientStdError> {
         #[cfg(feature = "jmap")]
         if let Some(c) = self.jmap.as_mut() {
+            return Ok(c.send_message(raw)?);
+        }
+        #[cfg(feature = "gmail")]
+        if let Some(c) = self.gmail.as_mut() {
             return Ok(c.send_message(raw)?);
         }
         #[cfg(feature = "smtp")]

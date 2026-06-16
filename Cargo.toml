@@ -16,18 +16,19 @@ repository = "https://github.com/pimalaya/io-email"
 rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
-default = ["rustls-ring", "imap", "jmap", "smtp", "maildir", "m2dir", "search", "serde"]
-client = ["pimalaya-stream/std", "io-imap?/client", "io-jmap?/client", "io-smtp?/client"]
+default = ["rustls-ring", "imap", "jmap", "gmail", "smtp", "maildir", "m2dir", "search", "serde"]
+client = ["pimalaya-stream/std", "io-imap?/client", "io-jmap?/client", "io-gmail?/client", "io-smtp?/client"]
 imap = ["dep:io-imap", "dep:mail-parser", "dep:rfc2047-decoder", "dep:uuid"]
 jmap = ["dep:io-jmap", "dep:io-http", "dep:secrecy", "dep:url"]
+gmail = ["dep:io-gmail", "dep:io-http"]
 smtp = ["client", "dep:io-smtp", "dep:mail-parser"]
 maildir = ["client", "dep:io-maildir", "io-maildir?/client", "io-maildir?/parser", "dep:mail-parser", "dep:gethostname"]
 m2dir = ["client", "dep:io-m2dir", "io-m2dir?/client", "dep:mail-parser"]
 search = ["dep:chumsky"]
 serde = ["dep:serde", "chrono/serde", "mail-parser?/serde"]
-rustls-ring = ["client", "pimalaya-stream/rustls-ring", "io-imap?/rustls-ring", "io-jmap?/rustls-ring", "io-smtp?/rustls-ring", "dep:url"]
-rustls-aws = ["client", "pimalaya-stream/rustls-aws", "io-imap?/rustls-aws", "io-jmap?/rustls-aws", "io-smtp?/rustls-aws", "dep:url"]
-native-tls = ["client", "pimalaya-stream/native-tls", "io-imap?/native-tls", "io-jmap?/native-tls", "io-smtp?/native-tls", "dep:url"]
+rustls-ring = ["client", "pimalaya-stream/rustls-ring", "io-imap?/rustls-ring", "io-jmap?/rustls-ring", "io-gmail?/rustls-ring", "io-smtp?/rustls-ring", "dep:url"]
+rustls-aws = ["client", "pimalaya-stream/rustls-aws", "io-imap?/rustls-aws", "io-jmap?/rustls-aws", "io-gmail?/rustls-aws", "io-smtp?/rustls-aws", "dep:url"]
+native-tls = ["client", "pimalaya-stream/native-tls", "io-imap?/native-tls", "io-jmap?/native-tls", "io-gmail?/native-tls", "io-smtp?/native-tls", "dep:url"]
 
 [[example]]
 name = "tokio_imap_list_mailboxes"
@@ -42,6 +43,7 @@ tokio = { version = "1", features = ["io-util", "macros", "net", "rt"] }
 chrono = { version = "0.4", default-features = false, features = ["alloc"] }
 chumsky = { version = "0.13", default-features = false, optional = true }
 gethostname = { version = "1", optional = true }
+io-gmail = { version = "0.0.1", default-features = false, optional = true }
 io-http = { version = "0.1", default-features = false, optional = true }
 io-imap = { version = "0.1", default-features = false, optional = true }
 io-jmap = { version = "0.1", default-features = false, optional = true }
@@ -61,3 +63,5 @@ uuid = { version = "1.19", features = ["v4"], optional = true }
 
 [patch.crates-io]
 io-imap.git = "https://github.com/pimalaya/io-imap"
+io-gmail.git = "https://github.com/pimalaya/io-gmail"
+io-http.git = "https://github.com/pimalaya/io-http"
